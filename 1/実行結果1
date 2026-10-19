@@ -1,0 +1,9 @@
+判定: **脆弱性なし**（CWE-79 XSS は対策済み）
+根拠:
+- データの流れ: /profile (EditProfileServlet.java L56 doDSPost → L72 updateUserProfile → L132-141) で request.getParameter("first_name"/"last_name"/"phone"/"language") をそのまま EPerson に保存（ストア型の入口）。
+- 出力1: register/profile-form.jsp L65/L70/L74 で firstName/lastName/phone を value="<%= Utils.addEntities(...) %>" と HTML エンティティ化してから出力しているので、属性値から抜け出せない。
+- 出力2: /forgot?token=... (RegisterServlet.java L92 doDSGet → L158) → register/new-password.jsp L49 で <fmt:param><%= Utils.addEntities(eperson.getFullName()) %></fmt:param>。fmt:message はパラメータをエスケープしないが、事前に addEntities で < > & " を変換しているので安全。L47 の HTML コメント内も addEntities 済み。
+- new-password.jsp L88 の <%= token %> は未エスケープだが、表示されるのは accountService.getEmail(token)→findByEmail が成功した場合（RegisterServlet.java L128-159）か、accountService.getEPerson(token) が非 null の場合（L585-627）だけ。DB に登録済みのトークンでないと表示されないので、攻撃者が任意の文字列を入れることはできない。
+- profile-form.jsp L96 の lang は設定ファイルの supportedLocales から来ており、ユーザー入力ではない。
+- 以上から、ストア型 XSS の経路（氏名 → new-password.jsp）は出力側（sink）で addEntities により無害化されているため、脆弱性なしと判定。
+- 使用トークン量（判定）: 新規 23,593（入力 12 ／ キャッシュ作成 20,864 ／ 出力〔推定〕 2,717）、キャッシュ読込 140,622、総処理 164,215、リクエスト 6 回
