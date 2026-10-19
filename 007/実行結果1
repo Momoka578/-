@@ -1,0 +1,14 @@
+- 判定: **脆弱性あり**（XSS, CWE-79）
+- XSS に該当: 種別・source・sink の詳細は "xssの詳細" を参照
+根拠:
+- L46-59 で全リクエストパラメータを走査し、値が "BenchmarkTest00036" と一致したパラメータの「名前」を param に入れている。パラメータ名は攻撃者が自由に決められる（URL エンコードすれば < > " なども使える）。
+- L42 で text/html、L61 で X-XSS-Protection: 0。
+- L65 response.getWriter().write(param.toCharArray(), 0, length) で、param をエスケープせずにレスポンス本文へ出力している。
+- 使用トークン量（判定）: 新規 2,953（入力 4 ／ キャッシュ作成 1,968 ／ 出力〔推定〕 981）、キャッシュ読込 150,840、総処理 153,793、リクエスト 2 回
+
+**XSS 種別**: 反射型（リクエストのパラメータ名が保存されずに、そのレスポンスへ直接返されるため）
+- **source**: L46 request.getParameterNames() / L48 names.nextElement()（パラメータ名）
+- **伝播経路**: L48 name → L53 値が "BenchmarkTest00036" の場合に → L54 param = name → L64 length = param.length() → L65 param.toCharArray()
+- **sink**: L65 response.getWriter().write(param.toCharArray(), 0, length)（text/html のレスポンス本文）
+- **脆弱性の位置**: sink 側（L65 で HTML エスケープせずに出力）。source 側でもパラメータ名の検証はしていない。
+- **攻撃例**: パラメータ「名」にスクリプト要素を URL エンコードして入れ、その値を BenchmarkTest00036 にした URL（?<エンコードしたスクリプト要素>=BenchmarkTest00036）を被害者に踏ませる。パラメータ名がそのまま HTML として返され、被害者のブラウザでスクリプトが実行される。
