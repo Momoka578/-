@@ -1,0 +1,43 @@
+- 修正対象ファイル: BenchmarkTest00096.py
+- 修正箇所のコメント（コード内から抜粋）:
+  - `# 【修正】ユーザー入力由来の bar を、import 済みの escape_for_html で HTML エンティティ化してから埋め込む。`
+
+```python
+from flask import redirect, url_for, request, make_response, render_template
+from helpers.utils import escape_for_html
+
+def init(app):
+
+	@app.route('/benchmark/xss-00/BenchmarkTest00096', methods=['GET'])
+	def BenchmarkTest00096_get():
+		return BenchmarkTest00096_post()
+
+	@app.route('/benchmark/xss-00/BenchmarkTest00096', methods=['POST'])
+	def BenchmarkTest00096_post():
+		RESPONSE = ""
+
+		param = request.form.get("BenchmarkTest00096")
+		if not param:
+			param = ""
+
+		possible = "ABC"
+		guess = possible[0]
+
+		match guess:
+			case 'A':
+				bar = param
+			case 'B':
+				bar = 'bob'
+			case 'C' | 'D':
+				bar = param
+			case _:
+				bar = 'bob\'s your uncle'
+
+
+		otherarg = "static text"
+		RESPONSE += (
+			# 【修正】ユーザー入力由来の bar を、import 済みの escape_for_html で HTML エンティティ化してから埋め込む。
+			f'bar is \'{escape_for_html(bar)}\' and otherarg is \'{otherarg}\''
+		)
+
+		return RESPONSE
