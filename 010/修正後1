@@ -1,0 +1,33 @@
+修正対象ファイル: BenchmarkTest00097.py
+- 修正箇所のコメント（コード内から抜粋）:
+  - `# 【修正】スペース分割は対策にならないため、出力直前に escape_for_html で bar を HTML エンティティ化する。`
+
+```python
+from flask import redirect, url_for, request, make_response, render_template
+from helpers.utils import escape_for_html
+
+def init(app):
+
+	@app.route('/benchmark/xss-00/BenchmarkTest00097', methods=['GET'])
+	def BenchmarkTest00097_get():
+		return BenchmarkTest00097_post()
+
+	@app.route('/benchmark/xss-00/BenchmarkTest00097', methods=['POST'])
+	def BenchmarkTest00097_post():
+		RESPONSE = ""
+
+		param = request.form.get("BenchmarkTest00097")
+		if not param:
+			param = ""
+
+		bar = ''
+		if param:
+			bar = param.split(' ')[0]
+
+
+		otherarg = "static text"
+		RESPONSE += (
+			# 【修正】スペース分割は対策にならないため、出力直前に escape_for_html で bar を HTML エンティティ化する。
+			f'bar is \'{escape_for_html(bar)}\' and otherarg is \'{otherarg}\''
+		)
+return RESPONSE
