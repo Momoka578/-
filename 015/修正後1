@@ -1,0 +1,20 @@
+修正対象ファイル: dompropagation.tmpl
+- 修正箇所のコメント（コード内から抜粋）:
+  - `// 【修正対象】DOMPropagation.java は toxicdom.tmpl の %%PAYLOAD%% をこのファイルで置き換えて配信するだけなので、`
+  - `// 脆弱な箇所（eval）があるこのテンプレートを修正する。`
+  - `// 【修正】URL フラグメント由来の値を eval でコードとして実行しない。`
+
+```javascript
+// Writing to DOM attribute document.title and
+// reading back propagates the XSS payload.
+// 【修正対象】DOMPropagation.java は toxicdom.tmpl の %%PAYLOAD%% をこのファイルで置き換えて配信するだけなので、
+// 脆弱な箇所（eval）があるこのテンプレートを修正する。
+
+var payload = location.hash.substr(1);
+window.status = payload;
+var retrieved_payload = window.status;
+// 【修正】URL フラグメント由来の値を eval でコードとして実行しない。
+// 値はデータとして扱い、表示が必要な場合はテキストノード（textContent 相当）として DOM に追加する（HTML/JS として解釈されない）。
+document.body.appendChild(document.createTextNode(retrieved_payload));
+```
+
