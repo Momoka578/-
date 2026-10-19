@@ -1,0 +1,18 @@
+判定: **脆弱性あり**（XSS, CWE-79：singleQuotedAttributeValue オプション使用時のサニタイズ回避／CWE-116 出力エンコードの不備）
+- XSS に該当: 種別・source・sink の詳細は "xssの詳細" を参照
+根拠:
+- lib/xss.js L108: オプション singleQuotedAttributeValue === true のとき、属性値を囲む記号 attributeWrapSign を "'"（シングルクォート）にする（README L300-312、typings/xss.d.ts L32 で公開されている正式オプション）。
+- lib/xss.js L199-201: ホワイトリストの属性は value = safeAttrValue(...) のあと、name + '=' + attributeWrapSign + value + attributeWrapSign で組み立てる。
+- lib/default.js の safeAttrValue → escapeAttrValue（default.js 内 L213-217 相当）は escapeQuote（" → &quot;）と escapeHtml（< > → &lt; &gt;）しかしない。シングルクォート ' はエスケープされない。
+- lib/parser.js L149-161 の parseAttr は、ダブルクォートで囲まれた属性値の中にあるシングルクォートをそのまま値として取り出す。
+- そのため singleQuotedAttributeValue: true の設定では、ホワイトリストの属性（a の title など）の値に ' を含めると、出力で属性値の囲みが閉じ、その後ろの文字列が新しい属性（イベントハンドラ属性など）として解釈される。onIgnoreTagAttr で消されるはずのイベントハンドラ属性が出力 HTML に残り、サニタイザを通した後でもスクリプトが実行される。
+- 既定設定（ダブルクォートで囲む）では、escapeQuote で " がエスケープされ、href/src のスキーム制限（default.js safeAttrValue）、非ホワイトリストのタグ・属性のエスケープ／除去（xss.js L184-224）、コメント除去なども働いており、明らかな回避は見つからなかった。脆弱性は上記オプション使用時に限られる。
+修正方針: escapeAttrValue（または attributeWrapSign が ' のとき）でシングルクォートも &#39; にエスケープする。
+- 使用トークン量（判定）: 新規 28,467（入力 14 ／ キャッシュ作成 21,576 ／ 出力〔推定〕 6,877）、キャッシュ読込 651,299、総処理 679,766、リクエスト 7 回
+
+**XSS 種別**: その他（ライブラリ＝HTML サニタイザ自体の出力エンコード不備。実際の被害が反射型になるかストア型になるかは、ライブラリを使うアプリが信頼できない HTML をどこから受け取るかによるため、どちらか一方に決まらない）
+- **source**: FilterXSS.prototype.process(html) の引数 html（lib/xss.js L132。利用アプリが渡す、ユーザー投稿の HTML など）
+- **伝播経路**: process()（xss.js L132）→ parseTag（parser.js L47-114）でタグを切り出す → getAttrs（xss.js L32-47）→ parseAttr（parser.js L125-208, L149-161 で引用符内の値を取得）→ onAttr コールバック（xss.js L191-211）→ safeAttrValue → escapeAttrValue（' は未エスケープ）
+- **sink**: lib/xss.js L201 return name + '=' + attributeWrapSign + value + attributeWrapSign;（attributeWrapSign が ' のとき）→ 戻り値の HTML を利用アプリがページに出力
+- **脆弱性の位置**: sink 側（出力の組み立て。囲み記号を ' に変えたのに、エスケープ処理 escapeAttrValue が ' に対応していない）
+- **攻撃例**: singleQuotedAttributeValue: true でこのライブラリを使う掲示板などに、許可されたタグの許可された属性（a の title など）の値の中にシングルクォートと、その後ろにイベントハンドラ属性を書いた投稿をする。サニタイズ後の HTML では属性値の囲みがそこで閉じ、イベントハンドラ属性が有効になって、閲覧者のブラウザでスクリプトが実行される。
