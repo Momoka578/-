@@ -1,0 +1,36 @@
+修正対象ファイル: test.php
+- 修正箇所のコメント（コード内から抜粋）:
+  - `// 【修正】HTML 出力用のエスケープ関数（< > & " ' をすべて実体参照に変換する）`
+  - `<!-- 【修正】head・title の値は HTML エスケープしてから出力し、タグとして解釈されないようにする -->`
+  - `<!-- 【修正】href の値も ENT_QUOTES でエスケープし、" で属性から抜け出せないようにする（スキームは http:// 固定のまま） -->`
+  - `<?php /* 【修正】入力をコードとして直接埋め込まず、json_encode で JavaScript の文字列リテラル（データ）として埋め込む。`
+
+```php
+<?php
+$head = $_GET['head'];
+$title = $_GET['title'];
+$href = $_GET['href'];
+$script = $_GET['script'];
+
+// 【修正】HTML 出力用のエスケープ関数（< > & " ' をすべて実体参照に変換する）
+function h($s) {
+    return htmlspecialchars((string)$s, ENT_QUOTES, 'UTF-8');
+}
+?>
+<html>
+<!-- 【修正】head・title の値は HTML エスケープしてから出力し、タグとして解釈されないようにする -->
+<head><?php echo h($head); ?> <title><?php echo h($title); ?></title></head>
+<body>
+<!-- 【修正】href の値も ENT_QUOTES でエスケープし、" で属性から抜け出せないようにする（スキームは http:// 固定のまま） -->
+<a href="http://<?php echo h($href); ?>">text</a>
+<script>
+   <?php /* 【修正】入力をコードとして直接埋め込まず、json_encode で JavaScript の文字列リテラル（データ）として埋め込む。
+            JSON_HEX_* で < > & ' " を \uXXXX にし、</script> による脱出も防ぐ */ ?>
+   var script = <?php echo json_encode((string)$script, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT); ?>;
+</script>
+<frameset>
+
+</frameset>
+</body>
+</html>
+```
