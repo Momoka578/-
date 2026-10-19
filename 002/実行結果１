@@ -1,0 +1,8 @@
+- 判定: **脆弱性なし**（CWE-79 XSS は対策済み）
+根拠:
+- データの流れ: dspace-admin/news-edit.jsp L68 のフォーム → NewsEditServlet.java L75 request.getParameter("news") → L78 newsService.writeNewsFile() → NewsServiceImpl.java L119-122 でファイルに保存 → home.jsp L52-53 readNewsFile()（NewsServiceImpl.java L83-91）→ home.jsp L77 / L168 で出力。
+- sink の home.jsp L77 <%= Utils.addEntities(topNews) %>、L168 <%= Utils.addEntities(sideNews) %> は HTML エンティティ化されているので、ニュース本文に <script> を入れても全訪問者向けのトップページでは実行されない（ストア型 XSS は sink 側で対策済み）。
+- position パラメータ（NewsEditServlet.java L55 → news-edit.jsp L70 value='<%= position %>'）は未エスケープだが、表示前に NewsServiceImpl.validate()（L142-147、許可されたファイル名リストとの完全一致）を通り、不一致なら IllegalArgumentException になるので任意の文字列は入らない。
+- home.jsp のほかの出力（L138/L140/L195）は addEntities 済み。L113 は設定値、L139 のハンドルはシステムが生成した値。
+- 注意点（判定には影響しない）: news-edit.jsp L68 <textarea><%= news %></textarea> は未エスケープなので、ニュース本文に </textarea><script> があれば編集画面で実行される。ただし書き込みも閲覧も /dspace-admin 配下の管理者だけで、信頼された管理者同士の自己 XSS にとどまる。L206 のコミュニティ short_description の生出力は DSpace がもともと HTML を許可している項目で、今回の追跡経路の外。
+- 使用トークン量（判定）: 新規 13,897（入力 8 ／ キャッシュ作成 10,332 ／ 出力〔推定〕 3,557）、キャッシュ読込 162,346、総処理 176,243、リクエスト 4 回
