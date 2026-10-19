@@ -1,0 +1,8 @@
+ 判定: **脆弱性なし**（CWE-79 XSS は対策済み）
+根拠:
+- データの流れ: tools/edit-community.jsp L147 のフォーム（name）→ EditCommunitiesServlet.java の processConfirmEditCommunity（L543 付近 communityService.setMetadata(..., "name", request.getParameter("name"))）でコミュニティ名を DB に保存（ストア型の入口）→ 投稿画面 /submit（SubmissionController → JSPStepManager → JSPSelectCollectionStep）→ submit/select-collection.jsp L76 <dspace:selectcollection> → SelectCollectionTag.java L85-92 → CollectionDropDown.collectionPath()（CollectionDropDown.java L64-70 で親コミュニティ名とコレクション名を連結）。
+- sink の SelectCollectionTag.java L92 は Utils.addEntities(CollectionDropDown.collectionPath(...)) と HTML エンティティ化してから <option> に出力しているので、コミュニティ名にタグを入れても実行されない。
+- edit-community.jsp L147/L151/L156 の再表示も Utils.addEntities 済み。L265/L269 の parentID は UUID 型、L277/L281 の community.getID() はシステムの ID。
+- select-collection.jsp L79 の SubmissionController.getSubmissionParameters()（SubmissionController.java L1335-1380）が出力するのは数値／ID だけで、ユーザーが自由に入れた文字列は含まない。
+- 以上から、コミュニティ名 → コレクション選択ドロップダウンのストア型 XSS 経路は sink 側で対策済みのため、脆弱性なしと判定。
+- 使用トークン量（判定）: 新規 20,190（入力 14 ／ キャッシュ作成 15,571 ／ 出力〔推定〕 4,605）、キャッシュ読込 389,290、総処理 409,480、リクエスト 7 回
