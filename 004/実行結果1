@@ -1,0 +1,15 @@
+- 判定: **脆弱性あり**（XSS, CWE-79。あわせて書式文字列の外部制御 CWE-134）
+- XSS に該当: 種別・source・sink の詳細は "xssの詳細" を参照
+根拠:
+- L45-49 で HTTP ヘッダ Referer の値を param に入れ、L52 で URLDecoder.decode() により %xx をデコードしている（エンコードされた < > " が元の文字に戻る）。
+- L42 で Content-Type を text/html にし、L54 で X-XSS-Protection: 0 にしてブラウザの XSS フィルタも無効化している。
+- L56 response.getWriter().format(Locale.US, param, obj) で、param を書式文字列としてそのままレスポンスに出力している。エスケープもサニタイズもない。書式指定子を含まない文字列はそのまま出力されるため、HTML/JavaScript として解釈される。
+- さらに、ユーザーが制御できる文字列を書式文字列に使っているため、%n や不正な指定子による例外（IllegalFormatException）を起こせる（CWE-134）。
+- 使用トークン量（判定）: 新規 5,198（入力 4 ／ キャッシュ作成 3,689 ／ 出力〔推定〕 1,505）、キャッシュ読込 130,784、総処理 135,982、リクエスト 2 回
+
+ **XSS 種別**: 反射型（リクエストの Referer ヘッダの値が保存されずに、同じリクエストのレスポンスにそのまま返されるため）
+- **source**: L45 request.getHeaders("Referer") / L48 headers.nextElement()
+- **伝播経路**: L48 param = Referer の値 → L52 URLDecoder.decode(param, "UTF-8") でデコード → L56 format() の第 2 引数（書式文字列）として使用
+- **sink**: L56 response.getWriter().format(java.util.Locale.US, param, obj)（text/html のレスポンス本文）
+- **脆弱性の位置**: sink 側（L56 で HTML エスケープせずに出力していることが主因）。source 側の L52 で URL デコードしているため、エンコードされたタグも復元されて悪化している。
+- **攻撃例**: 攻撃者が、パスやクエリにスクリプト要素を URL エンコードして埋め込んだ URL のページを用意し、そこから被害者をこのサーブレットへ遷移させる。ブラウザが送る Referer にその URL が入り、L52 でデコードされて L56 で HTML として出力されるので、被害者のブラウザで任意のスクリプトが実行される（Cookie の窃取など）。ブラウザの Referrer-Policy で送られる値が制限される場合もあるが、コードとしては無防備。
