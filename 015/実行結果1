@@ -1,0 +1,16 @@
+判定: **脆弱性あり**（DOM-based XSS, CWE-79。eval による JavaScript コード注入 CWE-95）
+- XSS に該当: 種別・source・sink の詳細は "xssの詳細" を参照
+根拠:
+- DOMPropagation.java L32-37: toxicdom.tmpl（<script>%%PAYLOAD%%</script>）の %%PAYLOAD%% を dompropagation.tmpl の内容で置き換え（Templates.replacePayload は単純な文字列置換）、Responses.sendXssed で text/html として返す（X-XSS-Protection: 0）。サーバー側はリクエストの値を使っていないので、Java 側に注入点はない。
+- 脆弱なのはレスポンスに埋め込まれるクライアント側 JavaScript（dompropagation.tmpl）:
+  - L4 var payload = location.hash.substr(1);  URL のフラグメント（# 以降）は攻撃者が自由に決められ、サーバーにも送られない。
+  - L5 window.status = payload; / L6 var retrieved_payload = window.status;  DOM のプロパティに書いてから読み戻すだけで、値はそのまま伝わる（無害化されない）。
+  - L7 eval(retrieved_payload);  検証せずに JavaScript として実行している。
+- 使用トークン量（判定）: 新規 9,808（入力 10 ／ キャッシュ作成 6,726 ／ 出力〔推定〕 3,072）、キャッシュ読込 661,549、総処理 671,357、リクエスト 5 回
+
+XSS 種別**: DOM-base（入力元 location.hash も、実行先 eval もブラウザ内の JavaScript で完結し、サーバーのレスポンスには攻撃文字列が一切含まれないため。フラグメントはサーバーに送られないので、サーバー側の対策やログでは検知できない）
+- **source**: dompropagation.tmpl L4 location.hash（URL の # 以降）
+- **伝播経路**: L4 payload = location.hash.substr(1) → L5 window.status = payload（DOM プロパティに保存）→ L6 retrieved_payload = window.status（読み戻し）→ L7
+- **sink**: dompropagation.tmpl L7 eval(retrieved_payload)（toxicdom.tmpl L4-6 の script 要素内として、DOMPropagation.java L37 で配信される）
+- **脆弱性の位置**: sink 側（L7 で信頼できない値を eval していること）。source 側でも、L4 で location.hash を検証していない。
+- **攻撃例**: このページの URL の # の後ろに、任意の JavaScript 文（document.cookie を外部へ送信するなど）を付けたリンクを被害者に踏ませる。ページの読み込み時に、その文が window.status を経由して eval で実行される。# 以降はサーバーへ送られないので、サーバー側では検知できない。
