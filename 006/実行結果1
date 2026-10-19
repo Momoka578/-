@@ -1,0 +1,15 @@
+ 判定: **脆弱性あり**（XSS, CWE-79。あわせて書式文字列の外部制御 CWE-134）
+- XSS に該当: 種別・source・sink の詳細は "xssの詳細" を参照
+根拠:
+- L44-48 でリクエストパラメータ BenchmarkTest00030 の最初の値を param に入れている（GET のクエリ文字列でも POST 本文でも可）。
+- L42 で text/html、L51 で X-XSS-Protection: 0。
+- L53 response.getWriter().printf(param, obj) で、param を書式文字列としてエスケープせずにそのまま出力している。書式指定子を含まない文字列はそのまま HTML として出力される。外部入力を書式文字列に使っている点は CWE-134 にも当たる。
+- 使用トークン量（判定）: 新規 2,845（入力 4 ／ キャッシュ作成 1,865 ／ 出力〔推定〕 976）、キャッシュ読込 145,509、総処理 148,354、リクエスト 2 回
+
+- **XSS 種別**: 反射型（クエリ／フォームのパラメータが保存されずに、そのレスポンスへ直接返されるため）
+- **source**: L44 request.getParameterMap() / L47-48 map.get("BenchmarkTest00030")[0]
+- **伝播経路**: L48 param = values[0] → 加工なし → L53 printf() の書式文字列
+- **sink**: L53 response.getWriter().printf(param, obj)（text/html のレスポンス本文）
+- **脆弱性の位置**: sink 側（L53 で HTML エスケープせずに出力）。source 側でも入力検証はしていない。
+- **攻撃例**: 攻撃者が、BenchmarkTest00030 パラメータにスクリプト要素を入れた URL（/xss-00/BenchmarkTest00030?BenchmarkTest00030=<スクリプト要素>）を作り、メールなどで被害者にクリックさせる。レスポンスにそのまま埋め込まれ、
+被害者のブラウザ上で対象サイトの権限でスクリプトが実行される。
