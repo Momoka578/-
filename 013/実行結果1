@@ -1,0 +1,13 @@
+ 判定: **脆弱性あり**（XSS, CWE-80 / CWE-79。bad() メソッド）
+- XSS に該当: 種別・source・sink の詳細は "xssの詳細" を参照
+根拠:
+- bad()（L31-77）: L44-45 で ../common/config.properties を読み込み、L48 data = properties.getProperty("data") で外部ファイルの値を取得。L74 response.getWriter().println("<br>bad(): data = " + data) で、エンコードも検証もせずに HTML レスポンスに出力している。プロパティファイルは アプリ外部から変更されうる、信頼できないデータ源。
+- goodG2B()（L85-98）は data = "foo" の固定文字列なので安全。脆弱なのは bad() の経路だけ。
+- 使用トークン量（判定）: 新規 4,064（入力 4 ／ キャッシュ作成 2,907 ／ 出力〔推定〕 1,153）、キャッシュ読込 230,159、総処理 234,223、リクエスト 2 回
+
+*XSS 種別**: ストア型（攻撃用の文字列がサーバー上のファイル config.properties に保存され、bad() が呼ばれるたびに、ページを開いた全利用者のレスポンスへ出力されるため。リクエストから直接反射されるものではない）
+- **source**: L44-48 FileInputStream("../common/config.properties") → properties.load() → properties.getProperty("data")
+- **伝播経路**: L48 data = getProperty("data") → L71 null チェックだけ → L74 文字列連結
+- **sink**: L74 response.getWriter().println("<br>bad(): data = " + data)
+- **脆弱性の位置**: sink 側（L74 で HTML エンコードしていない）。source 側（L48）も、外部ファイルの値を検証せずに信頼している。
+- **攻撃例**: 攻撃者がなんらかの手段（設定ファイルの共有ディレクトリへの書き込み、別の脆弱性、設定変更機能など）で config.properties の data にスクリプト要素を書き込むと、このサーブレットを開いた全利用者のブラウザでスクリプトが実行される。
