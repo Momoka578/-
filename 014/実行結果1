@@ -1,0 +1,19 @@
+判定: **脆弱性あり**（XSS, CWE-79 / CWE-116 不適切なエンコード）
+- XSS に該当: 種別・source・sink の詳細は "xssの詳細" を参照
+対象: JSON の repository（linxiaowu66/swagger-ui）は現在 404 のため、同じコミット 14fad2b4 を上流 swagger-api/swagger-ui から取得して判定した（prePatch のコードのみ。postPatch や修正 diff は見ていない）。
+根拠:
+- handlebars.js L4-10 _sanitize はブラックリスト型の正規表現で、<script>…</script> と、引用符付きの on属性="…" / on属性='…'、on属性=単語(単語) の形しか消さない。script 以外のタグや、引用符なしで記号を含むイベントハンドラ属性は残るので、サニタイズになっていない。
+- L28-69 renderTextParam ヘルパー: 
+  - L32/L53 param.default（API 仕様 JSON の default 値）は上記 _sanitize を通すだけで、L58 の textarea 本文、L66 の value='…'（シングルクォートで囲んだ属性）にそのまま連結される。' や </textarea> がエスケープされないので、属性やテキストエリアから抜け出してイベントハンドラ属性やタグを入れられる。
+  - L37-43 X-data-* のベンダー拡張は、プロパティ名も値（param[property]）も一切エスケープせずに L42 で属性 '…' に連結され、L56/L65 でタグに入る。
+  - L68 結果を Handlebars.SafeString で返すので、テンプレート側（param.handlebars L26 {{#renderTextParam this}}）でも自動エスケープされない。
+  - name / valueId / paramType（L33-35）だけは escapeExpression 済み。
+- 同じ _sanitize を使う param.handlebars L32 {{{sanitize description}}} も、弱いブラックリストなので同様に危険。
+- 使用トークン量（判定）: 新規 13,665（入力 14 ／ キャッシュ作成 8,591 ／ 出力〔推定〕 5,060）、キャッシュ読込 853,742、総処理 867,407、リクエスト 7 回
+
+**XSS 種別**: DOM-base（ページの URL（location.search）から読み込む仕様ファイルを決め、取得した JSON をブラウザ内の JavaScript（Handlebars ヘルパー＋jQuery の .html()）で HTML に組み立てて DOM に挿入する。サーバーの応答に反射・保存されるのではなく、処理がすべてクライアント側で完結しているため）
+- **source**: src/main/html/index.html L36-38 window.location.search の url= パラメータ（読み込む API 仕様の URL）→ その仕様 JSON の parameters[].default、x-data-* 拡張、description
+- **伝播経路**: index.html L36-38 url → SwaggerUi が仕様 JSON を取得 → ParameterView.js L60-61 template(this.model) → param.handlebars L26 renderTextParam(this) → handlebars.js L32 defaultValue / L37-43 dataVendorExtensions → L53 sanitize()（不十分）→ L56-66 文字列連結 → L68 SafeString
+- **sink**: handlebars.js L58 / L66（default 値）、L42（X-data-* 拡張）で組み立てた HTML → ParameterView.js L61 $(this.el).html(...)（innerHTML 相当で DOM に挿入）。param.handlebars L32 の description も同様。
+- **脆弱性の位置**: sink 側（handlebars.js の出力の組み立てで、文脈に合ったエスケープをしていない。_sanitize の正規表現ブラックリストは対策として不十分）。source 側でも、URL パラメータで任意の外部仕様を読み込めるのに、その内容を信頼している。
+- **攻撃例**: 攻撃者が自分のサーバーに API 仕様 JSON を置き、あるパラメータの default 値に「シングルクォートで value 属性を閉じ、記号を含む引用符なしのイベントハンドラ属性を続ける」文字列（または x-data-* 拡張の値に同様の文字列）を入れる。被害者に「対象サイトの swagger-ui の URL ?url=攻撃者の仕様 URL」を開かせると、パラメータ欄の描画時にイベントハンドラが有効になり、swagger-ui のオリジンでスクリプトが実行される。
