@@ -1,0 +1,14 @@
+ 判定: **脆弱性あり**（XSS, CWE-79）
+- XSS に該当: 種別・source・sink の詳細は "xssの詳細" を参照
+根拠:
+- L31 param = request.form.get("BenchmarkTest00096") でフォーム（POST 本文）の値を取得。
+- L35-36 で guess = "ABC"[0] = 'A' に固定されるので、L38-40 の match 文では必ず case 'A' に入り bar = param になる（安全な定数になる分岐 B/_ には入らない）。
+- L50-52 で f 文字列に bar をそのまま埋め込み、L54 で return RESPONSE。Flask は str の戻り値を Content-Type: text/html で返すので、HTML として解釈される。import 済みの escape_for_html（L19）は使われていない。
+- 使用トークン量（判定）: 新規 2,954（入力 4 ／ キャッシュ作成 1,423 ／ 出力〔推定〕 1,527）、キャッシュ読込 162,119、総処理 165,073、リクエスト 2 回
+
+**XSS 種別**: 反射型（POST パラメータが保存されずに、そのレスポンスへ直接返されるため）
+- **source**: L31 request.form.get("BenchmarkTest00096")
+- **伝播経路**: L31 param → L32-33（空なら ""）→ L40 bar = param（guess は常に 'A'）→ L51 f'bar is \'{bar}\' ...' → L54 return RESPONSE
+- **sink**: L50-54 RESPONSE への埋め込みと return（Flask の text/html レスポンス本文）
+- **脆弱性の位置**: sink 側（L51 で HTML エスケープせずに埋め込んでいる）。source 側でも検証していない。
+- **攻撃例**: 攻撃者が自分のサイトに、/benchmark/xss-00/BenchmarkTest00096 へ POST する自動送信フォームを置き、BenchmarkTest00096 フィールドにスクリプト要素を入れておく。被害者がそのページを開くとフォームが送信され、返された HTML の中でスクリプトが対象サイトのオリジンで実行される。
