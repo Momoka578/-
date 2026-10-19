@@ -1,0 +1,15 @@
+判定: **脆弱性あり**（XSS, CWE-79。L12 は CWE-95 相当の JavaScript コード注入）
+- XSS に該当: 種別・source・sink の詳細は "xssの詳細" を参照
+根拠:
+- L2-5 で $_GET['head'] / ['title'] / ['href'] / ['script'] を取得し、検証もエスケープもせずに L8/L10/L12 で echo している。
+- L8 <head><?php echo $head; ?> … <title><?php echo $title; ?></title>：head は head 要素内にそのまま出力されるのでタグを直接書ける。title も </title> で閉じれば任意のタグを入れられる。
+- L10 <a href="http://<?php echo $href; ?>">：ダブルクォートを入れると属性から抜け出してイベントハンドラ属性などを追加できる。
+- L12 <script> ブロック内に $script をそのまま出力しているので、パラメータの値がそのまま JavaScript として実行される（HTML エスケープでも防げない文脈）。
+- 使用トークン量（判定）: 新規 5,829（入力 4 ／ キャッシュ作成 4,536 ／ 出力〔推定〕 1,289）、キャッシュ読込 222,180、総処理 228,009、リクエスト 2 回
+
+**XSS 種別**: 反射型（GET パラメータが保存されずに、そのリクエストのレスポンスへ直接出力されるため）
+- **source**: L2 $_GET['head']、L3 $_GET['title']、L4 $_GET['href']、L5 $_GET['script']
+- **伝播経路**: L2-5 で変数に代入 → 加工なし → L8/L10/L12 の echo
+- **sink**: L8 echo $head（head 要素内）、L8 echo $title（title 要素内）、L10 echo $href（href 属性値内）、L12 echo $script（script 要素内）
+- **脆弱性の位置**: sink 側（4 か所すべて、出力の文脈に合ったエスケープがない）。source 側でも入力検証していない。
+- **攻撃例**: script パラメータに任意の JavaScript 文（document.cookie を外部へ送るなど）を入れた test.php の URL を被害者に踏ませると、そのまま script 要素内で実行される。head／title パラメータにスクリプト要素を入れる、href パラメータにダブルクォートとイベントハンドラ属性を入れる方法でも同様に実行できる。
