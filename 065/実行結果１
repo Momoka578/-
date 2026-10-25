@@ -1,0 +1,14 @@
+### No.65 SARD 501365 PasswordServlet.java / login/incorrect.jsp（+ components/login-form.jsp, WEB-INF/web.xml）
+- 判定: **脆弱性あり**（ログインジェクション／ログ偽造・CWE-117。XSS(CWE-79) はなし）
+根拠（CWE-117）:
+- PasswordServlet.java 64行目: `String email = request.getParameter("login_email");` 未認証の誰もが POST /password-login（web.xml 334-335, 680-681行目）で任意の値を送れる。
+- PasswordServlet.java 100-101行目: ログイン失敗時に `log.info(LogManager.getHeader(context, "failed_login", "email=" + email + ", result=" + ...))` として email を無加工でログに書く。
+- 上流 DSpace 6.2 の LogManager.escapeLogField（LogManager.java 74-81行目）は「\」と「:」しかエスケープせず、CR/LF は素通し。log4j.properties 55行目の PatternLayout `%d %-5p %c @ %m%n` も改行を符号化しない。
+- よって login_email に改行を含めると dspace.log に任意の偽の行（例: 他ユーザーの login 成功行）を差し込め、監査ログや LogAnalyser の統計を改ざんできる。認証前に悪用でき、影響は低〜中程度。
+- 修正案（XSS ではないので修正コードは作らない）: ログに出す前に email の CR/LF などの制御文字を置換・除去する（例: email.replaceAll("[\\r\\n\\t]", "_")）か、LogManager.escapeLogField で改行もエスケープする。
+XSS がないと判断した理由:
+- login/incorrect.jsp 40行目で `<c:set var="login_email"><%= request.getParameter("login_email") %></c:set>` と入力値を page スコープ変数に入れているが、出力は 43行目の `<c:out value="${login_email}" />` だけ。c:out は escapeXml が既定で true なので & < > ' " がエスケープされる（escapeXml="false" の指定もない）。
+- web.xml は Servlet 2.4（11行目）なので EL は有効。c の taglib URI（incorrect.jsp 24行目）は標準 JSTL で、web.xml や上流 WEB-INF に c.tld の差し替えもない。
+- fmt:param（43行目）にはエスケープ済みの文字列が入る。上流 Messages.properties 654行目の jsp.login.incorrect.text は {0}（コンテキストパス+/forgot、42行目）しか使わず、ユーザー入力は属性値にも入らない。
+- components/login-form.jsp は静的なフォームで、出力するのは request.getContextPath() とメッセージキーだけ（17, 18, 37行目）。ユーザー入力は出力していない。
+- 使用トークン量（判定）: 新規 36,122（入力 16 ／ キャッシュ作成 24,480 ／ 出力〔推定〕 11,626）、キャッシュ読込 196,944、総処理 233,066、リクエスト 8 回
