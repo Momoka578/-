@@ -1,0 +1,12 @@
+## No.83 CVE-2019-10745 assign-deep 1.0.0 (index.js)
+- 判定: **脆弱性あり**（プロトタイプ汚染 Prototype Pollution・CWE-1321 / CWE-915）
+対象: jonschlinkert/assign-deep prePatch edab79f1fe37bb8f78f4d7a4fe205c66885acee3 の index.js（ライブラリ本体は 37 行のこのファイルのみ）
+根拠:
+- index.js 12-29 行の再帰マージ関数 assign(target, ...args) は、18 行で Object.keys(args[i]) のキーをそのまま列挙し、キー名を一切検査していない（"__proto__"、"constructor"、"prototype" を除外していない）。
+- 経路1（__proto__）: JSON.parse で作ったオブジェクトでは "__proto__" が自身のプロパティとして Object.keys に現れる。19 行で target["__proto__"] は Object.prototype を返し、31-33 行の isObject は toString.call(Object.prototype) === '[object Object]' なので true になる。そのため 20 行で assign(Object.prototype, 攻撃者の値) が再帰的に呼ばれ、22 行の target[key] = args[i][key] で Object.prototype に任意のプロパティが書き込まれる。
+- 経路2（constructor.prototype）: source が {constructor: {prototype: {...}}} の形だと、19 行で target.constructor は Object 関数になる。isObject は typeof === 'function' でも true を返すので、20 行で assign(Object, {prototype: ...}) に進む。さらに Object.prototype に再帰し、22 行で汚染される。この経路は JSON 由来でなくても成立する。
+- 影響: リクエストボディや設定ファイルなど、攻撃者が制御する JSON をこの関数でマージするアプリでは、全オブジェクトが継承するプロパティを書き換えられる。その結果、認可フラグの改ざん（例: isAdmin）、例外による DoS（CWE-400）、テンプレートエンジンや child_process のオプション経由での任意コード実行・コマンド実行（CWE-94 / CWE-78）、出力処理経由の XSS（CWE-79）につながりうる。
+- 主な脆弱性の位置: index.js 18-22 行（特に 22 行の代入 target[key] = args[i][key] と、20 行の再帰呼び出し）。
+- XSS そのものではない（DOM や HTML 出力の sink を持たない汎用ライブラリ）ため、XSS 用の項目と修正コードは作らない。
+修正案（記録のみ）: 18 行のループ内で key が '__proto__'、'constructor'、'prototype' のときは continue する。または Object.prototype.hasOwnProperty.call(target, key) で、自身のプロパティのときだけ再帰する。isObject で Object.prototype や関数を再帰先にしない。
+- 使用トークン量（判定）: 新規 4,893（入力 4 ／ キャッシュ作成 2,977 ／ 出力〔推定〕 1,912）、キャッシュ読込 34,381、総処理 39,274、リクエスト 2 回
