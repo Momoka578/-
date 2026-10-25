@@ -1,0 +1,21 @@
+
+### No.61 SARD 501377 eperson-list.jsp（+ EPersonListServlet.java）
+- 判定: **脆弱性あり**（反射型クロスサイトスクリプティング・CWE-79）
+- XSS に該当: 種別・source・sink の詳細は "xssの詳細" を参照
+根拠:
+- EPersonListServlet.java 90行目で request.getParameter("search") をそのまま取得し、107行目で request.setAttribute("search", search) として JSP に渡している（検証・エスケープなし）。
+- eperson-list.jsp 44行目で search を取り出し、187行目 `<input ... name="search" value="<%= search %>"/>` でエスケープせずに HTML 属性値へ出力している。`"` を含めれば属性を抜けてイベントハンドラ属性やタグを注入できる。
+- 同 117行目で jumpLink = ... + "&search=" + search + "&offset=" と URL エンコードも HTML エスケープもせずに連結し、200〜205行目・329〜334行目の `<a href="<%= jumpLink %>...">` にそのまま出力している（2つ目の sink）。
+- 214行目の検索結果表示は Utils.addEntities(search)（= Escape.html）でエスケープされており安全。不統一な扱いで、187行目と 200〜205/329〜334行目だけが漏れている。
+- その他の確認: eperson-list.jsp 298〜299行目の fullname/email は escapeJavaScript→escapeXml の順で onclick 属性用に正しく二重エスケープ、307〜315行目は Utils.addEntities 済み、305/306行目の e.getID() は UUID。profile-form.jsp 65/70/74行目は Utils.addEntities 済み、96行目の lang は設定由来のロケール。edit-profile.jsp・EditProfileServlet.java にはエスケープ漏れの出力なし。
+- 補足（XSS 以外の気付き）: web.xml では /tools/* は registered-only フィルタのみで、EPersonListServlet 自体に管理者権限チェックがない。ログイン済みの一般ユーザーでも全 EPerson のメールアドレス一覧を閲覧できる可能性がある（CWE-862 の疑い。呼び出し先の権限制御はこの zip だけでは確認不能のため主判定には含めない）。
+- 使用トークン量（判定）: 新規 26,848（入力 6 ／ キャッシュ作成 22,507 ／ 出力〔推定〕 4,335）、キャッシュ読込 69,269、総処理 96,117、リクエスト 3 回
+
+## No.61 SARD 501377 eperson-list.jsp（+ EPersonListServlet.java）
+
+- **XSS 種別**: 反射型 — HTTP リクエストの search パラメータがサーバ側で保存されずに、同じレスポンスの HTML にそのまま埋め込まれるため。
+- **source**: EPersonListServlet.java 90行目 `String search = request.getParameter("search");`（GET/POST どちらでも可。doDSPost 43行目も doDSGet に委譲）
+- **伝播経路**: EPersonListServlet.java 90行目 getParameter → 107行目 request.setAttribute("search", search) → JSPManager.showJSP（114行目）→ eperson-list.jsp 44行目 request.getAttribute("search") → (a) 187行目へ直接出力 / (b) 117行目で jumpLink 文字列に連結 → 200〜205・329〜334行目へ出力
+- **sink**: eperson-list.jsp 187行目 `value="<%= search %>"`（input 要素の属性値）、および 200〜205行目・329〜334行目 `href="<%= jumpLink %>..."`（a 要素の href 属性値。jumpLink は 117行目で search を未エンコード連結）
+- **脆弱性の位置**: sink 側（eperson-list.jsp の出力時に HTML 属性コンテキスト用のエスケープ／URL エンコードをしていない点が本質）。source 側（サーブレット 90行目）にも入力検証はないが、検索語は任意文字列を許す必要があるため、修正は出力側で行うべき。
+- **攻撃例**: 攻撃者は、ダブルクォートで value 属性（または href 属性）を閉じてイベントハンドラ属性を追加するような文字列を search パラメータに入れた /tools/eperson-list の URL を作り、DSpace にログイン中の利用者（管理者・コレクション管理者など）にメールや掲示板経由でクリックさせる。レスポンスの検索ボックスとページ送りリンクにその文字列がそのまま埋め込まれ、被害者のブラウザで DSpace のオリジン権限のスクリプトが実行される。その結果、セッションの乗っ取りや、被害者の権限での操作（グループ編集など）を行われる。
