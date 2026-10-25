@@ -1,0 +1,16 @@
+## No.82 CVE-2019-10744 lodash 4.17.11（prePatch 1f8ea07, lodash.js）
+- 判定: **脆弱性あり**（コードインジェクション CWE-94 / 不適切なエスケープ CWE-116。あわせてプロトタイプ汚染 CWE-1321）
+根拠1（コードインジェクション: _.template, lodash.js 14756-14862）:
+ - 14787-14791: options.sourceURL を '//# sourceURL=' + options.sourceURL + '\n' とそのまま連結している。改行文字の除去やエスケープをしていないので、sourceURL に改行を含めると、改行の後ろの文字列がテンプレート関数本体の JavaScript として扱われる。
+ - 14822, 14832: options.variable を 'function(' + (variable || 'obj') + ') {' と連結している。識別子として正しいかを検査していないので、')' や '{' などを含めると任意のコードを関数定義に差し込める。
+ - 14851: 上の文字列を Function(importsKeys, sourceURL + 'return ' + source) に渡して実行している（sink）。Node.js 上では任意コード実行（RCE）、ブラウザ上では任意スクリプト実行になる。
+ - 14766: options = assignInWith({}, options, settings, customDefaultsAssignIn)。assignIn は keysIn（12657-12659）を使うので、継承プロパティもコピーする。14788 の 'sourceURL' in options もプロトタイプ鎖を見る。そのため、別の箇所で Object.prototype.sourceURL / variable が汚染されていると、アプリが options を渡さない普通の _.template(str) 呼び出しでもコードが注入される（プロトタイプ汚染 → コード実行のガジェット）。
+根拠2（プロトタイプ汚染: baseSet, lodash.js 3955-3983）:
+ - 3967-3980: パスの各キーについて '__proto__'・'constructor'・'prototype' を除外していない。3971 で nested[key] を読み、3979 の assignValue で代入し、3980 の nested = nested[key] で辿っていく。'__proto__.x' や 'constructor.prototype.x' のパスで Object.prototype を書き換えられる。このパスは _.set / _.setWith / _.update / _.zipObjectDeep（8664-8666）から到達できる。
+補足（ベンチマーク JSON の指摘行 6608 = safeGet の return object[key]）:
+ - safeGet（6599-6609）は '__proto__' と、関数値の 'constructor' を返さない。baseMergeDeep（3624-3625）と baseMerge（3597）はこれを経由する。'constructor'→'prototype' のパスでは objValue が undefined になり、initCloneObject（3669）で新しいオブジェクトが作られる。このため merge / defaultsDeep の経路は、このコミットでは塞がれていると判断した。判定「あり」の主な根拠は template のコード注入（CWE-94/116）である。
+修正案（XSS ではないので修正コードは作らない）: sourceURL から改行（\n \r 
+ 
+）を除去する。variable は識別子の正規表現で検証し、不正なら例外にする。options のコピーは own プロパティだけ（hasOwnProperty）にする。baseSet で '__proto__'・'constructor'・'prototype' のキーを拒否する。
+- 使用トークン量（判定）: 新規 29,637（入力 16 ／ キャッシュ作成 21,615 ／ 出力〔推定〕 8,006）、キャッシュ読込 201,991、総処理 231,628、リクエスト 8 回
+
