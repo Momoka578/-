@@ -1,0 +1,11 @@
+### No.58 aheckmann/mpath lib/index.js (CVE-2018-16490, prePatch 77204d7)
+- 判定: **脆弱性あり**（プロトタイプ汚染、CWE-1321 / CWE-915）
+根拠: lib/index.js 157 行目 exports.set(path, val, o, ...) は、172〜174 行目でパスを "." で分割し、191〜228 行目で obj = _to[part]（224 行目）とたどったあと、
+  272 行目 obj[part] = map(val) で代入する。各 part が "__proto__"、"constructor"、"prototype" かどうかをまったく検査していない。
+  そのため、set('__proto__.isAdmin', true, {}) のように呼ぶと、224 行目で obj が Object.prototype になり、272 行目で Object.prototype.isAdmin = true が書き込まれる
+  （'constructor.prototype.x' でも同じ）。249/261 行目の配列要素への代入も同様。
+  mpath は mongoose などでドキュメントのパス指定に使われており、パス文字列（クエリやリクエストボディのキー）が外部から来ると、
+  プロセス全体のすべてのオブジェクトに既定値を注入できる。認可判定の迂回、例外による DoS、テンプレートエンジン等と組み合わせた
+  コード実行（RCE）や XSS につながりうる。
+修正案: 各 part について '__proto__'、'constructor'、'prototype' を拒否する（あるいは hasOwnProperty で自身のプロパティだけをたどる）。XSS そのものではないため修正コードは作らない。
+- 使用トークン量（判定）: 新規 7,715（入力 6 ／ キャッシュ作成 6,176 ／ 出力〔推定〕 1,533）、キャッシュ読込 338,753、総処理 346,468、リクエスト 3 回
