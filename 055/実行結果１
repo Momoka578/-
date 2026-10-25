@@ -1,0 +1,12 @@
+### No.55 moscajs/mosca lib/persistence/mongo.js (CVE-2018-11615, prePatch e61f749)
+- 判定: **脆弱性あり**（不完全なエスケープによる正規表現インジェクション → DoS、CWE-116・CWE-20・CWE-625/1333）
+根拠: lib/persistence/mongo.js 269〜271 行目 lookupRetained(pattern) は、MQTT クライアントが SUBSCRIBE で送ったトピックフィルタ pattern から
+  new RegExp(pattern.replace(/(#|\+)/, ".+").replace('\\', '\\\\')) を作り、MongoDB の $regex 検索に使っている。
+  ・replace(/(#|\+)/, ...) には g フラグがなく、最初の "#" か "+" しか置換しない。replace('\\', '\\\\') も最初の 1 個のバックスラッシュだけ。
+  ・それ以外の正規表現メタ文字（( ) [ ] * ? { } . | ^ $ など）はまったくエスケープしていない。
+  呼び出し経路: client.js 484〜502 行目 handleSubscribe → server.forwardRetained(sub.topic)（abstract.js 86〜87 行目で lookupRetained に差し替え）。
+  影響: (1) "(" のような不正なパターンを購読すると new RegExp が同期的に SyntaxError を投げ、ブローカーのプロセスが落ちうる（未捕捉例外による DoS）。
+        (2) 2 個目以降の "+" やグループを使って、壊滅的なバックトラックを起こす正規表現を MongoDB に評価させ、DB の CPU を占有できる（ReDoS）。
+  283 行目で Matcher による再判定があるため、他トピックの情報漏えいには直結しないが、可用性の侵害は成立する。
+修正案: トピック文字列の正規表現メタ文字をすべてエスケープしてから、"+" → "[^/]+"、"#" → ".*" をグローバルに置換する。new RegExp を try/catch で囲む。XSS ではないため修正コードは作らない。
+- 使用トークン量（判定）: 新規 22,413（入力 12 ／ キャッシュ作成 19,204 ／ 出力〔推定〕 3,197）、キャッシュ読込 500,636、総処理 523,049、リクエスト 6 回
