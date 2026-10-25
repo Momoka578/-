@@ -1,0 +1,11 @@
+## No.23 CVE-2017-1000219 KyleRoss/windows-cpu index.js（prePatch da656c1）
+- 判定: **脆弱性あり**（OS コマンドインジェクション・CWE-78／CWE-88）
+根拠:
+- index.js L77-82 findLoad(arg, cb): L81 で "wmic path Win32_PerfFormattedData_PerfProc_Process get Name,PercentProcessorTime,IDProcess | findstr /i /c:" + arg と、ライブラリ利用者から受け取った arg を検証も引用もせずに連結し、L82 の child_process.exec(cmd) でシェル（Windows では cmd.exe）経由で実行している。
+- arg に &、|、&& などのシェルのメタ文字を含めると、findstr の後ろに任意のコマンドをつなげて実行できる。空白を含めると引数が分かれてしまう（引数インジェクション）問題もある。
+- findLoad は公開 API（exports.findLoad）で、ドキュメント上も「プロセス名や PID を渡す」用途になっている。Web アプリが利用者指定のプロセス名を渡すと、リモートからコマンドを実行できる。
+- 他の関数（totalLoad L136, cpuInfo L231）は execFile と固定引数、totalMemoryUsage L270-271 は固定文字列なので問題ない。nodeLoad/processLoad（L174, L202）は固定値や数値を渡すので安全。
+- XSS ではない（HTML 出力はない）。
+修正案（コードは作らない）: exec をやめ、execFile(wmic, ['path','Win32_PerfFormattedData_PerfProc_Process','get','Name,PercentProcessorTime,IDProcess']) で取得して JS 側でフィルタする。少なくとも arg を /^[\w.#-]+$/ や数値に制限する。
+- 使用トークン量（判定）: 新規 9,054（入力 6 ／ キャッシュ作成 7,655 ／ 出力〔推定〕 1,393）、キャッシュ読込 245,640、総処理 254,694、リクエスト 3 回
+
