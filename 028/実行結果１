@@ -1,0 +1,10 @@
+### No.28 CVE-2017-16003 felixrieseberg/windows-build-tools src/download.js（prePatch 3a97ea1）
+- 判定: **脆弱性あり**（安全でない通信路での実行ファイルのダウンロード（完全性検証なし）・CWE-829／CWE-494／CWE-295／CWE-319）
+根拠:
+- src/download.js L27-38 downloadTools(): nugget に strictSSL: false（L34）を指定して installer.url からファイルを取得しており、HTTPS でもサーバ証明書の検証が無効になっている。
+- ダウンロード先 URL（src/constants.js L5）は Visual C++ Build Tools インストーラ 'http://download.microsoft.com/...visualcppbuildtools_full.exe' で、暗号化されていない HTTP。Python インストーラ（constants.js L1, L11）は既定で https だが、L34 のせいで証明書を検証しない。環境変数 npm_config_python_mirror / PYTHON_MIRROR では http のミラーも指定できる。
+- 取得したファイルにはハッシュや署名の検証がなく（L38-52 では保存して resolve するだけ）、その後インストーラとして実行される（src/utils.js の getBuildToolsInstallerPath/getPythonInstallerPath L32-60 で保存先を決め、install 処理で起動）。このツールは管理者権限の PowerShell から実行することが前提になっている。
+- そのため、同じネットワーク上の攻撃者（公衆 Wi-Fi、悪意あるプロキシ、DNS 偽装など）が通信に割り込み、インストーラを改ざんした実行ファイルに差し替えると、被害者の端末で管理者権限の任意コードが実行される。
+- XSS ではない（Web 出力なし）。
+修正案（コードは作らない）: URL を https にし、strictSSL: true（既定値）に戻す。加えて、ダウンロードしたファイルの SHA-256 や Authenticode 署名を検証してから実行する。
+- 使用トークン量（判定）: 新規 15,742（入力 8 ／ キャッシュ作成 13,180 ／ 出力〔推定〕 2,554）、キャッシュ読込 827,907、総処理 843,649、リクエスト 4 回
