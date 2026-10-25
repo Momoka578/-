@@ -1,0 +1,13 @@
+## No.84 CVE-2019-10746 mixin-deep 2.0.0 (index.js)
+- 判定: **脆弱性あり**（プロトタイプ汚染 / Prototype Pollution・CWE-915（CWE-1321））
+根拠:
+- index.js 3-14行 mixinDeep(target, ...rest) は rest の各オブジェクトのキーを for...in で列挙し、mixin() で target へ再帰的にコピーする。
+- 7行目で除外しているのは key === '__proto__' のみで、'constructor' と 'prototype' は除外していない。
+- 16-23行 mixin(): 17行目 obj = target[key]。18行目で val と obj の両方が isObject なら 19行目で mixinDeep(obj, val) と再帰し、それ以外は 21行目 target[key] = val で代入する。
+- 25-27行 isObject() は typeof val === 'function' も真とするため、target.constructor（= Object 関数）も「オブジェクト」とみなされ、再帰に入る。
+- そのため、JSON.parse 等で作られた外部入力 {"constructor": {"prototype": {"x": ...}}} を mixinDeep({}, input) に渡すと、
+  target.constructor（Object）→ Object.prototype の順にたどり、21行目 target[key] = val で Object.prototype.x に値が書き込まれる（グローバルなプロトタイプ汚染）。
+- 影響: 全オブジェクトに任意のプロパティが現れるため、アプリ側のロジック次第で認可回避、DoS（CWE-400）、テンプレートや child_process のオプション経由での XSS・コマンド実行・コード実行（CWE-79/78/94）につながり得る。
+- 脆弱な箇所: index.js 7行目（キー検査が '__proto__' だけで不十分）、21行目（検査されていないキーへの代入が書き込み先）。
+修正案（XSS ではないため修正コードは作らない）: 7行目の検査を '__proto__'・'constructor'・'prototype' を除外する isValidKey() に置き換える。あわせて hasOwnProperty で自身のプロパティだけを対象にする。または再帰先が Object.prototype や関数の prototype でないことを確認する。
+- 使用トークン量（判定）: 新規 4,302（入力 4 ／ キャッシュ作成 2,694 ／ 出力〔推定〕 1,604）、キャッシュ読込 34,429、総処理 38,731、リクエスト 2 回
