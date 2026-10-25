@@ -1,0 +1,20 @@
+### No.19 CVE-2018-16480 tnantoka/public bin/public（prePatch 6d152eb）
+- 判定: **脆弱性あり**（ストア型 XSS・CWE-79／CWE-116。付随してプレフィックス比較によるパストラバーサル CWE-22）
+- XSS に該当: 種別・source・sink の詳細は "xssの詳細" を参照
+根拠:
+- bin/public L98-111: 404 またはディレクトリへのアクセス時に fs.readdir でファイル一覧を取得し、L107 で '<li><a href="' + path.join(base, file) + '">' + file + '</a></li>' という HTML を組み立てる。ファイル名 file を HTML エスケープせずに、属性値（href）と要素内容の両方へ埋め込んでいる。
+- L110: '<h1>Index of "' + abs + '"</h1>' でも、リクエストパスから作った絶対パス abs をエスケープせずに出力している（url.parse が < > " などを %XX に自動エスケープするため、反射型としての実害は小さいが、出力時エスケープがない）。
+- L88: Content-Type: text/html で返すので、埋め込んだ文字列は HTML として解釈される。
+- L91-92, L100-101: エラー時に JSON.stringify(err) を <pre> にエスケープなしで出力（err.path を含む）。内部パスの開示にもなる。
+- 付随: L80 abs.indexOf(root) !== 0 は区切り文字のない前方一致なので、root が /srv/pub のとき /srv/pub/../pub2/secret（= /srv/pub2/secret）が通り、同じ接頭辞を持つ兄弟ディレクトリのファイルを読める（CWE-22）。
+- 使用トークン量（判定）: 新規 7,303（入力 6 ／ キャッシュ作成 4,148 ／ 出力〔推定〕 3,149）、キャッシュ読込 149,636、総処理 156,939、リクエスト 3 回
+
+
+## No.19 CVE-2018-16480 tnantoka/public bin/public（prePatch 6d152eb）
+
+- **XSS 種別**: ストア型（攻撃文字列はファイル名としてファイルシステムに保存され、一覧ページを開いた別の利用者のブラウザで実行されるため）
+- **source**: 公開ディレクトリ内のファイル名（L98 fs.readdir(filePath, ...) の files）。副次的にリクエスト URL のパス（L74 url.parse(req.url).pathname → L77 abs）
+- **伝播経路**: ファイル名 → files 配列（L98）→ forEach の file（L106）→ list 配列へ文字列連結（L107）→ list.join（L111）→ res.end。パスは pathname → filePath（L75）→ abs（L77）→ L110 の res.write
+- **sink**: L107 list.push('<li><a href="', path.join(base, file), '">', file, '</a></li>') → L111 res.end(list.join('\n'))。副次的に L110 res.write(['<h1>', 'Index of "', abs, '"</h1>'])、L92/L101 の JSON.stringify(err) 出力
+- **脆弱性の位置**: sink 側（ディレクトリ一覧の HTML を作るときに、ファイル名とパスを HTML エスケープしていない）
+- **攻撃例**: 攻撃者は、アップロード、共有フォルダ、配布アーカイブなどを使って、公開ディレクトリに HTML タグやイベント属性を含む名前のファイルを置く。利用者がその一覧ページを開くと、ファイル名がタグとして解釈され、スクリプトが実行される。
