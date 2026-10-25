@@ -1,0 +1,21 @@
+### No.73 SARD 501366 dspace-jspui/src/main/webapp/tools/eperson-list.jsp（+ EPersonListServlet.java）
+- 判定: **脆弱性あり**（反射型クロスサイトスクリプティング XSS・CWE-79）
+- XSS に該当: 種別・source・sink の詳細は "xssの詳細" を参照
+根拠:
+- EPersonListServlet.java 90行目でリクエストパラメータ search を request.getParameter("search") で取得し、検証・エスケープせずに 107行目 request.setAttribute("search", search) で JSP に渡している。
+- eperson-list.jsp 44行目で search 属性を取り出し、187行目 <input ... name="search" value="<%= search %>"/> で HTML 属性値にエスケープなしで出力している。ダブルクォートで属性を閉じれば任意の属性（イベントハンドラ）やタグを挿入できる。
+- 同 JSP 117行目で jumpLink に "&search="+search を URL エンコード・HTML エスケープなしで連結し、200〜205行目・329〜334行目の <a href="<%= jumpLink %>..."> に出力している。こちらも href 属性を閉じて任意の属性・タグを挿入できる（search が空でないときだけ使われる）。
+- 一方、214行目は Utils.addEntities(search) でエスケープ済み、298〜299行目の fullname/email は escapeJavaScript→escapeXml、307〜315行目の EPerson の各項目は Utils.addEntities でエスケープ済みで問題なし。sortby は Servlet 側で固定値に変換され（57〜74行目）、first/offset は int に変換されるので注入不可。
+- web.xml 83〜86行目で /tools/* は registered-only フィルタが掛かっているため、被害者はログイン済みユーザー（管理者を含む）に限られるが、GET で成立するため細工した URL を踏ませるだけで攻撃できる。
+- EPersonServiceImpl.java の search は UUID 判定のあと DAO へ文字列を渡すだけで、このファイル内に SQL 文の組み立てはなく、SQL インジェクションの根拠は見当たらない。
+修正方針（案）: 187行目は Utils.addEntities(search) で HTML エスケープし、117行目は search を URLEncoder.encode(search, "UTF-8") で URL エンコードしたうえで、href 出力時に Utils.addEntities(jumpLink) で HTML エスケープする。
+- 使用トークン量（判定）: 新規 20,408（入力 8 ／ キャッシュ作成 17,499 ／ 出力〔推定〕 2,901）、キャッシュ読込 95,340、総処理 115,748、リクエスト 4 回
+
+## No.73 SARD 501366 dspace-jspui/src/main/webapp/tools/eperson-list.jsp（+ EPersonListServlet.java）
+
+- **XSS 種別**: 反射型（リクエストパラメータ search がサーバーに保存されず、同じレスポンスの HTML にそのまま反映されるため）
+- **source**: EPersonListServlet.java 90行目 request.getParameter("search")（HTTP リクエストの search パラメータ）
+- **伝播経路**: EPersonListServlet.java 90行目 search → 107行目 request.setAttribute("search", search) → eperson-list.jsp 44行目 (String) request.getAttribute("search") → (a) そのまま 187行目へ／(b) 117行目で jumpLink に連結 → 200〜205・329〜334行目へ
+- **sink**: eperson-list.jsp 187行目 <input value="<%= search %>">、および 200〜205行目・329〜334行目 <a href="<%= jumpLink %>...">（JSP 式 <%= %> による無加工出力）
+- **脆弱性の位置**: sink 側（JSP 187行目と 117行目＋200〜205・329〜334行目で、HTML 属性値への出力時にエスケープしていない）。source 側の Servlet 90〜107行目でも無検証のまま渡しているが、同じ値を 214行目ではエスケープしているので、出力時エスケープの漏れが本質。
+- **攻撃例**: 攻撃者は search パラメータにダブルクォートで属性を閉じてイベントハンドラやスクリプトタグを続ける文字列を入れた /tools/eperson-list の URL を作り、ログイン済みの DSpace ユーザー（管理者など）にリンクを踏ませる。応答ページの検索欄の value 属性とページ送りリンクの href 属性に文字列がそのまま埋め込まれ、被害者のブラウザでスクリプトが実行されてセッションの悪用や管理操作の実行が起こり得る。
