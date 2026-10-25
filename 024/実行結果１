@@ -1,0 +1,20 @@
+## No.24 CVE-2017-1000427 markedjs/marked lib/marked.js（prePatch 38f1727, v0.3.6）
+- 判定: **脆弱性あり**（XSS・CWE-79。原因は URL スキームの不完全な検査 CWE-20／CWE-184）
+- XSS に該当: 種別・source・sink の詳細は "xssの詳細" を参照
+根拠:
+- lib/marked.js L869-888 Renderer.prototype.link: sanitize オプションが有効なとき（L870）、L872-874 で href を unescape、decodeURIComponent、英数字と ':' 以外の除去、小文字化の順に正規化する。L878 では、先頭が 'javascript:' または 'vbscript:' の場合だけ空文字を返す（拒否リスト方式）。
+- 'data:' など他の危険なスキームは検査されず、L882 '<a href="' + href + '"' としてそのまま出力される。例えば data:text/html;base64,... のリンクは sanitize: true でも通る。当時のブラウザ（data: URL へのトップレベル遷移を禁止する前の Chrome/Firefox など）では、クリックするとスクリプト入りの HTML が開いて実行される。Firefox の古い版では data: 文書が開いた元のオリジンを引き継ぐことがあった。
+- href は InlineLexer.outputLink（L702-708）で escape() 済みなので、属性値から抜け出すことはできない。問題はスキーム検査が許可リストではなく不完全な拒否リストである点。
+- Renderer.prototype.image（L890-897）は sanitize 時でも src のスキームを一切検査しない（img の javascript: は現行ブラウザでは実行されないが、同じ設計上の欠陥がある）。
+- sanitize: true は「信頼できない Markdown を安全に表示する」ためのオプションなので、これを迂回できることは脆弱性にあたる（既定値 sanitize: false では生 HTML をそのまま通す仕様、L1246）。
+- 使用トークン量（判定）: 新規 14,625（入力 12 ／ キャッシュ作成 8,740 ／ 出力〔推定〕 5,873）、キャッシュ読込 542,308、総処理 556,933、リクエスト 6 回
+
+
+## No.24 CVE-2017-1000427 markedjs/marked lib/marked.js（prePatch 38f1727, v0.3.6）
+
+- **XSS 種別**: ストア型（marked はライブラリだが、主な利用場面では、攻撃者が投稿・保存した Markdown（コメント、README、Wiki 等）が他の利用者向けに HTML へ変換されて表示され、閲覧者がリンクをクリックしたときに実行されるため。クライアント側だけで変換する使い方では DOM-base にもなりうる）
+- **source**: marked(src, {sanitize: true}) に渡される Markdown 文字列中のリンク記法 [text](href)・参照リンク定義・autolink（L620-626 cap[2]、L631-642 this.links、L578-590 cap[1]）
+- **伝播経路**: Markdown の href 部分 → InlineLexer.output のリンク処理（L620-626）→ outputLink（L702-708）で escape(link.href) → Renderer.prototype.link（L869）→ L872-878 のスキーム検査（data: 等は素通り）→ L882 の文字列連結
+- **sink**: lib/marked.js L882 var out = '<a href="' + href + '"'（返された HTML を利用側が innerHTML やテンプレートで出力する）。副次的に L891 '<img src="' + href + '"'
+- **脆弱性の位置**: sink 側（出力直前のスキーム検査 L878 が javascript:/vbscript: だけを拒否する不完全な拒否リストで、安全なスキームの許可リストになっていない）
+- **攻撃例**: 攻撃者は sanitize を有効にしたサイトのコメント欄などに、リンク先を data: スキームの HTML（中身にスクリプト）にした Markdown リンクを投稿する。検査を通ってそのまま a 要素の href になり、閲覧者がクリックすると、スクリプト入りの文書が開いて実行される。
