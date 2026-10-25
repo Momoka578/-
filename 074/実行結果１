@@ -1,0 +1,13 @@
+### No.74 SARD 501362 eperson-edit.jsp / eperson-confirm-delete.jsp / EPersonAdminServlet.java (DSpace 6.2 JSPUI 管理者の EPerson 編集)
+- 判定: **脆弱性なし**（XSS 対策済み。他の種類の脆弱性も確認できず）
+根拠（なしと判断した理由）:
+- 管理者が入力した値（servlet の 131〜175 行と 211〜243 行: email, firstname, lastname, netid, phone, language）は EPerson に保存され、JSP で再表示される。この再表示がストア型 XSS の候補になる。
+- eperson-edit.jsp の出力箇所は、86 行（見出しの email）、105 行（email）、113 行（lastName）、121 行（firstName）、129 行（netid）、138 行（phone）。どれも Utils.addEntities() でエスケープしている。上流の DSpace 6.2 では Utils.addEntities() は com.coverity.security.Escape.html() を呼ぶだけで、& < > " ' を実体参照にする。value 属性は二重引用符で囲まれているので、属性の外へ抜け出せない。
+- eperson-edit.jsp 216 行: グループ名（myLink、209〜214 行）も Utils.addEntities() でエスケープしている。ただし <a> タグ全体をエスケープしているので、リンクではなく文字列として表示される。これは機能上の不具合で、セキュリティ上の問題ではない。
+- eperson-edit.jsp 104 行の eperson.getID() は UUID。163〜164 行の lang と表示名は、設定ファイルのロケールと JDK から来る値で、ユーザー入力ではない。保存された language は 154・160 行で比較に使うだけで、出力されない。175・182 行は真偽値から決まる固定文字列。88 行の popup は Messages のキーから組み立てる。
+- eperson-confirm-delete.jsp: 38 行（getFullName）と 39 行（getEmail）は Utils.addEntities() でエスケープしている。48 行は UUID。
+- アクセス制御: web.xml 73〜76 行で admin-only フィルタ（AdminOnlyFilter）を /dspace-admin/* に割り当てており、545〜546 行で本サーブレットを /dspace-admin/edit-epeople に割り当てている。そのため管理者しか使えない。login-as（310〜383 行）は、設定フラグ（312 行）と authorizeService.isAdmin（325 行）を確認し、管理者グループの直接メンバーを対象にできないようにしている（349〜355 行）。
+- 343 行は UUID を != で比べている（参照の比較）。値が違えば必ず例外になる（安全側に倒れる）ので、権限の回避にはならない。
+- 130 行・297 行: eperson_id が不正だと e が null のまま使われ NPE になる。131 行: email パラメータがないと NPE。どちらも管理者に限られた 500 エラーで、悪用できる脆弱性ではない。
+- 注意点（判定には含めない）: どのフォームにも CSRF トークンがない。ただしこれは DSpace JSPUI 全体の設計で、このテストケースに固有の欠陥ではないと判断した。
+- 使用トークン量（判定）: 新規 42,133（入力 16 ／ キャッシュ作成 33,374 ／ 出力〔推定〕 8,743）、キャッシュ読込 241,291、総処理 283,424、リクエスト 8 回
