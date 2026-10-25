@@ -1,0 +1,17 @@
+## No.67 SARD 501355 group-edit.jsp（GroupEditServlet.java / GroupServiceImpl.java / web.xml）
+- 判定: **脆弱性なし**（対象フロー上の XSS(CWE-79) は出力時エスケープ済み。他の種類の脆弱性もテストケース内には見当たらない）
+根拠:
+- 対象のデータの流れ: GroupEditServlet.java 92行目 request.getParameter("group_name")（ユーザー入力）→ 96行目 groupService.setName() → GroupServiceImpl.java 95-104行目 setName()（恒久グループ以外は値をそのまま設定）→ 97行目 update() で DB に保存 → 212-218行目でグループを request 属性に入れて /tools/group-edit.jsp を表示。
+- sink の group-edit.jsp では、グループ名を出力する 2 か所がどちらもエスケープされている:
+  - 72行目 <h1> 本文: <%=Utils.addEntities(group.getName())%>
+  - 79行目 input の value 属性（ダブルクォートで囲まれている）: <%= Utils.addEntities(group.getName()) %>
+  - Utils.addEntities は上流 DSpace 6.2 の org.dspace.core.Utils（279-282行目）で com.coverity.security.Escape.html() を呼ぶ。& < > " ' / を実体参照に変えるので、本文でも二重引用符の属性値でも安全。
+- そのほかの出力も安全: 72行目と85行目の group.getID() は UUID。66行目と69行目の naviAdmin / link はサーバ側の固定文字列。73行目の popup は固定のメッセージキー。
+- 認可: web.xml 83-86行目で /tools/* に registered-only フィルタ、610-611行目で /tools/group-edit を GroupEditServlet に割り当て。サーブレット 69行目で対象グループへの ADD 権限を確認し、削除（230行目）では WRITE 権限を追加で確認している。GroupServiceImpl の create（76行目、管理者限定）、setName/delete（恒久グループの保護、96行目・390行目）、getParentObject（588-657行目、コレクション/コミュニティ管理者の委任範囲）にも不審な点はない。
+- SQL はすべて DAO 経由。ファイル操作・リダイレクト・コマンド実行はない。group_id/eperson_id/group_ids は UIUtil で UUID に変換されるので、インジェクションの経路はない。
+注意点（テストケースの範囲外で、判定には含めない）:
+- group-edit.jsp 95行目が呼ぶ上流のタグ SelectGroupTag は、メンバーグループの名前を groups[i].getName() のままエスケープせずに出力する。上流の tools/group-list.jsp（showMainPage 310行目から表示）と dspace-admin/group-confirm-delete.jsp（225行目から表示）も、グループ名をエスケープせずに出力する。グループ名を変えられるコレクション管理者などが、別の管理者に対してストア型 XSS を仕掛けられる余地があり、これは DSpace 6.2 本体の問題。
+- doDSGet が doDSPost を呼ぶ（44-49行目）。フォームに CSRF トークンもないので、GET でもメンバー変更などができてしまう（CSRF, CWE-352）。ただしこれは JSPUI 全体の設計で、このテストケース固有ではない。
+- 94行目: group_name が無いと newName.equals() で NullPointerException になる。エラーページに飛ぶだけで、脆弱性とはみなさない。
+- 使用トークン量（判定）: 新規 70,875（入力 22 ／ キャッシュ作成 48,961 ／ 出力〔推定〕 21,892）、キャッシュ読込 388,346、総処理 459,221、リクエスト 11 回
+
