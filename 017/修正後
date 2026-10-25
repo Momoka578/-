@@ -1,0 +1,150 @@
+# No.17 google/firing-range src/tests/dom/ToxicDom.java
+
+- 修正対象ファイル: ToxicDom.java
+- 修正箇所のコメント（コード内から抜粋）:
+  - `// 修正: eval / innerHTML / document.write の代わりに使う安全な sink。`
+  - `// 修正: postMessage 用の安全なハンドラ。送信元 origin を自オリジンと完全一致で確認し、`
+  - `// 修正: 例外を 400 として返せるよう try で囲み、X-XSS-Protection: 0 を付ける sendXssed は使わない`
+  - `// 修正: sendXssed（X-XSS-Protection: 0）ではなく通常ページとして返す`
+  - `// 修正: sendXssed（X-XSS-Protection: 0）ではなく通常ページとして返す`
+  - `// 修正: postMessage 系テンプレートは origin 未検証・不完全な検証のまま eval / innerHTML /`
+  - `// 修正: 指定された危険な sink テンプレート（eval / innerHTML / document.write）は読み込まず、`
+
+```java
+package com.google.testing.security.firingrange.tests.dom;
+
+import com.google.common.base.CharMatcher;
+import com.google.testing.security.firingrange.utils.Responses;
+import com.google.testing.security.firingrange.utils.Templates;
+
+import java.io.IOException;
+import java.util.regex.Pattern;
+
+import javax.servlet.http.HttpServlet;
+import javax.servlet.http.HttpServletRequest;
+import javax.servlet.http.HttpServletResponse;
+
+/**
+ * A servlet to provide toxic DOM based XSSes. It is mapped to the whole /dom/toxicdom/
+ * directory and maps paths as follows:
+ * <ul>
+ *     <li> Source object
+ *     <li> Source property
+ *     <li> Sink
+ * </ul>
+ *
+ * Thus, {@code /dom/toxicdom/document/cookie/eval} will map to the document.cookie source,
+ * and the eval sink.
+ */
+public class ToxicDom extends HttpServlet {
+
+  private static final String TOXIC_TEMPLATE = "toxicdom.tmpl";
+  private static final String TOXIC_EXTERNAL_TEMPLATE = "toxicdomexternal.tmpl";
+
+  private static final Pattern WORD_CHARS_ONLY = Pattern.compile("^\\w+$");
+
+  // 修正: eval / innerHTML / document.write の代わりに使う安全な sink。
+  // payload を textContent に代入するので、HTML や JavaScript として解釈されない。
+  private static final String SAFE_SINK =
+      "var div = document.createElement('div');\n"
+      + "document.documentElement.appendChild(div);\n"
+      + "// Sync trigger.\n"
+      + "div.textContent = payload;\n"
+      + "// Async trigger.\n"
+      + "function trigger(payload) {\n"
+      + "  div.textContent = payload;\n"
+      + "}\n";
+
+  // 修正: postMessage 用の安全なハンドラ。送信元 origin を自オリジンと完全一致で確認し、
+  // 受信データは eval / innerHTML / document.write に渡さず textContent で文字列として表示する。
+  private static final String SAFE_POSTMESSAGE_HANDLER =
+      "var postMessageHandler = function(msg) {\n"
+      + "  if (msg.origin !== window.location.origin) {\n"
+      + "    return;\n"
+      + "  }\n"
+      + "  var div = document.createElement('div');\n"
+      + "  div.textContent = (typeof msg.data === 'string') ? msg.data : JSON.stringify(msg.data);\n"
+      + "  document.documentElement.appendChild(div);\n"
+      + "};\n"
+      + "\n"
+      + "window.addEventListener('message', postMessageHandler, false);\n";
+
+  @Override
+  public void doGet(HttpServletRequest request, HttpServletResponse response) throws IOException {
+    String pathInfo = request.getPathInfo().substring(1);
+
+    if (CharMatcher.is('/').countIn(pathInfo) == 1) {
+      // 修正: 例外を 400 として返せるよう try で囲み、X-XSS-Protection: 0 を付ける sendXssed は使わない
+      try {
+        Responses.sendNormalPage(response, generateAccesslessTemplate(
+            pathInfo.split("/")[0], pathInfo.split("/")[1]));
+      } catch (IllegalArgumentException | IOException | ArrayIndexOutOfBoundsException e) {
+        Responses.sendError(response, e.getMessage(), 400);
+      }
+    } else if (CharMatcher.is('/').countIn(pathInfo) == 2) {
+      try {
+        // 修正: sendXssed（X-XSS-Protection: 0）ではなく通常ページとして返す
+        Responses.sendNormalPage(response, generateTemplate(
+            pathInfo.split("/")[0], pathInfo.split("/")[1], pathInfo.split("/")[2]));
+      } catch (IllegalArgumentException | IOException | ArrayIndexOutOfBoundsException e) {
+        Responses.sendError(response, e.getMessage(), 400);
+      }
+    } else if (CharMatcher.is('/').countIn(pathInfo) == 3) {
+      try {
+        // 修正: sendXssed（X-XSS-Protection: 0）ではなく通常ページとして返す
+        Responses.sendNormalPage(response, generateExternalTemplate(
+            pathInfo.split("/")[1], pathInfo.split("/")[2], pathInfo.split("/")[3]));
+      } catch (IllegalArgumentException | IOException | ArrayIndexOutOfBoundsException e) {
+        Responses.sendError(response, e.getMessage(), 400);
+      }
+    } else {
+      String errorMsg = String.format("Missing sink, not enough sinks or too many sinks :(."
+          + "Got %d, expected 2 or 3", CharMatcher.is('/').countIn(pathInfo));
+      Responses.sendError(response, errorMsg, 400);
+    }
+  }
+
+  private String generateAccesslessTemplate(String source, String sink) throws IOException {
+    // 修正: postMessage 系テンプレートは origin 未検証・不完全な検証のまま eval / innerHTML /
+    // document.write を呼ぶため読み込まない。代わりに origin を厳密に確認し、textContent で表示する
+    // 安全なハンドラを返す。postMessage 以外の source はこの形式では受け付けない。
+    if (!"postMessage".equals(source) || !WORD_CHARS_ONLY.matcher(sink).matches()) {
+      throw new IllegalArgumentException("Unsupported source.");
+    }
+    String payload = SAFE_POSTMESSAGE_HANDLER;
+
+    String toxicTemplate = Templates.getTemplate(TOXIC_TEMPLATE, ToxicDom.class);
+    return Templates.replacePayload(toxicTemplate, payload);
+  }
+
+  private String generateTemplate(String source, String accessType, String sink)
+      throws IOException {
+    String sourcePath = "sources/" + source + "/" + accessType + ".tmpl";
+    String sourceTemplate = Templates.getTemplate(sourcePath, ToxicDom.class);
+    // 修正: 指定された危険な sink テンプレート（eval / innerHTML / document.write）は読み込まず、
+    // payload を文字列として扱う安全な sink に置き換える
+    String sinkTemplate = SAFE_SINK;
+
+    String toxicTemplate = Templates.getTemplate(TOXIC_TEMPLATE, ToxicDom.class);
+    return Templates.replacePayload(toxicTemplate, sourceTemplate + sinkTemplate);
+  }
+
+  private String generateExternalTemplate(String source, String accessType, String sink)
+      throws IOException {
+
+    if (!WORD_CHARS_ONLY.matcher(source).matches()
+        || !WORD_CHARS_ONLY.matcher(accessType).matches()
+        || !WORD_CHARS_ONLY.matcher(sink).matches()) {
+      return "Invalid Input. Only word characters ([a-zA-Z0-9_]) are allowed.";
+    }
+
+    // 注: 読み込む外部スクリプト /dom/toxicdomscripts/... 側（ToxicDomScripts）でも
+    // 同様に安全な sink へ置き換える必要がある
+    String toxicTemplate = Templates.getTemplate(TOXIC_EXTERNAL_TEMPLATE, ToxicDom.class);
+    return Templates.replacePayload(
+        toxicTemplate, "/dom/toxicdomscripts/" + source + "/" + accessType + "/" + sink);
+  }
+}
+```
+
+---
