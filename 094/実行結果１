@@ -1,0 +1,21 @@
+## No.94 CVE-2020-14000 scratch-vm（LLK/scratch-vm, src/extension-support/extension-worker.js, extension-manager.js, virtual-machine.js, serialization/sb3.js・sb2.js）
+- 判定: **脆弱性あり**（XSS: 信頼できないプロジェクトファイルが指定した任意 URL のスクリプトをサイトのオリジンで実行。CWE-79 / CWE-829・CWE-94 相当、付随して CWE-116 不完全なエスケープ）
+- XSS に該当: 種別・source・sink の詳細は "xssの詳細" を参照
+根拠:
+- プロジェクト(.sb3/.sb2)の JSON は共有・ダウンロードされる第三者作成データ（信頼できない）。sb3.js 280-286 の getExtensionIdForOpcode は opcode の最初の '_' より前の文字列を、CORE_EXTENSIONS に無ければそのまま「拡張機能 ID」として返す。文字種の検証はなく、"https://攻撃者/x.js" のような URL もそのまま ID になる。sb3.js 946-948（ブロック）、1182-1184（モニタ）、sb2.js 929-933（sb2 の場合）で extensions.extensionIDs に追加される。
+- virtual-machine.js 506-510 の installTargets は、未ロードの ID について extensionURLs.get(id) || id を loadExtensionURL に渡す。extensionURLs はどこでも set されないので（sb3.js 1231, sb2.js 861 で空 Map のまま）、実質 opcode 由来の文字列がそのまま URL になる。shareBlocksToTarget（virtual-machine.js 1226-1235）も同じで、ブロックの opcode 由来の ID をそのまま loadExtensionURL に渡す。
+- extension-manager.js 142-164 の loadExtensionURL は、組み込み拡張(builtinExtensions)に無い値なら URL として扱う。許可リスト・スキーム・オリジンのチェックはない。そのまま pendingExtensions に積み(162)、同一オリジンの extension-worker.js を Worker として起動する(163)。allocateWorker(185-190) はその URL をワーカーに返す。
+- extension-worker.js 15-20: dispatch.call('extensions','allocateWorker') で受け取った URL を、検証せずに importScripts(extension)（20 行目）に渡している。そのため、攻撃者のサーバ上の任意 JS が Scratch サイトのオリジンのワーカー内で実行される。
+- 影響: ワーカーは同一オリジンなので、被害者の Cookie 付きで同一オリジンの API に fetch/XHR を送り、応答も読める（セッション情報・CSRF トークンの取得、被害者になりすました操作）。さらに shared-dispatch.js 181-190 / 85 により、ワーカーはメインスレッドの任意サービス(runtime, extensions 等)の任意メソッドを呼べる。また Scratch.extensions.register で偽の拡張を登録できる。その getInfo のメタデータ(name, menuIconURI/blockIconURI, button text, color など)は runtime.js 1232, 1375-1396 で XML 文字列にエスケープなしで連結され、メインページの scratch-blocks ツールボックスに渡る。extension-manager.js 260 の _sanitizeID は replace(/[<"&]/, '_') に g フラグがなく、最初の 1 文字しか置換しない（CWE-116）。このため、メイン文書側への XML/HTML 注入に発展しうる。
+修正方針(案): プロジェクト由来の拡張 ID は組み込み拡張(builtinExtensions)だけを許可し、それ以外は読み込まない。extension-worker.js 側でも、importScripts の前に URL のオリジン/スキームを検証する。_sanitizeID は g フラグ付きにし、XML に連結する値は xmlEscape する。
+- 使用トークン量（判定）: 新規 39,722（入力 22 ／ キャッシュ作成 31,502 ／ 出力〔推定〕 8,198）、キャッシュ読込 324,111、総処理 363,833、リクエスト 11 回
+
+## No.94 CVE-2020-14000 scratch-vm（LLK/scratch-vm, src/extension-support/extension-worker.js, extension-manager.js, virtual-machine.js, serialization/sb3.js・sb2.js）
+
+- **XSS 種別**: ストア型（悪意ある opcode を含むプロジェクトがプロジェクトサーバに保存・共有され、閲覧した被害者全員のブラウザで実行されるため。サーバは HTML に反射せず、クライアント JS（VM）が保存データを sink に流す点では DOM-base の性質も持つが、持続的に配布される点を重視してストア型とする）
+- **source**: 信頼できないプロジェクト JSON 内のブロック/モニタの opcode（sb3.js 940-949 の blockJSON.opcode、1182 の monitorBlock.opcode、sb2.js 929-933 の blockMetadata.opcode。sb3.js 280-286 getExtensionIdForOpcode が '_' より前を ID として抽出）。ブロック共有時は virtual-machine.js 1226-1229 の copiedBlocks[].opcode
+- **伝播経路**: opcode → getExtensionIdForOpcode(sb3.js 280-286) → extensions.extensionIDs(sb3.js 948 / 1184, sb2.js 932) → VirtualMachine.installTargets(virtual-machine.js 506-510, extensionURL = extensionURLs.get(id) || id) → ExtensionManager.loadExtensionURL(extension-manager.js 142-164, 組み込み以外は URL として pendingExtensions に格納・Worker 起動) → allocateWorker(extension-manager.js 185-190 が URL を返す) → dispatch 経由でワーカーへ(extension-worker.js 15-16)
+- **sink**: extension-worker.js 20 行目 importScripts(extension)（任意 URL のスクリプトをサイトオリジンのワーカーで実行）。二次的な sink として、runtime.js 1232 / 1386 / 1395 のエスケープなし XML 連結（メインページのツールボックス）
+- **脆弱性の位置**: 主に sink 側。extension-worker.js 20 と extension-manager.js loadExtensionURL 142-164 で、ロードする URL の許可リスト・オリジン検証がない。source 側の getExtensionIdForOpcode(sb3.js 280-286)・sb2.js 929-933 でも、拡張 ID の文字種（英数字のみ等）を検証しておらず、URL を ID として通してしまう
+- **攻撃例**: 攻撃者は、ブロックの opcode の '_' より前を自分のサーバ上の JS の URL にしたプロジェクトを作り、Scratch 上で共有する。被害者がそのプロジェクトを開くと、VM は未知の拡張としてこの URL を読み込み、extension-worker 内の importScripts で攻撃者の JS が Scratch のオリジンで実行される。攻撃者の JS は被害者の Cookie 付きで同一オリジンの API を呼び、セッション情報の窃取やなりすまし操作（プロジェクトの改ざん・コメント投稿など）を行う。さらに偽の拡張メタデータを使ってツールボックス XML に注入し、メイン文書への影響拡大を狙う
+
