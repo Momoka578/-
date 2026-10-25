@@ -1,0 +1,18 @@
+### No.95 CVE-2020-15092 TimelineJS3 (NUKnightLab/TimelineJS3, source/js/media/TL.Media.js)
+- 判定: **脆弱性あり**（ストア型クロスサイトスクリプティング・CWE-79 / CWE-116 不適切な出力エンコード）
+- XSS に該当: 種別・source・sink の詳細は "xssの詳細" を参照
+根拠: source/js/media/TL.Media.js の showMeta() 263行目 `this._el.credit.innerHTML = this.options.autolink == true ? TL.Util.linkify(this.data.credit) : this.data.credit;` で、タイムラインデータ（スライドの media.credit）がエスケープもサニタイズもされずに innerHTML へ代入される。270行目の caption（media.caption）も同じ。
+- データの出どころは source/js/core/TL.ConfigFactory.js。Google スプレッドシートの mediacredit / mediacaption 列（52-53行、92-93行、257-258行）か、作者が用意した JSON から読み込み、値をそのまま media.credit / media.caption に入れている。TL.TimelineConfig.js にも TL.Slide.js（247行で new mediatype.cls(this.data.media, ...)）にも無害化の処理はない。
+- autolink が有効なときに通る TL.Util.linkify（TL.Util.js 180-220行）は、URL をアンカーに置き換えるだけで、HTML 特殊文字はエスケープしない。このため、どちらの分岐でも生の HTML が DOM に入る。
+- 同じ問題の箇所: updateMeta() 287行・293行。credit_alternate / caption_alternate（Flickr など外部 API 応答から得る値）をそのまま innerHTML に代入している。loadErrorDisplay() 227行も message と options.media_type を innerHTML に連結している。参考として、_initLayout() 323行は data.link をスキーム検証せずに a.href に設定しており、javascript: URL を通してしまう。
+修正案: credit/caption は許可するタグ（a, b, i, em, strong, br など）以外を除去するサニタイズ、または textContent での出力に切り替える。linkify の後にもサニタイズする。
+- 使用トークン量（判定）: 新規 19,875（入力 14 ／ キャッシュ作成 16,047 ／ 出力〔推定〕 3,814）、キャッシュ読込 158,525、総処理 178,400、リクエスト 7 回
+
+## No.95 CVE-2020-15092 TimelineJS3 (NUKnightLab/TimelineJS3, source/js/media/TL.Media.js)
+
+- **XSS 種別**: ストア型（攻撃文字列は Google スプレッドシートやタイムライン JSON に保存され、タイムラインを埋め込んだページを閲覧した不特定のユーザーのブラウザで、読み込みのたびに実行される）
+- **source**: タイムラインデータのメディアのクレジット・キャプション。TL.ConfigFactory.js 52-53行 / 92-93行 / 257-258行の item_data.mediacredit・item_data.mediacaption（スプレッドシートの列）、または JSON の events[].media.credit / media.caption。
+- **伝播経路**: スプレッドシート/JSON → TL.ConfigFactory（extractGoogleEntryData_V1/V3/V4 で media.credit/caption に格納）→ TL.TimelineConfig → TL.Slide._initLayout（TL.Slide.js 247行 new mediatype.cls(this.data.media, this.options)）→ TL.Media.initialize の TL.Util.mergeData(this.data, data)（TL.Media.js 75行）→ onLoaded()（242行）→ showMeta()（261-271行）。autolink=true のときは途中で TL.Util.linkify を通るが、無害化はされない。
+- **sink**: TL.Media.js 263行 this._el.credit.innerHTML、270行 this._el.caption.innerHTML（同じ種類の sink として 287行・293行の credit_alternate/caption_alternate、227行の content_item.innerHTML）
+- **脆弱性の位置**: sink 側。source のデータは任意の文字列が入る前提のものなのに、出力時（TL.Media.js 263・270行）に HTML エスケープもサニタイズもせず innerHTML に代入していることが原因（CWE-116）。source 側（ConfigFactory）にも検証はない。
+- **攻撃例**: 攻撃者が、共有タイムラインのスプレッドシートの編集権を持つか、自分で作ったタイムラインを他サイトに埋め込ませるなどして、media のクレジット欄にイベントハンドラ付きの img 要素などの HTML を保存する。閲覧者がそのスライドを開くとメディアの読み込み後に showMeta() が動き、クレジットが innerHTML として解釈されてスクリプトが実行される。結果として、埋め込み先オリジンの Cookie 窃取や画面の改ざんができる。
