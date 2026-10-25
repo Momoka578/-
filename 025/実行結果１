@@ -1,0 +1,19 @@
+## No.25 CVE-2017-1001004 josdejong/typed-function typed-function.js（prePatch 9a8cac3）
+- 判定: **脆弱性あり**（コードインジェクション CWE-94／CWE-116。ブラウザで使うと任意スクリプト実行＝XSS（CWE-79）になる）
+- XSS に該当: 種別・source・sink の詳細は "xssの詳細" を参照
+根拠:
+- typed-function.js L1079-1124 _typed(name, signatures): L1100 で _name = name || '' とし、L1102 'function ' + _name + '(' + ... + ') {' と L1104 '  var name = \'' + _name + '\';' で、関数名を検証もエスケープもせずに JavaScript のソース文字列へ連結している。
+- L1109-1115 で、その文字列を new Function(refs.name, 'createError', body) で評価し、L1116 で実行している（eval と同等）。
+- name は公開 API typed(name: string, signatures)（L1242 'string, Object': _typed）でそのまま渡されるほか、L1238/L1246 getName(fns)（L64-87）で渡された関数の fn.name からも決まる。どちらも識別子かどうかを確認していない。
+- そのため name に「'」や「(){}」、改行などを含めると、文字列リテラルや関数宣言を抜け出して任意の JS 文を、生成される関数のファクトリに挿入できる。この JS は new Function 評価時（typed() 呼び出し時）と、関数呼び出し時に実行される。
+- 補足: 型名も L668-670 のコメント、L719/L820 の '...' 文字列、L625 のコメントへ無エスケープで連結されている。ただし型名は L33-57 getTypeTest で登録済みの型（typed.addType, L1363-1369）と一致しないと例外になり、登録は開発者が行うので、外部から悪用するのは難しい。
+- 使用トークン量（判定）: 新規 32,957（入力 16 ／ キャッシュ作成 26,987 ／ 出力〔推定〕 5,954）、キャッシュ読込 1,046,370、総処理 1,079,327、リクエスト 8 回
+
+No.25 CVE-2017-1001004 josdejong/typed-function typed-function.js（prePatch 9a8cac3）
+
+- **XSS 種別**: その他（HTML への埋め込みではなく、汎用 JS ライブラリが関数名を JS ソースに連結し new Function で評価するコードインジェクション。ブラウザでは、利用側が URL や入力フォーム由来の名前を渡すと DOM-based XSS と同じ結果になる。Node.js では任意コード実行になる）
+- **source**: typed(name, signatures) の第 1 引数 name（L1242 → L1079）、または typed(signatures) / typed(...fns) で渡す関数の name プロパティ（L1238, L1246 → getName L64-87）
+- **伝播経路**: name → _name（L1100）→ code 配列への文字列連結（L1102, L1104）→ code.join と body の組み立て（L1109-1112）→ new Function(..., body)（L1115）→ factory(refs, createError) の実行（L1116）
+- **sink**: typed-function.js L1115 new Function(refs.name, 'createError', body)（実行は L1116）
+- **脆弱性の位置**: sink 側（動的に生成するソースコードへの埋め込み時に、識別子としての検証や文字列リテラルとしてのエスケープをしていない）。source 側でも名前の形式を確認していない
+- **攻撃例**: math.js など typed-function を使うアプリで、利用者が関数定義の名前を指定できる場合を考える。攻撃者は、引用符やかっこで文字列や関数宣言を抜け出す名前を与える。そうすると typed() が内部で生成・評価するコードに攻撃者の JS 文が入り、ページのオリジン（Node.js ではサーバ）で任意コードが実行される。
