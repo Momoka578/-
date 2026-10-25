@@ -1,0 +1,21 @@
+## No.76 SARD 501360 dspace-jspui/src/main/webapp/tools/eperson-list.jsp
+- 判定: **脆弱性あり**（クロスサイトスクリプティング：反射型 XSS, CWE-79）
+- XSS に該当: 種別・source・sink の詳細は "xssの詳細" を参照
+根拠: eperson-list.jsp は検索文字列 search（request 属性。上流 DSpace 6.2 の EPersonListServlet.java:90 で request.getParameter("search") を取得し、:107 で setAttribute しているだけで無加工）を、エスケープせずに HTML へ出力している。
+  - eperson-list.jsp:44 search = (String) request.getAttribute("search")（null チェックだけ）
+  - eperson-list.jsp:187 <input ... name="search" value="<%= search %>"/> … ダブルクォートで囲まれた属性値に生のまま出力。「"」で属性を抜け出し、イベントハンドラ属性やタグを注入できる。
+  - eperson-list.jsp:117 jumpLink = ... + "&search=" + search + "&offset=" … URL エンコードも HTML エスケープもせずに連結し、:200-205 と :329-334 の <a href="<%= jumpLink %>..."> に出力（12 か所）。こちらも「"」で href 属性を抜け出せる。
+  - 一方、:214 の結果見出しは Utils.addEntities(search)（=Escape.html）でエスケープ済みで安全。エスケープ漏れは :187 と :117→:200-205/:329-334。
+その他の確認:
+  - eperson-list.jsp:298-299 の fullname/email は escapeJavaScript→escapeXml の順で処理され、onclick 内の JS 文字列（:305）として正しい。:306-315 も addEntities 済み。first/sortBy/multiple（:183-185）は int/boolean で安全。
+  - eperson-edit.jsp: 各 value 属性（:105,113,121,129,138）と見出し（:86）は Utils.addEntities 済み。:216 は <a> タグごと addEntities しているため、リンクがテキスト表示される表示上の不具合はあるが、グループ名もエスケープされるので XSS にはならない。
+  - EPersonAdminServlet.java: 入力値を DB に保存するだけで、直接 HTML へは出力しない（出力側の eperson-edit.jsp でエスケープ済み）。CSRF トークンはないが、DSpace JSPUI 全体の設計の問題なので、本件の主な判定対象ではない。
+修正案: :187 は Utils.addEntities(search) で出力する。:117 は URLEncoder.encode(search, "UTF-8") で URL エンコードしてから連結し、:200-205/:329-334 の href 出力時にも Utils.addEntities(jumpLink) で HTML エスケープする。
+- 使用トークン量（判定）: 新規 29,679（入力 12 ／ キャッシュ作成 25,376 ／ 出力〔推定〕 4,291）、キャッシュ読込 157,090、総処理 186,769、リクエスト 6 回
+
+**XSS 種別**: 反射型 — リクエストパラメータ search が保存されず、同じレスポンスの HTML（eperson-list.jsp）にそのまま反映されるため。
+- **source**: HTTP リクエストパラメータ search（/tools/eperson-list?search=...）。上流 EPersonListServlet.java:90 request.getParameter("search") → :107 request.setAttribute("search", search)。
+- **伝播経路**: EPersonListServlet.java:90 → :107 setAttribute → eperson-list.jsp:44 getAttribute("search")（無加工）→ (1) そのまま :187 へ / (2) :117 で jumpLink に文字列連結 → :200-205, :329-334 へ
+- **sink**: eperson-list.jsp:187 <input type="text" name="search" value="<%= search %>"/>、および eperson-list.jsp:200-205・:329-334 <a href="<%= jumpLink %>...">（jumpLink は :117 で search を含む）
+- **脆弱性の位置**: sink 側（eperson-list.jsp:187 と :117/:200-205/:329-334 の出力時に、HTML 属性値のエスケープ（:117 では URL エンコードも）をしていない）。source 側（サーブレット）は入力をそのまま渡すだけで、出力時に属性用のエスケープをするのが本来の対策。
+- **攻撃例**: 攻撃者が search パラメータに「ダブルクォートで value/href 属性を閉じ、onfocus などのイベントハンドラや script 要素を続ける文字列」を入れた /tools/eperson-list の URL を作り、ログイン中の管理者（/tools/* は registered-only）に踏ませる。ページ表示時に注入スクリプトが管理者の権限で実行され、セッションの悪用や管理操作（EPerson 編集、グループ変更など）の実行につながる。
