@@ -1,0 +1,19 @@
+## No.33 restify/node-restify lib/server.js (prePatch 8938951)
+- 判定: **脆弱性あり**（反射型 XSS、CWE-79 / 出力のエンコード不備 CWE-116）
+- XSS に該当: 種別・source・sink の詳細は "xssの詳細" を参照
+根拠:
+- lib/router.js 607行: ルートが見つからないと new ResourceNotFoundError('%s does not exist', req.url) を作る。リクエスト URL（攻撃者が自由に決められる）が、エラーメッセージ（err.message と err.body.message）にそのまま埋め込まれる。lib/server.js 760行の new ResourceNotFoundError(req.path()) も同じ。
+- lib/server.js 184-205行 emitRouteError(): 'NotFound' などのリスナが登録されていなければ、202行で res.send(err) を実行し、このエラーをエスケープせずにレスポンス本文として返す。
+- lib/response.js format() は Accept ヘッダとアプリが登録した formatters で Content-Type を決める。formatters/text.js は body.message を、formatters/json.js は body.body.message を、そのまま出力する。アプリが text/html の formatter を登録している場合は HTML として返る。text/plain の場合でも、nosniff がなければ古いブラウザが内容を推測して HTML として描画しうる。そうなると、URL に含めたタグがページ内で解釈される。
+- 使用トークン量（判定）: 新規 18,785（入力 16 ／ キャッシュ作成 13,582 ／ 出力〔推定〕 5,187）、キャッシュ読込 350,194、総処理 368,979、リクエスト 8 回
+
+# No.33 restify/node-restify lib/server.js (prePatch 8938951)
+
+- **XSS 種別**: 反射型（リクエストの URL に含めた値が保存されずに、そのリクエストへの 404 エラーレスポンスにそのまま返されるため）
+- **source**: lib/router.js 607行の req.url（および lib/server.js 760行の req.path()）＝攻撃者が作ったリクエストのパスとクエリ
+- **伝播経路**: router.find() → callback(new ResourceNotFoundError('%s does not exist', req.url))（router.js 607行）→ server.js 746-753行 onRoute(err) → emitRouteError(self, req, res, err)（server.js 753行／761行）→ server.js 202行 res.send(err) → response.js format() → formatter（text: body.message、json: body.body.message、アプリ定義の text/html formatter）→ レスポンス本文
+- **sink**: lib/server.js 202行 res.send(err)（エラーメッセージをエスケープせずにレスポンスへ書き出す箇所）
+- **脆弱性の位置**: 主に sink 側（server.js 202行で、エラー応答を送るときに出力エンコードをしていない）。source 側（router.js 607行・server.js 760行）でも、未検証の URL をメッセージに埋め込んでいる。
+- **攻撃例**: 攻撃者が、存在しないパスにスクリプトを含むタグを入れたリンクを作り、被害者に開かせる。サーバは「<そのURL> does not exist」という 404 応答を返す。その応答が HTML として解釈されれば、対象サイトのオリジンでスクリプトが実行される。その結果、Cookie の窃取や、被害者になりすました操作をされる。
+
+---
