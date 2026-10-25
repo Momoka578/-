@@ -1,0 +1,22 @@
+## No.54 nprapps/pym.js src/pym.js (CVE-2018-1000086, prePatch 4b9016c)
+- 判定: **脆弱性あり**（DOM-based XSS／オープンリダイレクト、CWE-79・CWE-601）
+- XSS に該当: 種別・source・sink の詳細は "xssの詳細" を参照
+根拠: pym.Parent は、696 行目で window の message イベントを受信し、513〜536 行目 _processMessage で
+  "pym" xPYMx <id> xPYMx <種類> xPYMx <本文> 形式の文字列を解析して、_fire（480〜486 行目）で種類ごとのハンドラへ渡す。
+  691 行目で登録された navigateTo ハンドラ _onNavigateToMessage（565〜570 行目）は、569 行目で document.location.href = message と
+  受け取った本文をそのまま代入しており、URL のスキームを検査していない。
+  送信元の検査（65〜75 行目 _isSafeMessage）は、xdomain の既定値が '*'（333 行目）のため何も検査されない。さらに e.source が自分の iframe か
+  どうかも確認していない。そのため、子 iframe に限らず、親ページに postMessage できる任意のウィンドウ（攻撃者のページが iframe/window.open で
+  親ページを開く場合など）が "javascript:..." を送れば、親ページのオリジンでスクリプトが実行される。http(s) の URL なら任意サイトへのリダイレクトになる。
+  id は親ページの DOM の div の id で、ページのソースから簡単に分かる。
+- 使用トークン量（判定）: 新規 10,516（入力 10 ／ キャッシュ作成 7,790 ／ 出力〔推定〕 2,716）、キャッシュ読込 239,499、総処理 250,015、リクエスト 5 回
+
+
+# No.54 nprapps/pym.js src/pym.js (CVE-2018-1000086, prePatch 4b9016c)
+
+- **XSS 種別**: DOM-base（サーバを経由せず、ブラウザ内の postMessage で受け取ったデータを、クライアント側の JavaScript が location に代入して発火するため）
+- **source**: src/pym.js 696 行目の window 'message' イベントの e.data（513 行目 _processMessage の引数 e、525 行目で e.data を正規表現で解析）
+- **伝播経路**: e.data（525 行目）→ match[2] = message（533 行目）→ this._fire(messageType, message)（535 行目）→ messageHandlers['navigateTo']（481〜483 行目、691 行目で登録）→ _onNavigateToMessage(message)（565 行目）
+- **sink**: src/pym.js 569 行目 document.location.href = message
+- **脆弱性の位置**: sink 側（569 行目で URL スキームを検証せずに location へ代入している）が主因。source 側（65〜69 行目）でも、既定の xdomain '*' のため送信元オリジンと e.source を検証していない不備がある。
+- **攻撃例**: 攻撃者は自分のサイトから、pym.js を使う記事ページを iframe か window.open で開き、その窓に向けて、navigateTo 型で本文が javascript: スキームの URL のメッセージを postMessage する。親ページはその URL を location.href に代入するため、記事サイトのオリジンで攻撃者のスクリプトが動き、Cookie の窃取や画面の改ざんができる。
