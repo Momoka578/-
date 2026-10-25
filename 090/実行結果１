@@ -1,0 +1,13 @@
+### No.90 CVE-2020-11021 @actions/http-client 1.0.8（index.ts, auth.ts）
+- 判定: **脆弱性あり**（リダイレクト時に認証情報を別ホストへ送信する情報漏えい・CWE-200）
+根拠:
+- index.ts 364-403 行: 3xx レスポンスの Location に自動で追従する（既定で _allowRedirects=true、最大 50 回。106・108 行）。
+- index.ts 389-397 行: ホスト名が変わったときに Authorization を削除しているが、対象は呼び出し側が渡した追加ヘッダ `headers` だけである。
+- index.ts 400 行で、リダイレクト先についても _prepareRequest() を呼ぶ。その 561-565 行で、登録済みハンドラ全部の handler.prepareRequest(info.options) を、ホストを確認せずに毎回実行する。
+- auth.ts 12-16 行（BasicCredentialHandler）、41-43 行（BearerCredentialHandler）、69-72 行（PersonalAccessTokenCredentialHandler）の prepareRequest は、無条件で options.headers['Authorization'] を設定する。
+  → 正規サーバ（または応答を改ざんできる者）が攻撃者のホストへ 301/302/307 などでリダイレクトさせると、Basic 認証のユーザー名・パスワードや Bearer/PAT トークンが攻撃者ホストへ送られる（実際の送信は 482 行の info.httpModule.request(info.options)）。
+- 同じく 553 行の _mergeHeaders() で混ざる this.requestOptions.headers（クライアント全体の既定ヘッダ、574-579 行）内の Authorization も、390-397 行の削除処理の対象外である。そのためリダイレクト先が別ホストでもそのまま送られる。
+- 補足: 390 行の比較は最初の URL（parsedUrl）とのホスト名比較だけで、ポートやスキームは比べていない。ただし https→http のダウングレードは 375-383 行で既定で拒否される。
+- 影響: GitHub Actions のツールキットなどでトークンを付けて外部 API を呼ぶ場面で、リダイレクト経由で GITHUB_TOKEN などの認証情報が第三者に漏れる。
+- 修正案（XSS ではないので修正コードは作らない）: リダイレクト先のホスト名が元と異なる場合は、ハンドラの prepareRequest を適用しない（またはハンドラを外す）。あわせて、マージ後のヘッダ（requestOptions.headers 由来を含む）からも authorization を削除する。
+- 使用トークン量（判定）: 新規 20,022（入力 10 ／ キャッシュ作成 16,784 ／ 出力〔推定〕 3,228）、キャッシュ読込 99,843、総処理 119,865、リクエスト 5 回
