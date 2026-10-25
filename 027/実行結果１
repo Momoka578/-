@@ -1,0 +1,18 @@
+## No.27 CVE-2017-16011 jquery/jquery src/core.js（prePatch 452e327）
+- 判定: **脆弱性あり**（DOM-based XSS・CWE-79）
+- XSS に該当: 種別・source・sink の詳細は "xssの詳細" を参照
+根拠:
+- src/core.js L52: rquickExpr = /^(?:[^#<]*(<[\w\W]+>)[^>]*|#([\w-]*))$/。先頭が '#' でなければ、文字列の途中に '<...>' が 1 つでもあると、その部分を HTML として取り出す（[^#<]* で任意の前置き文字列を許している）。
+- L106-113 init(): 文字列 selector が '<' で始まらない場合も L112 rquickExpr.exec(selector) で判定する。L116-127 で match[1] があれば jQuery.parseHTML(match[1], document, true) を呼んで DOM 要素を生成する（第 3 引数 true でスクリプトも保持する）。
+- そのため、開発者が CSS セレクタのつもりで $("input[value='" + 利用者入力 + "']") や $(".item " + location の一部) のように外部入力を含む文字列を渡すと、入力に含まれる '<img ... onerror=...>' 等が HTML として解釈される。要素生成時に画像の読み込みが始まり、onerror などのスクリプトが実行される。
+- L51 のコメントにあるとおり #id を優先して location.hash 単体の場合は防いでいるが、'#' で始まらない文字列（hash の一部を切り出したもの、検索パラメータ、属性セレクタへの埋め込み等）では防げない。セレクタと HTML を区別する条件（先頭が '<' か）が緩すぎる。
+- 使用トークン量（判定）: 新規 8,439（入力 6 ／ キャッシュ作成 5,269 ／ 出力〔推定〕 3,164）、キャッシュ読込 550,719、総処理 559,158、リクエスト 3 回
+
+## No.27 CVE-2017-16011 jquery/jquery src/core.js（prePatch 452e327）
+
+- **XSS 種別**: DOM-base（サーバを経由せず、ブラウザ内で jQuery がセレクタ文字列を HTML として解釈し、DOM 要素を生成することで発生するため）
+- **source**: jQuery(selector) / $(selector) の selector 引数（L36, L90）。実際の入力元は、アプリが selector に連結する location.hash/search、フォーム入力、他の DOM 属性値など
+- **伝播経路**: 外部入力 → アプリがセレクタ文字列に連結 → jQuery(selector)（L36-38）→ init（L90）→ L112 rquickExpr.exec で '<...>' 部分が match[1] に入る → L119-127 jQuery.parseHTML(match[1], document, true) → DOM 要素の生成とイベントハンドラ属性の実行
+- **sink**: src/core.js L123-127 jQuery.merge(this, jQuery.parseHTML(match[1], ..., true))（HTML 文字列の DOM 化）
+- **脆弱性の位置**: sink 側に入る前の判定（L52 の正規表現）。セレクタ文字列のどこかに '<' があれば HTML とみなすため、本来セレクタとして扱うべき入力が HTML の sink（parseHTML）に流れる
+- **攻撃例**: アプリが URL の一部を使って $("a[name=" + 値 + "]") のように要素を探す場合を考える。攻撃者は、その値に onerror 付きの画像タグを入れた URL を被害者に踏ませる。jQuery がこれを HTML として扱って要素を生成するので、被害者のブラウザでスクリプトが動く。
