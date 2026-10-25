@@ -1,0 +1,21 @@
+### No.72 SARD 501369 dspace-jspui home.jsp（+ EditCommunitiesServlet.java / TopCommunitiesSiteProcessor.java / edit-community.jsp）
+- 判定: **脆弱性あり**（ストア型 XSS・CWE-79）
+- XSS に該当: 種別・source・sink の詳細は "xssの詳細" を参照
+根拠:
+- home.jsp 206 行目 `<p><%= communityService.getMetadata(com, "short_description") %></p>` で、トップレベルコミュニティの「短い説明（short_description）」をエスケープせずに HTML 本文へ出力している。
+- 同じループ内のコミュニティ名（195 行目 Utils.addEntities(com.getName())）や、最近の投稿のタイトル・抄録（138・140 行目）は Utils.addEntities でエスケープされており、206 行目だけ漏れている。
+- short_description の値は、EditCommunitiesServlet.java 544-545 行目で request.getParameter("short_description") をそのまま communityService.setMetadata に渡し、571 行目の communityService.update で DB に保存される。保存時の入力検証や無害化はない。
+- 保存された値は TopCommunitiesSiteProcessor.java 54 行目 communityService.findAllTop() で読み出され、60 行目で request 属性 "communities" に入る。index.jsp 56-59 行目でこの処理が実行され、70 行目で /home.jsp に転送される。home.jsp 47 行目で受け取り、182 行目のループを経て 206 行目で出力される。
+- 編集フォーム edit-community.jsp 151 行目では Utils.addEntities(shortDesc) でエスケープされているため、編集画面では発火しない。トップページ（誰でも閲覧できるサイトのホーム）でのみ発火する。
+- 書き込める者: サイト管理者だけでなく、コミュニティ管理者（委任された下位の権限）も、自分のコミュニティの説明を編集できる（EditCommunitiesServlet の CONFIRM_EDIT_COMMUNITY）。この権限で書いたスクリプトが、匿名の閲覧者やサイト管理者のブラウザで実行される。
+修正方針: home.jsp 206 行目を Utils.addEntities(...) で囲み、他の出力箇所と同じく HTML エスケープする。
+- 使用トークン量（判定）: 新規 25,244（入力 12 ／ キャッシュ作成 22,173 ／ 出力〔推定〕 3,059）、キャッシュ読込 163,262、総処理 188,506、リクエスト 6 回
+
+# No.72 SARD 501369 dspace-jspui home.jsp（+ EditCommunitiesServlet.java / TopCommunitiesSiteProcessor.java / edit-community.jsp）
+
+- **XSS 種別**: ストア型（攻撃文字列はコミュニティのメタデータとして DB に保存され、後で別の利用者がトップページを開いたときに出力されるため）
+- **source**: EditCommunitiesServlet.java 544-545 行目 request.getParameter("short_description")（入力フォームは edit-community.jsp 151 行目の name="short_description"）
+- **伝播経路**: EditCommunitiesServlet.java 544-545 行目 communityService.setMetadata(context, community, "short_description", …) → 571 行目 communityService.update で DB に保存 → index.jsp 56-59 行目 SiteHomeProcessor の実行 → TopCommunitiesSiteProcessor.java 54 行目 findAllTop() → 60 行目 request.setAttribute("communities", …) → index.jsp 70 行目 /home.jsp へ転送 → home.jsp 47 行目 request.getAttribute("communities") → 182 行目 for ループ → 206 行目 communityService.getMetadata(com, "short_description")
+- **sink**: home.jsp 206 行目 `<p><%= communityService.getMetadata(com, "short_description") %></p>`（HTML 本文コンテキストに無エスケープで出力）
+- **脆弱性の位置**: sink 側（home.jsp 206 行目で出力時のエスケープが欠けている）。source 側（サーブレット）は短い説明を平文として保存する設計で、他の出力箇所はすべて出力時にエスケープしているため、直すべきは sink 側。
+- **攻撃例**: コミュニティ管理者の権限を持つ攻撃者（または管理者アカウントを乗っ取った者）が、トップレベルコミュニティの編集画面で「短い説明」に script 要素やイベントハンドラ付きの HTML を入れて保存する。その後、サイトのトップページ（/ または /index.jsp）を開いたすべての利用者のブラウザでスクリプトが実行され、セッションの乗っ取りや、サイト管理者の権限での操作（CSRF 的な管理操作）に悪用される。
