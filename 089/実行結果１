@@ -1,0 +1,12 @@
+### No.89 CVE-2019-10765 ioBroker.admin（iobroker.admin）lib/web.js の /log/* ルート
+- 判定: **脆弱性あり**（パストラバーサルによる任意ファイル読み出し・CWE-22）
+根拠:
+- lib/web.js 342行目 server.app.get('/log/*') で、343行目 req.url（Express では未デコード・未正規化の生 URL）を '/' で分割する。344〜346行目で 2 番目の要素を transport、残りを '/' で連結したものを filename にしている。filename の中身は一切検査していない。
+- 350行目では transport が設定済みの file 型トランスポート（既定構成の "file1" など）かどうかだけを確認している。その後 354行目 path.join(ログディレクトリ, filename) または 356行目 path.join('log/', filename) でパスを組み立てる。path.join は '..' を解決するため、filename に '../' が含まれるとログディレクトリの外へ出られる。結果がログディレクトリ配下に収まっているかの包含チェック（path.resolve 後の startsWith 比較など）がない。
+- 359〜361行目で相対パスに __dirname/../../../ を付けたあと、363行目 fs.existsSync(filename)、364行目 lstatSync を経て、2MB 以下なら 368行目 decorateLogFile → 104行目 fs.readFileSync(filename) の内容を HTML に埋めて res.send する。2MB 超なら 366行目 res.sendFile(filename) で返す。このため、Node プロセスが読めるファイルなら何でも応答に載る。
+- Node の http も Express のルータも '..' を正規化しない。そのため curl --path-as-is などのクライアントで GET /log/file1/../../../../etc/passwd のような生のドットセグメントを送ると、/log/* にマッチしたまま filename が '../../../../etc/passwd' になる。結果として /etc/passwd や ioBroker の設定ファイル（iobroker-data/iobroker.json、objects/states DB、証明書の秘密鍵など）を読み出せる。Windows ではバックスラッシュ区切りでも同じことができる。
+- settings.auth が false（認証なし）の構成では、未認証のネットワーク利用者が攻撃できる。認証ありの構成でも、ログ閲覧以外の権限を持たない利用者がサーバ上の任意ファイルを読める。
+- 付随する問題: 375行目 res.send('File ' + filename + ' not found') が、解決後の絶対パスを応答に含める（サーバのディレクトリ構成が漏れる。text/html で返る）。ただし req.url は未デコードで、ブラウザは < > " をパーセントエンコードして送るため、この箇所の反射型 XSS は現実的ではないと判断した。主たる脆弱性はパストラバーサル（XSS ではない）とする。
+修正案（コードは作成しない）: filename を path.resolve で絶対パス化し、許可するログディレクトリ（path.resolve 済み）+ path.sep で始まるかを検査し、外れたら 404 にする。あわせて '..' やヌル文字を含む要求を拒否し、req.url ではなく req.params / デコード済みパスから クエリを除いて取り出す。404 メッセージには解決後のパスを出さない。
+- 使用トークン量（判定）: 新規 13,997（入力 6 ／ キャッシュ作成 10,211 ／ 出力〔推定〕 3,780）、キャッシュ読込 52,963、総処理 66,960、リクエスト 3 回
+
