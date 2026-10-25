@@ -1,0 +1,28 @@
+## No.69 SARD 501349 browse/full.jsp, tools/edit-item-form.jsp（+ BrowserServlet.java, admin/EditItemServlet.java）
+- 判定: **脆弱性あり**（クロスサイトスクリプティング XSS・CWE-79）
+- XSS に該当: 種別・source・sink の詳細は "xssの詳細" を参照
+根拠:
+- 主な箇所: dspace-jspui/src/main/webapp/browse/full.jsp 217行目と297行目。`<input type="hidden" name="authority" value="<%=bi.getAuthority() %>"/>` で、閲覧条件の authority をエスケープせずに HTML 属性値へ出力している。
+  - 同じ if/else の value 分岐（221行目・301行目）と見出し（202行目）は Utils.addEntities() でエスケープしている。authority 分岐だけ処理が抜けている。
+  - authority は、AbstractBrowserServlet（上流 6.2・113行目）の request.getParameter("authority") から来る。検証せずに BrowserScope.setAuthorityValue() → BrowseEngine（360行目）→ BrowseInfo.setAuthority() と渡る。month・year・starts_with は「XSS 対策」として検証しているが、authority は検証していない。
+  - full.jsp は、該当する authority の項目が存在して閲覧結果があるときだけ表示される（結果がなければ no-results.jsp）。そのため、確実に攻撃するには、項目の authority キーとして攻撃文字列を保存しておく必要がある。
+  - 保存経路: admin/EditItemServlet.java 732〜733行目で request.getParameter("choice_<key>_authority_<seq>") を取得し、756〜757行目の itemService.addMetadata(..., authority, confidence) で、検証せずに DB に保存している。
+- 同じ種類の出力漏れ（ストア型）: tools/edit-item-form.jsp は、保存済みのメタデータをエスケープせずに出力している。
+  - 486行目: <textarea> 内のメタデータ値 dcv.get(i).getValue()。</textarea> で閉じて脱出できる。
+  - 142〜143行目・160行目: doAuthority() 内の dcv.getValue()（option 要素と textarea）。
+  - 173行目: value 属性内の dcv.getAuthority()。
+  - 490行目: value 属性内の言語 getLanguage()。
+  - 601行目: value 属性内の bitstream.getSource()。同じ表の name・description・user format（598・604・610行目）は addEntities でエスケープしているのに、source だけエスケープしていない。
+  - これらの値の書き込み元: EditItemServlet 747・756行目（value）、718行目（language）、732行目（authority）、798・827行目（bitstream_source）、856・871行目（addfield_value）、1035行目（アップロード時のファイル名をそのまま source に保存）。
+- web.xml: /browse にはログイン制限がない（誰でも閲覧できる）。/tools/* は registered-only フィルタ（登録ユーザー以上）。出力をエスケープするフィルタはない。
+修正方針: full.jsp 217・297行目を Utils.addEntities(bi.getAuthority()) にする。edit-item-form.jsp の該当する出力箇所も Utils.addEntities() でエスケープする。
+- 使用トークン量（判定）: 新規 71,502（入力 28 ／ キャッシュ作成 60,243 ／ 出力〔推定〕 11,231）、キャッシュ読込 718,566、総処理 790,068、リクエスト 14 回
+
+## No.69 SARD 501349 browse/full.jsp, tools/edit-item-form.jsp（+ BrowserServlet.java, admin/EditItemServlet.java）
+
+- **XSS 種別**: ストア型。攻撃文字列は、項目の編集で DB に保存したメタデータ（authority キー・値・bitstream source など）に入る。full.jsp では閲覧リンクの authority パラメータを経由し、edit-item-form.jsp では DB から直接読まれて、別の利用者の画面に出力される。full.jsp は URL パラメータの反射でもあるが、結果がないとページが表示されないため、保存データが前提となる。
+- **source**: EditItemServlet.java 732〜733行目 request.getParameter("choice_"+key+"_authority_"+seq)（ほかに 747行目 value、718行目 language、798行目 bitstream_source、856行目 addfield_value、1035行目 アップロードファイル名）。閲覧時は AbstractBrowserServlet（上流）113行目の request.getParameter("authority")。
+- **伝播経路**: EditItemServlet 756行目 itemService.addMetadata() → DB（metadatavalue.authority）→ 閲覧インデックス → 著者一覧などのリンク browse?type=..&authority=<キー> → AbstractBrowserServlet の getParameter("authority") → BrowserScope.setAuthorityValue() → BrowseEngine.browse() → BrowseInfo.setAuthority() → request 属性 "browse.info" → full.jsp 73行目 bi → 217・297行目 bi.getAuthority()。もう一つの経路として、DB → EditItemServlet.showEditForm() 634行目 request 属性 "item" → edit-item-form.jsp 438行目 getMetadata() → 486・173 などの行。
+- **sink**: full.jsp 217行目・297行目 <%=bi.getAuthority() %>（hidden input の value 属性）。edit-item-form.jsp 486行目（textarea 本文）、142〜143・160・173・490・601行目。
+- **脆弱性の位置**: sink 側。source（パラメータの取得と保存）は、データとして受け付けること自体は正当な処理である。HTML 出力の文脈に応じたエスケープを JSP の出力箇所で行っていないことが原因。
+- **攻撃例**: 項目の編集権限を持つ利用者（コレクション管理者など）が、authority 管理の著者フィールドの authority キーに、属性値を閉じて script を挿入する文字列を設定して保存する。一般の閲覧者が「著者で閲覧」からその著者をクリックすると、full.jsp の hidden input で属性値から抜け出してスクリプトが実行される。リンクを直接送り付けてもよい。同様に、投稿者がタイトルなどに </textarea> で始まる文字列を入れておくと、管理者が編集画面（edit-item-form.jsp）を開いたときに、管理者の権限でスクリプトが実行される。
