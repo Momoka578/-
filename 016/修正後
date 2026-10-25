@@ -1,0 +1,86 @@
+## No.16 google/firing-range src/tests/dom/EventTriggering.java
+
+- 修正対象ファイル: EventTriggering.java
+- 修正箇所のコメント（コード内から抜粋）:
+  - `// 修正: eval / innerHTML / document.write の代わりに使う安全な sink。`
+  - `// 修正: X-XSS-Protection: 0 を付ける sendXssed ではなく、通常ページ用の送信処理を使う`
+  - `// 修正: リクエストで指定された危険な sink テンプレート（eval / innerHTML / document.write）は`
+
+```java
+package com.google.testing.security.firingrange.tests.dom;
+
+import com.google.common.base.CharMatcher;
+import com.google.testing.security.firingrange.utils.Responses;
+import com.google.testing.security.firingrange.utils.Templates;
+
+import java.io.IOException;
+
+import javax.servlet.http.HttpServlet;
+import javax.servlet.http.HttpServletRequest;
+import javax.servlet.http.HttpServletResponse;
+
+/**
+ * A servlet to provide XSSs that occur after event firing. It is mapped to the
+ * /dom/eventtriggering/ directory and maps paths as follows:
+ * <ul>
+ *     <li> Source object
+ *     <li> Source property
+ *     <li> Sink
+ * </ul>
+ *
+ * Thus, {@code /dom/eventtriggering/document/cookie/eval} will map to the document.cookie source,
+ * and the eval sink.
+ */
+public class EventTriggering extends HttpServlet {
+
+  private static final String TOXIC_TEMPLATE = "toxicdom.tmpl";
+  private static final String DEFERRED_TEMPLATE = "deferred.tmpl";
+
+  // 修正: eval / innerHTML / document.write の代わりに使う安全な sink。
+  // payload を textContent に代入するので、HTML や JavaScript として解釈されず文字列として表示される。
+  private static final String SAFE_SINK =
+      "var div = document.createElement('div');\n"
+      + "document.documentElement.appendChild(div);\n"
+      + "// Sync trigger.\n"
+      + "div.textContent = payload;\n"
+      + "// Async trigger.\n"
+      + "function trigger(payload) {\n"
+      + "  div.textContent = payload;\n"
+      + "}\n";
+
+  @Override
+  public void doGet(HttpServletRequest request, HttpServletResponse response) throws IOException {
+    String pathInfo = request.getPathInfo().substring(1);
+    if (CharMatcher.is('/').countIn(pathInfo) != 2) {
+      String errorMsg = String.format("Missing sink, not enough sinks or too many sinks :(."
+          + "Got %d, expected 2", CharMatcher.is('/').countIn(pathInfo));
+      Responses.sendError(response, errorMsg, 400);
+    } else {
+      try {
+        String template = generateTemplate(
+            pathInfo.split("/")[0], pathInfo.split("/")[1], pathInfo.split("/")[2]);
+        // 修正: X-XSS-Protection: 0 を付ける sendXssed ではなく、通常ページ用の送信処理を使う
+        Responses.sendNormalPage(response, template);
+      } catch (IllegalArgumentException | IOException e) {
+        Responses.sendError(response, e.getMessage(), 400);
+      }
+    }
+  }
+
+  private String generateTemplate(String source, String accessType, String sink)
+      throws IOException {
+    String sourcePath = "sources/" + source + "/" + accessType + ".tmpl";
+    String sourceTemplate = Templates.getTemplate(sourcePath, EventTriggering.class);
+    // 修正: リクエストで指定された危険な sink テンプレート（eval / innerHTML / document.write）は
+    // 読み込まず、payload を文字列として扱う安全な sink に置き換える
+    String sinkTemplate = SAFE_SINK;
+
+    String toxicTemplate = Templates.getTemplate(TOXIC_TEMPLATE, EventTriggering.class);
+    String deferredTemplate = Templates.getTemplate(DEFERRED_TEMPLATE, EventTriggering.class);
+    // Wrap each sink with code to defer its execution.
+    String deferredPayload = Templates.replacePayload(deferredTemplate, sinkTemplate);
+    return Templates.replacePayload(toxicTemplate, deferredPayload + sourceTemplate + sinkTemplate);
+  }
+
+}
+```
