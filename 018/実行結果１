@@ -1,0 +1,21 @@
+## No.18 google/firing-range src/tests/dom/ToxicDomScripts.java
+- 判定: **脆弱性あり**（DOM-based XSS・CWE-79）
+- XSS に該当: 種別・source・sink の詳細は "xssの詳細" を参照
+根拠:
+- ToxicDomScripts.java L47-50: /dom/toxicdomscripts/<source>/<accessType>/<sink> を受け、generateTemplate()（L61-70）で sources/<source>/<accessType>.tmpl と sinks/<sink>.tmpl を連結し、toxicdomscript.tmpl（%%PAYLOAD%% のみ）に入れて Responses.sendJavaScript（text/javascript）で外部スクリプトとして返す。
+- このスクリプトは ToxicDom の external 形式（toxicdomexternal.tmpl L4 の <script src>）から読み込まれ、ページ内で実行される。
+- source テンプレート（localStorage/array|function|property.tmpl L4-8, sessionStorage/*.tmpl L5-8, window/name.tmpl L5,L8, document/cookie.tmpl L13, document/referrer.tmpl L5,L8）が取得した値を、sink テンプレート（sinks/eval.tmpl L2,L6 eval / innerHtml.tmpl L5,L9 innerHTML / documentWrite.tmpl L2,L6 document.write）に無害化なしで渡す。
+- サーバ側はテンプレート選択のみ（Templates.getTemplate で ".." 禁止）で、サーバ側の入力反射やパストラバーサルはない。脆弱性は生成される JS 側。
+- 使用トークン量（判定）: 新規 7,140（入力 4 ／ キャッシュ作成 5,406 ／ 出力〔推定〕 1,730）、キャッシュ読込 87,053、総処理 94,193、リクエスト 2 回
+
+## No.18 google/firing-range src/tests/dom/ToxicDomScripts.java
+
+- **XSS 種別**: DOM-base（サーバ応答（JS ファイル）には入力値が含まれず、ブラウザ内で Web Storage・window.name・cookie・referrer を読み取って危険な DOM/JS API に渡すため）
+- **source**: localStorage['badValue'] / localStorage.getItem('badValue') / localStorage.badValue（localStorage/*.tmpl L4-8）、sessionStorage.badValue（sessionStorage/property.tmpl L5,L8）、window.name（window/name.tmpl L5,L8）、document.cookie（document/cookie.tmpl L5-13, cookie_set.tmpl L19,L22）、document.referrer（document/referrer.tmpl L5,L8）
+- **伝播経路**: source の値 → 変数 payload（同期）／ setTimeout 内の trigger(値)（非同期）→ ToxicDomScripts.java L69 で連結した sink テンプレート → toxicdomscript.tmpl L1 → sendJavaScript（L49）→ ページの <script src> で実行
+- **sink**: sinks/eval.tmpl L2,L6 eval(payload)、sinks/innerHtml.tmpl L5,L9 div.innerHTML = payload、sinks/documentWrite.tmpl L2,L6 document.write(payload)
+- **脆弱性の位置**: sink 側（保存領域やウィンドウ名など、外部から書き換えられる値を検証せずに eval/innerHTML/document.write へ渡している）
+- **攻撃例**: 同じオリジンの別の弱点や、サブドメインからの cookie 設定、名前付きウィンドウでの遷移などで、攻撃者が localStorage、cookie、window.name にスクリプトを入れる。その後、被害者が該当ページを開くと、外部スクリプトがその値を eval や innerHTML で実行し、任意スクリプトが動く。値は保存されたまま残るので、ページを開くたびに再発する。
+
+---
+
