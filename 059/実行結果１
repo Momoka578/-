@@ -1,0 +1,10 @@
+## No.59 OWASP BenchmarkJava BenchmarkTest00055.java
+- 判定: **脆弱性あり**（脆弱な暗号アルゴリズムの使用、CWE-327）
+根拠: doPost の 79〜80 行目 Cipher.getInstance("DES/CBC/PKCS5Padding", "SunJCE") と 82 行目 KeyGenerator.getInstance("DES") で、
+  鍵長が実質 56 ビットの DES を使って、クッキー BenchmarkTest00055 の値（54〜66 行目、URL デコード済み）を暗号化し、
+  104〜114 行目で "secret_value=" として passwordFile.txt に保存している。DES は総当たりで現実的に解読できるため、保存した秘密値の機密性が守れない。
+  （76 行目の IV は SecureRandom.generateSeed(8) で生成しており、IV 自体に問題はない。）
+  出力の 115〜123 行目は ESAPI encodeForHTML でエンコードしているため XSS ではない。書き込み先は固定パスで、パストラバーサルもない。
+  付随: catch 節（129、135 行目など）で e.printStackTrace(response.getWriter()) としており、スタックトレースを応答に出す情報露出（CWE-209）もある。
+修正案: AES-GCM（例: "AES/GCM/NoPadding"、128 ビット以上の鍵）に置き換える。XSS ではないため修正コードは作らない。
+- 使用トークン量（判定）: 新規 5,180（入力 4 ／ キャッシュ作成 4,338 ／ 出力〔推定〕 838）、キャッシュ読込 234,591、総処理 239,771、リクエスト 2 回
