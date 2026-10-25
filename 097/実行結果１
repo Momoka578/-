@@ -1,0 +1,16 @@
+### No.97 SARD 1644 Target97.java
+- 判定: **脆弱性あり**（クロスサイトスクリプティング／ストア型XSS・CWE-79）
+- XSS に該当: 種別・source・sink の詳細は "xssの詳細" を参照
+根拠: Target97.java の doGet() は、データベース（mytab テーブルの val 列）から読み出した値を、Content-Type text/html のレスポンスにエスケープせずにそのまま出力している（52行目 out.println(rs.getString(1))）。mytab.val に HTML／JavaScript が保存されていれば、閲覧者のブラウザでそのスクリプトが実行される。
+補足: リクエストパラメータ name（41行目）は PreparedStatement のプレースホルダ（47-48行目 "... where name = ?" と setString）で渡しているため、SQL インジェクションはない。また name 自体はレスポンスに出力していないので、反射型 XSS もない。PreparedStatement と ResultSet を close していない（47-49行目。リソースリーク CWE-404 相当）が、これはコード品質上の問題であり、判定の主因ではない。
+修正方針（参考）: 52行目の出力前に、& < > " ' を HTML エンティティへ変換してから出力する。
+- 使用トークン量（判定）: 新規 3,423（入力 4 ／ キャッシュ作成 1,939 ／ 出力〔推定〕 1,480）、キャッシュ読込 33,272、総処理 36,695、リクエスト 2 回
+
+## No.97 SARD 1644 Target97.java
+
+- **XSS 種別**: ストア型（出力しているのはリクエストの値ではなく、DB に保存済みの値 mytab.val であり、事前に別の経路で DB に書き込まれた攻撃データが後の閲覧時に出力されるため）
+- **source**: 52行目 rs.getString(1)（DB の mytab.val。値は別の機能や過去の入力でユーザーが書き込める前提。41行目の name は検索キーとして出力する行を選ぶだけ）
+- **伝播経路**: 47行目 prepareStatement("select val from mytab where name = ?") → 48行目 setString(1, name) → 49行目 executeQuery() で ResultSet rs を取得 → 51-52行目 while(rs.next()) で rs.getString(1) を取り出す → 無害化せずに out.println に渡す
+- **sink**: 52行目 out.println(rs.getString(1))（38行目の ServletOutputStream。37行目で text/html を指定し、39行目の <pre> 要素内に出力）
+- **脆弱性の位置**: sink 側（52行目で DB の値を HTML エスケープせずに出力している点。source 側の DB への保存時にも検証がない可能性はあるが、このファイルで直すべき箇所は出力時の 52行目）
+- **攻撃例**: 攻撃者が別の機能などを使い、mytab の val 列に script 要素を含む文字列を保存しておく。被害者がこのサーブレットに該当の name を指定してアクセスすると、その値が <pre> 内にそのまま出力され、被害者のブラウザで攻撃者のスクリプトが実行される（Cookie の窃取、なりすまし操作など）。
