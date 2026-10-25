@@ -1,0 +1,10 @@
+
+### No.40 soyuka/pidusage lib/stats.js (prePatch e3660d8)
+- 判定: **脆弱性あり**（OS コマンドインジェクション、CWE-78 / CWE-88）
+根拠:
+- index.js 36-38行: 公開 API の stat(pid, options, cb) は、引数 pid を型も値も検査せずに、プラットフォームごとの関数へそのまま渡す。darwin、sunos、freebsd、aix では stats.ps が呼ばれる（index.js 18-24行）。
+- lib/stats.js 98-103行: cmd = 'ps -o pcpu,rss -p ' に pid を文字列として連結し、child_process.exec(cmd + pid, ...) で実行している。exec は /bin/sh -c を経由するため、pid にシェルのメタ文字（; | & $() ` など）が入っていると、任意の OS コマンドが実行される。
+- 利用するアプリが、外部から受け取った値（HTTP パラメータや監視対象の設定など）を数値かどうか確認せずに pidusage.stat() に渡すと、攻撃者はサーバ上で任意のコマンドを、アプリと同じ権限で実行できる。
+- 補足: Windows 用の win()（122-124行）は spawn に引数を配列で渡すので、シェルインジェクションは起きない。ただし pid を空白で分割しているため、wmic への引数インジェクション（CWE-88）の余地はある。Linux 用の proc() は p.join('/proc', ''+pid, 'stat') で読み取るだけなので、コマンドは実行されない。
+修正案: pid が正の整数かどうかを検証する（例: /^\d+$/ や Number.isInteger）。exec をやめて execFile('ps', ['-o', 'pcpu,rss', '-p', String(pid)]) のように、シェルを経由せず引数を配列で渡す。
+- 使用トークン量（判定）: 新規 7,203（入力 6 ／ キャッシュ作成 5,727 ／ 出力〔推定〕 1,470）、キャッシュ読込 278,054、総処理 285,257、リクエスト 3 回
