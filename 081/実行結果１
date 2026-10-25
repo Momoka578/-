@@ -1,0 +1,12 @@
+# No.81 CVE-2019-10742 axios (prePatch 047501f) lib/adapters/http.js
+- 判定: **脆弱性あり**（maxContentLength 超過時にレスポンスストリームを閉じない資源枯渇型 DoS・CWE-404 不適切なリソース解放 / CWE-400・CWE-730）
+根拠:
+- lib/adapters/http.js 213-222 行の handleStreamData で、受信チャンクを responseBuffer に push し、218 行で Buffer.concat(responseBuffer).length > config.maxContentLength を判定している。超過時は 219 行で reject() を呼ぶだけで、return もせず、stream.destroy()／res.destroy()／req.abort() のいずれも行わない。
+- そのため Promise は reject 済みになるが、HTTP 接続とレスポンスストリームは開いたまま。'data' ハンドラは呼ばれ続け、responseBuffer は際限なく大きくなる。maxContentLength の「上限を超えたら打ち切る」という保護が実際には効かない。
+- reject()（26-29 行）は clearTimeout(timer) を実行する。そのため、上限超過で reject された後は config.timeout（249-252 行）による req.abort() も起きない。悪意あるサーバや中継者が遅く・延々とデータを送り続ければ、接続とメモリがクライアント側に滞留し続ける。
+- さらに 218 行はチャンクごとに Buffer.concat で全体を再連結しており、受信量に対して O(n^2) のコピーが発生する。上限超過後もこの処理が続くため、CPU 消費も増える。
+- 影響: axios を Node.js で使うアプリ（サーバ側から外部 URL を取得するものなど）が maxContentLength を設定して巨大応答を防ごうとしても、攻撃者が制御する応答先から大量データを送られると、メモリ枯渇や CPU 浪費でプロセスが停止する（DoS）。既定値は maxContentLength: -1、timeout: 0（lib/defaults.js 72, 77 行）。上限を明示的に設定した利用者ほど、保護が効いていると誤認する。
+- 修正案（XSS ではないため修正コードは作らない）: 219 行の reject の直後で stream.destroy()（必要なら req.abort()）を呼び、return して以降の処理を打ち切る。また totalLength を加算方式で管理し、毎回の Buffer.concat をやめる。
+- XSS ではない（HTML 出力や DOM への書き込みはない）。
+- 使用トークン量（判定）: 新規 8,129（入力 6 ／ キャッシュ作成 6,219 ／ 出力〔推定〕 1,904）、キャッシュ読込 56,590、総処理 64,719、リクエスト 3 回
+
