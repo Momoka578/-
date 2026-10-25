@@ -1,0 +1,11 @@
+### No.56 twbs/bootstrap js/collapse.js v3.4.0 (CVE-2018-14040, prePatch 13bf8ae)
+- 判定: **脆弱性あり**（XSS、CWE-79）
+- XSS に該当: 種別・source・sink の詳細は "xssの詳細" を参照
+根拠: js/collapse.js 139〜147 行目 Collapse.prototype.getParent は、140 行目で $(this.options.parent) を実行している。
+  options.parent は、174 行目 $.extend({}, Collapse.DEFAULTS, $this.data(), ...) と 207 行目 $this.data() により、HTML 要素の data-parent 属性の値がそのまま入る。
+  jQuery の $() は、文字列が "<" で始まるなど HTML に見える場合、セレクタではなく HTML として解釈して DOM 要素を生成する。
+  そのため、data-parent に onerror 属性付きの img タグのような HTML を書くと、生成時にイベントハンドラが動いてスクリプトが実行される。
+  data-* 属性は、HTML サニタイザが「安全」として通すことが多い。利用者が投稿した HTML（コメント、Wiki など）に data-toggle="collapse" と
+  data-parent を持つ要素を置かせるサイトでは、閲覧者のブラウザでスクリプトが実行される。
+  なお、163 行目 $(document).find(target) と 20〜21 行目の $('[data-toggle=...]') は、セレクタとしてしか解釈されないため HTML 生成は起きない。
+- 使用トークン量（判定）: 新規 7,302（入力 6 ／ キャッシュ作成 4,973 ／ 出力〔推定〕 2,323）、キャッシュ読込 270,819、総処理 278,121、リクエスト 3 回
