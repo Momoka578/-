@@ -1,0 +1,17 @@
+## No.42 erming/shout client/js/shout.js (prePatch 890c751)
+- 判定: **脆弱性あり**（クライアント側 XSS、CWE-79 / CWE-116）
+- XSS に該当: 種別・source・sink の詳細は "xssの詳細" を参照
+根拠:
+- サーバ側 src/plugins/irc-events/topic.js 16行・29-33行: IRC サーバから届いたチャンネルトピック data.topic を、加工せずに chan.topic に保存する。そのまま socket.io の "topic" イベントで、ブラウザへ { chan, topic } として送っている。トピックは、そのチャンネルでトピックを変更できる任意の IRC 利用者（外部の攻撃者でもよい）が自由に設定できる文字列である。
+- クライアント側 client/js/shout.js 317-319行: socket.on("topic") の中で、$("#chan-" + data.chan).find(".header .topic").html(data.topic) を実行している。受け取ったトピック文字列を、エスケープせずに jQuery の .html()（innerHTML）でそのまま DOM に挿入している。
+- 初回の描画では client/views/chat.tpl 20行の {{{parse topic}}} を使い、client/js/libs/handlebars/parse.js 26-35行の escape() で < > ' を無害化している。トピックがリアルタイムに変わったときの経路（318行）だけ、このエスケープを通らない。
+- 使用トークン量（判定）: 新規 16,261（入力 12 ／ キャッシュ作成 11,125 ／ 出力〔推定〕 5,124）、キャッシュ読込 630,541、総処理 646,802、リクエスト 6 回
+
+## No.42 erming/shout client/js/shout.js (prePatch 890c751)
+
+- **XSS 種別**: DOM-base（サーバは HTML を組み立てず、トピックを JSON データとして WebSocket で送るだけである。ブラウザ側の JavaScript（shout.js 318行）が、そのデータを .html() で DOM に書き込む時点で、スクリプトとして解釈される。なお、ペイロード自体は IRC チャンネルのトピックとして保存され、チャンネルにいる全員に届くので、ストア型に近い性質も持つ。）
+- **source**: IRC の TOPIC コマンドで攻撃者が設定するトピック文字列。サーバ src/plugins/irc-events/topic.js 16行 var topic = data.topic、クライアント client/js/shout.js 317行 socket.on("topic", function(data) の data.topic
+- **伝播経路**: 攻撃者が IRC でトピックを設定 → IRC サーバ → shout サーバ irc.on("topic")（topic.js 6行）→ chan.topic = topic（29行）→ client.emit("topic", {chan, topic})（30-33行、socket.io）→ ブラウザ shout.js 317行 socket.on("topic") → 318行 .html(data.topic)
+- **sink**: client/js/shout.js 318行 $("#chan-" + data.chan).find(".header .topic").html(data.topic)
+- **脆弱性の位置**: sink 側（クライアントの shout.js 318行で、出力時のエスケープがない）。source 側（サーバの topic.js）でも、無害化しないまま転送している。
+- **攻撃例**: 攻撃者が同じ IRC チャンネルに参加し、イベントハンドラ属性を持つ画像タグなどの HTML をトピックとして設定する。そのチャンネルを shout で開いている全利用者のブラウザで、トピックの変更通知を受け取った時点で HTML が DOM に挿入され、スクリプトが実行される。その結果、shout のログイン用トークン（Cookie の token）を盗まれたり、被害者の IRC アカウントでメッセージを送られたりする。
