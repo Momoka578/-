@@ -1,0 +1,24 @@
+判定: **脆弱性あり**（DOM-based XSS・CWE-79。postMessage の origin 検証不備 CWE-346 を含む）
+- XSS に該当: 種別・source・sink の詳細は "xssの詳細" を参照
+根拠:
+- ToxicDom.java L51-53: パスが 2 階層（/dom/toxicdom/<source>/<name>）なら generateAccesslessTemplate()（L75-81）で sources/<source>/<name>.tmpl を toxicdom.tmpl の <script> 内に埋め込み、Responses.sendXssed（X-XSS-Protection: 0）で返す。
+- L54-57 / L83-92: 3 階層なら source テンプレート＋sink テンプレート（eval/innerHtml/documentWrite）を連結して <script> 内に出力。
+- L61-64 / L94-106: 4 階層（external）なら toxicdomexternal.tmpl の <script src> に /dom/toxicdomscripts/... を設定（\w+ のみ許可 L97-101 なので属性インジェクションはない）。
+- 生成される JS の具体例:
+  - data/sources/postMessage/eval.tmpl L2-3: msg.data を origin 確認なしで eval。
+  - postMessage/innerHtml.tmpl L2-4: JSON.parse(msg.data).html を div.innerHTML に代入。
+  - postMessage/documentWrite.tmpl L2-3: content.url を <script src="..."> として document.write。
+  - postMessage/complexMessageDocumentWriteEval.tmpl L3-8: msg.data.payload を eval、msg.data.html を document.write。
+  - postMessage/improperOriginValidationWithPartialStringComparison.tmpl L2: msg.origin.includes('www.google.com')、improperOriginValidationWithRegExp.tmpl L2-3: /https?:\/\/www.google.com/（. 未エスケープ・$ なし）で、www.google.com.evil.example 等の攻撃者オリジンを通してしまう（CWE-346）。
+  - window/name.tmpl L5,L8, document/referrer.tmpl L5,L8, document/cookie.tmpl L13, localStorage/*.tmpl, sessionStorage/*.tmpl の値を sinks/eval.tmpl L2,L6 / innerHtml.tmpl L5,L9 / documentWrite.tmpl L2,L6 に無害化なしで渡す。
+- サーバ側はテンプレート選択のみ（Templates.getTemplate で ".." 禁止）で、サーバ側のパストラバーサル等はない。脆弱性はクライアント側 JS。
+- 使用トークン量（判定）: 新規 12,664（入力 6 ／ キャッシュ作成 9,738 ／ 出力〔推定〕 2,920）、キャッシュ読込 97,950、総処理 110,614、リクエスト 3 回
+
+# No.17 google/firing-range src/tests/dom/ToxicDom.java
+
+- **XSS 種別**: DOM-base（サーバ応答にはユーザー入力が含まれず、ブラウザ内の JS が postMessage・window.name・referrer・cookie・Web Storage の値を読み取り、eval/innerHTML/document.write に渡すため）
+- **source**: postMessage の msg.data（postMessage/eval.tmpl L2、innerHtml.tmpl L2、documentWrite.tmpl L2、complexMessageDocumentWriteEval.tmpl L2-8、improperOrigin*.tmpl L3-4）、window.name（window/name.tmpl L5,L8）、document.referrer（document/referrer.tmpl L5,L8）、document.cookie（document/cookie.tmpl L5-13）、localStorage/sessionStorage（*/array|function|property.tmpl L4-8）
+- **伝播経路**: source の値 → グローバル変数 payload（sync）または setTimeout 内の trigger(...)（async）→ ToxicDom.java L91 で連結された sink テンプレート。postMessage 系はハンドラ内で直接 sink へ（L75-81 で単体テンプレートとして出力）
+- **sink**: eval（sinks/eval.tmpl L2,L6、postMessage/eval.tmpl L3、improperOrigin*.tmpl L3/L4、complexMessageDocumentWriteEval.tmpl L4）、innerHTML（sinks/innerHtml.tmpl L5,L9、postMessage/innerHtml.tmpl L4）、document.write（sinks/documentWrite.tmpl L2,L6、postMessage/documentWrite.tmpl L3、complexMessageDocumentWriteEval.tmpl L6,L8）。出力元は ToxicDom.java L52-53, L56-57 の sendXssed
+- **脆弱性の位置**: source 側（postMessage の origin を検証しない／不完全な検証）と sink 側（値を無害化せずに eval/innerHTML/document.write へ渡す）の両方
+- **攻撃例**: 攻撃者は自分のサイトから対象ページ（/dom/toxicdom/postMessage/eval など）を iframe やポップアップで開き、postMessage で JS コードや HTML を送る。ページは送信元を確認せずに eval や innerHTML で処理するため、対象オリジンで任意スクリプトが動く。window.name 系は、攻撃者が名前付きウィンドウで対象ページへ遷移させれば、その名前がそのまま実行される。
