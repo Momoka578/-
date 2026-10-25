@@ -1,0 +1,19 @@
+### No.22 CVE-2016-10735 twbs/bootstrap js/src/util.js（prePatch ba6a6f1, v4.0.0-beta）
+- 判定: **脆弱性あり**（DOM-based XSS・CWE-79／CWE-116: DOM のテキストを HTML として再解釈）
+- XSS に該当: 種別・source・sink の詳細は "xssの詳細" を参照
+根拠:
+- js/src/util.js L113-125 getSelectorFromElement(element): L114 で要素の data-target 属性を、それが空か '#' なら L116 で href 属性を selector として取得する。L120 でその文字列をそのまま jQuery の $(selector) に渡している。
+- jQuery（package.json で 3.0.0-4.0.0 系）の $() は、'<' で始まり '>' で終わる文字列を CSS セレクタではなく HTML として解釈し、要素を生成する。生成時に <img src=x onerror=...> の onerror などが実行される。
+- try/catch（L119-124）はセレクタ構文エラーを握りつぶすだけで、HTML として解釈されることは防げない。
+- 呼び出し元: collapse.js L370（data-toggle="collapse" のクリック）、modal.js L539、tab.js L88、dropdown.js L350、alert.js L89、carousel.js L458、scrollspy.js L128 など。data-api のクリック等で自動的に呼ばれる。
+- data-* 属性は「無害な属性」として HTML サニタイザやテンプレートで許可されやすい。そのため、ユーザー投稿コンテンツに data-target/href を書ける環境ではスクリプトを実行できる。
+- 使用トークン量（判定）: 新規 12,013（入力 10 ／ キャッシュ作成 8,598 ／ 出力〔推定〕 3,405）、キャッシュ読込 370,511、総処理 382,524、リクエスト 5 回
+
+## No.22 CVE-2016-10735 twbs/bootstrap js/src/util.js（prePatch ba6a6f1, v4.0.0-beta）
+
+- **XSS 種別**: DOM-base（サーバ側の処理ではなく、ブラウザ内の Bootstrap の JS が DOM の属性値（テキスト）を jQuery で HTML として再解釈するため）
+- **source**: 要素の data-target 属性（util.js L114）および href 属性（L116）。例: ユーザー投稿コンテンツ内のボタンやリンクに付けられた data-target
+- **伝播経路**: data-target / href の属性値 → 変数 selector（L114/L116）→ $(selector)（L120）→ jQuery が HTML 文字列と判定して DOM 要素を生成 → イベントハンドラ属性が実行。呼び出し元（collapse.js L370-371 等）でも返り値を再度 $(selector) に渡している
+- **sink**: util.js L120 const $selector = $(selector)（jQuery の HTML 解釈）。副次的に collapse.js L371、modal.js L542 などの $(selector)
+- **脆弱性の位置**: sink 側（属性値を検証せずに、HTML としても解釈する jQuery() に渡している）。source 側でもセレクタとして妥当か確認していない
+- **攻撃例**: 攻撃者は、data-* 属性を許可している掲示板やコメント欄などに、data-toggle="collapse" と、HTML タグを値にした data-target を持つ要素を投稿する。被害者がその要素をクリックすると、Bootstrap がこの値を jQuery に渡し、HTML として要素を生成する。そのとき onerror 等のスクリプトが被害者のブラウザで実行される。
