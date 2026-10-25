@@ -1,0 +1,10 @@
+## No.38 OWASP-Benchmark/BenchmarkJava BenchmarkTest00025.java
+- 判定: **脆弱性あり**（SQL インジェクション、CWE-89）
+根拠:
+- BenchmarkTest00025.java 44行: request.getParameter("BenchmarkTest00025") で、利用者が自由に決められるリクエストパラメータを param に入れている。45行は null を空文字にするだけで、検証もエスケープもしていない。
+- 47行: "SELECT userid from USERS where USERNAME='foo' and PASSWORD='" + param + "'" のように、param を SQL 文の文字列リテラルの中に直接連結している。
+- 51-53行: DatabaseHelper.JDBCtemplate.queryForObject(sql, Long.class) で、この連結した SQL をプレースホルダを使わずに実行している（Spring JdbcTemplate の引数なし版）。
+- 攻撃者がパラメータにシングルクォートと SQL 構文を入れると、WHERE 句の条件を書き換えられる。パスワードの確認を回避する（常に真になる条件を足す）、UNION で他の表のデータを読み出す、エラーや時間差を手がかりにブラインド SQL インジェクションでデータを抜き出す、といった攻撃が可能。
+- 参考: XSS には当たらない。54行で出力する results は Long 型で、58-59行の sql は ESAPI.encoder().encodeForHTML() でエスケープしてから出力しているため。
+修正案: "... and PASSWORD=?" とプレースホルダを使い、JDBCtemplate.queryForObject(sql, Long.class, param)（または PreparedStatement）で値をバインドする。
+- 使用トークン量（判定）: 新規 3,394（入力 4 ／ キャッシュ作成 2,354 ／ 出力〔推定〕 1,036）、キャッシュ読込 170,606、総処理 174,000、リクエスト 2 回
