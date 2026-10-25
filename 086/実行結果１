@@ -1,0 +1,10 @@
+### No.86 CVE-2019-10750 deeply 3.0.0（lib/reduce_object.js, merge.js, adapters/object.js）
+- 判定: **脆弱性あり**（プロトタイプ汚染 / CWE-915 Improperly Controlled Modification of Dynamically-Determined Object Attributes。CWE-1321 相当）
+根拠:
+- lib/reduce_object.js 17〜19行目: Object.keys(source) で得たキーを検査せず、acc[key] = merge(acc[key], source[key]) と再帰的に代入している。"__proto__" / "constructor" / "prototype" を除外する処理がない。
+- JSON.parse で作ったオブジェクトなどは "__proto__" を自身のプロパティ（Object.keys に出るキー）として持てる。その場合、19行目の acc["__proto__"] の読み出しは Object.prototype を返す。
+- merge.js 18〜40行目: precise-typeof（Object.prototype.toString を使う）では Object.prototype の型は 'object' になる。source 側の値も 'object' なので型が一致し、30〜33行目の新しいオブジェクトへの置き換えが起きない。そのため to = Object.prototype のまま adapters/object.js 17〜23行目 → reduceObject(Object.prototype, 攻撃者の値, merge) と進み、19行目で Object.prototype に任意のプロパティが書き込まれる。
+- 既定の immutable（immutable.js 13〜19行目、第1引数を undefined にする）でも、トップレベルの to が新しいオブジェクトになるだけで、その "__proto__" キーの読み出しは Object.prototype になる。だから mutable/immutable のどちらでも汚染が起きる。ネストした "constructor": {"prototype": {...}} の形でも、acc.constructor（Object 関数）を経由して到達できる可能性がある（function 型と object 型の不一致で置き換えられる場合もあるが、"__proto__" 経路だけで十分に成立する）。
+- 影響: 外部入力（HTTP リクエストの JSON ボディや設定ファイルなど）を deeply でマージ／クローンするアプリでは、すべてのオブジェクトに属性が注入される。結果として、認可チェックの回避、DoS（CWE-400、toString などの上書きによる例外）、さらに利用側の実装によってはテンプレートやコマンド生成を経由した XSS・コード実行（CWE-79/94/78）につながる。
+- 修正案（XSS ではないため修正コードは作らない）: reduce_object.js の reduce 内で key が '__proto__'、'constructor'、'prototype' のときは skip する。あるいは Object.prototype.hasOwnProperty.call(acc, key) でないとき acc[key] を読まず merge(undefined, source[key]) にする。合わせて、マージ先が Object.prototype / Function.prototype のときは書き込みを拒否する。
+- 使用トークン量（判定）: 新規 13,329（入力 10 ／ キャッシュ作成 10,111 ／ 出力〔推定〕 3,208）、キャッシュ読込 101,060、総処理 114,389、リクエスト 5 回
