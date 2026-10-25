@@ -9,3 +9,13 @@
   data-parent を持つ要素を置かせるサイトでは、閲覧者のブラウザでスクリプトが実行される。
   なお、163 行目 $(document).find(target) と 20〜21 行目の $('[data-toggle=...]') は、セレクタとしてしか解釈されないため HTML 生成は起きない。
 - 使用トークン量（判定）: 新規 7,302（入力 6 ／ キャッシュ作成 4,973 ／ 出力〔推定〕 2,323）、キャッシュ読込 270,819、総処理 278,121、リクエスト 3 回
+
+
+## No.56 twbs/bootstrap js/collapse.js v3.4.0 (CVE-2018-14040, prePatch 13bf8ae)
+
+- **XSS 種別**: DOM-base（サーバの出力ではなく、ブラウザ上の Bootstrap の JavaScript が DOM の属性値を jQuery の $() に渡し、HTML として解釈させて発火するため。悪性の属性値自体は保存された投稿などから来うる）
+- **source**: 要素の data-parent 属性（174 行目 $this.data() → options、または 200〜209 行目クリック時の 207 行目 $this.data() から Plugin へ渡る options）
+- **伝播経路**: data-parent 属性 → $this.data()（174 行目 / 207 行目）→ $.extend で options.parent（174 行目）→ new Collapse(this, options)（177 行目）→ this.options（19 行目）→ 24〜25 行目 this.getParent() → 140 行目
+- **sink**: js/collapse.js 140 行目 $(this.options.parent)（jQuery の HTML 解釈を伴う $()）
+- **脆弱性の位置**: sink 側（140 行目で、セレクタ専用の API ではなく、HTML も受け付ける $() に属性値を渡している）。source 側の data 属性に対する検証もない。
+- **攻撃例**: 攻撃者は、data-* 属性が許可された投稿欄に、data-toggle="collapse" と、HTML（エラー時にスクリプトを実行する画像タグなど）を値に持つ data-parent 属性を持つリンクを投稿する。閲覧者がそのリンクをクリックするか、collapse が初期化されると、jQuery がその値を HTML として生成し、閲覧者のブラウザでスクリプトが実行される。
