@@ -1,0 +1,20 @@
+### No.68 SARD 501351 tools/edit-item-form.jsp (+ EditItemServlet.java)
+- 判定: **脆弱性あり**（ストア型 XSS・CWE-79）
+- XSS に該当: 種別・source・sink の詳細は "xssの詳細" を参照
+根拠（コードを読んだ結果。web.xml を見ても XSS フィルタはなく、出力時のエスケープだけが防御になっている）:
+- tools/edit-item-form.jsp 486行: <textarea ...><%= dcv.get(i).getValue() %></textarea> で、アイテムのメタデータ値をエスケープせずに textarea の中へ出力している。値に「</textarea>」を含めれば要素を抜け出し、任意の HTML/スクリプトを挿入できる。
+- tools/edit-item-form.jsp 601行: value="<%= ... bitstream.getSource() %>" で、ビットストリームの source をエスケープせずに属性値へ出力している。同じ表の name(598行)・description(604行)・user format description(610行)は Utils.addEntities でエスケープしており、source だけ抜けている。source の値は EditItemServlet.java 1035行 b.setSource(context, wrapper.getFilesystemName("file")) で入る。これはクライアントが送ったアップロードファイル名で、「"」や「<」を含められる（上流の FileUploadRequest.getFilename は区切り文字より前を落とすだけ）。EditItemServlet.java 798行→827行の bitstream_source_* パラメータからもそのまま入る。通常の投稿（上流 UploadStep.setSource(filePath)）でも同じ値が入る。
+- 同じ JSP の doAuthority()（142〜143・147〜149・160・173行）も、dcv.getValue()/authority/choice の label をエスケープせずに StringBuffer へ連結している。490行の language（属性値）と 266行のコレクション名もエスケープしていない。
+- メタデータ値の入口: EditItemServlet.java 747行 request.getParameter(p) → 756行 itemService.addMetadata、856行 addfield_value → 871行 addMetadata。ほかに通常の投稿（submission）で投稿者が入力したタイトルなども、無加工で DB に保存される。
+- 補足（危険度は低い）: collection-home.jsp 118行の <h2><%= name %>、community-home.jsp 263行・319行のサブコミュニティ名とコレクション名、281行・338行と home.jsp 206行の short_description もエスケープしていない（community-home.jsp 91行の name はエスケープしている）。ただしこれらは管理者が入力する値で、introductory_text や side_bar_text は設計上 HTML を許しているので、主な指摘には含めない。
+- 補足（XSS 以外）: EditItemServlet.java 246〜251行。submit_cancel_cc パラメータがあると、checkEditAuthorization（256行）より前に showEditForm を呼んで return する。このため、/tools/* に入れる登録ユーザーなら誰でも、item_id を指定して任意のアイテムの編集画面（非公開や取り下げ済みのアイテムのメタデータを含む）を表示できる。認可の欠落（CWE-862）。修正案は、submit_cancel_cc の判定を checkEditAuthorization の後ろへ移すこと。
+- 使用トークン量（判定）: 新規 107,385（入力 34 ／ キャッシュ作成 93,279 ／ 出力〔推定〕 14,072）、キャッシュ読込 1,047,314、総処理 1,154,699、リクエスト 17 回
+
+## No.68 SARD 501351 tools/edit-item-form.jsp (+ EditItemServlet.java)
+
+- **XSS 種別**: ストア型（攻撃者が登録したメタデータ値やファイル名が DB に保存され、後で管理者や編集者がアイテム編集画面 /tools/edit-item を開いたときに出力されるため）
+- **source**: (1) メタデータ値: 投稿フォームの入力、EditItemServlet.java 747行 request.getParameter(p)（value_* パラメータ）、856行 request.getParameter("addfield_value")。(2) ビットストリーム source: EditItemServlet.java 1035行 wrapper.getFilesystemName("file")（クライアントのファイル名）、798行 request.getParameter("bitstream_source_"+key)、および上流 UploadStep の setSource(filePath)
+- **伝播経路**: (1) EditItemServlet.java 756行・871行 itemService.addMetadata → 875行 itemService.update で DB に保存 → 閲覧時は showEditForm（503〜643行）が item を request 属性にして edit-item-form.jsp へフォワード → 438行 getMetadata(item, ANY...) で取り出し → 486行で出力（authority 制御のフィールドは 482行 doAuthority → 142/160行）。(2) EditItemServlet.java 1035行/827行 setSource → 1040行/842行 bitstreamService.update で DB に保存 → showEditForm → edit-item-form.jsp 561〜576行で bundles/bitstreams を取り出し → 601行で出力
+- **sink**: tools/edit-item-form.jsp 486行（textarea の中身、<%= dcv.get(i).getValue() %>）と 601行（input の value 属性、<%= bitstream.getSource() %>）。ほかに 142〜143・160・173・490・266行
+- **脆弱性の位置**: sink 側。入力時の無害化はない（DSpace はメタデータを生の文字列として保存する設計）が、表示先 JSP で HTML エスケープしていないことが原因。同じ JSP のほかの欄（598・604・610行）は Utils.addEntities でエスケープしているのに、486行と 601行（ほか）だけが抜けている。
+- **攻撃例**: コレクションへの投稿権限を持つ一般ユーザーが、タイトルなどのメタデータに textarea を閉じるタグとスクリプトを含む値を入れて投稿する。または、属性値を閉じてイベントハンドラを足すような「"」入りのファイル名でファイルをアップロードする。審査や管理のために、管理者がそのアイテムの /tools/edit-item 画面を開く。すると管理者のブラウザで、管理者の権限・セッションのままスクリプトが動く。その結果、管理操作の不正実行（ユーザーの権限昇格、アイテムの削除・改ざんなど）や情報の窃取につながる。
