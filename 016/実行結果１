@@ -1,0 +1,20 @@
+### No.16 google/firing-range src/tests/dom/EventTriggering.java
+- 判定: **脆弱性あり**（DOM-based XSS・CWE-79）
+- XSS に該当: 種別・source・sink の詳細は "xssの詳細" を参照
+根拠:
+- EventTriggering.java L62-73 generateTemplate(): パス /dom/eventtriggering/<source>/<accessType>/<sink> で選んだ source テンプレートと sink テンプレートを連結し、toxicdom.tmpl の <script> 内（L5 %%PAYLOAD%%）に埋め込んで返す。sink テンプレートは deferred.tmpl（L1-3 function deferredPayload(){...}）でも包まれ、イベント発火後に sink が実行される。
+- Responses.sendXssed()（L55, Responses.java L71-79）は X-XSS-Protection: 0 を付け text/html で返す。
+- source 例: data/sources/document/formSubmission.tmpl L15 で payload = document.getElementById('userInput').value、L16 deferredPayload()。inputTyping.tmpl L8 で payload = e.target.value、L9 deferredPayload()（keyup/change イベント, L12-13）。
+- sink: data/sinks/eval.tmpl L2/L6 eval(payload)、innerHtml.tmpl L5/L9 div.innerHTML = payload、documentWrite.tmpl L2/L6 document.write(payload)。
+- payload は検証・エスケープ一切なしで sink に渡るため、入力値が JS として実行（eval）または HTML として解釈（innerHTML/document.write）される。
+- サーバ側のパスは Templates.getTemplate で ".." を禁止（Templates.java L61）しており、テンプレート選択だけなのでパストラバーサルはなし。脆弱性はクライアント側 JS にある。
+- 使用トークン量（判定）: 新規 14,941（入力 12 ／ キャッシュ作成 10,963 ／ 出力〔推定〕 3,966）、キャッシュ読込 128,809、総処理 143,750、リクエスト 6 回
+
+## No.16 google/firing-range src/tests/dom/EventTriggering.java
+
+- **XSS 種別**: DOM-base（サーバはユーザー入力を応答に含めず、ブラウザ内 JS が DOM の入力値を読み取り、そのまま eval/innerHTML/document.write へ渡すため）
+- **source**: data/sources/document/formSubmission.tmpl L15（フォームの input 値）、data/sources/document/inputTyping.tmpl L8（入力欄の値, keyup/change）。他の source（cookie.tmpl L13, window/name.tmpl L5/L8, referrer.tmpl L5/L8）も同じ仕組みで組み合わせ可能
+- **伝播経路**: 入力欄の value → グローバル変数 payload（formSubmission.tmpl L15 / inputTyping.tmpl L8）→ deferredPayload()（deferred.tmpl L1-3、EventTriggering.java L72 で sink を包む）→ sink テンプレート内の eval/innerHTML/document.write
+- **sink**: data/sinks/eval.tmpl L2,L6 eval(payload)／data/sinks/innerHtml.tmpl L5,L9 div.innerHTML = payload／data/sinks/documentWrite.tmpl L2,L6 document.write(payload)（EventTriggering.java L73 で toxicdom.tmpl L5 に連結）
+- **脆弱性の位置**: sink 側（入力値を無害化せずにコード実行・HTML 解釈する API に渡している）。source 側でも入力値の検証をしていない
+- **攻撃例**: 攻撃者が被害者に「この文字列を入力欄に貼り付けて送信して」と誘導したり、ドラッグ＆ドロップやクリックジャッキングで入力させると、入力値が eval や innerHTML で実行され、被害者のオリジンで任意スクリプトが動き cookie やセッションが盗まれる。
