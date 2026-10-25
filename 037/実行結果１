@@ -1,0 +1,9 @@
+## No.37 henrytseng/hostr lib/routes/statics.js (prePatch 5827ba4)
+- 判定: **脆弱性あり**（パストラバーサル／任意ファイルの読み取り、CWE-22）
+根拠:
+- lib/routes/statics.js 25-26行: url.parse(req.url).pathname をそのまま process.cwd() に連結してファイルパスを作っている。url.parse() はパスを正規化しない（'..' を解決しない）し、Node.js の http サーバもリクエストの URL を正規化しない。また、結果のパスが公開ディレクトリの中に収まっているかを検査する処理もない。
+- statics.js 31行 fs.stat(filePath)、60-62行 fs.createReadStream(filePath).pipe(res): 検査していない filePath を開き、その内容をそのまま HTTP レスポンスとして返している。
+- 攻撃者が、パスに '../' を並べたリクエスト（ブラウザは '..' を正規化してしまうので、生の HTTP リクエストを直接送る）を送ると、公開ディレクトリ（process.cwd()）の外にあるファイルを読み出せる。たとえば /etc/passwd、アプリの設定ファイル、秘密鍵などが漏えいする。
+- 副次的な問題: 81-86行で req.url をそのままログに出しており、ログインジェクションの余地がある。
+修正案: pathname をデコードしてから path.normalize/path.resolve で絶対パスにし、そのパスが公開ルートのディレクトリ（path.resolve(process.cwd()) + path.sep）で始まることを確認する。外れていれば 403/404 を返す。ヌルバイトも拒否する。
+- 使用トークン量（判定）: 新規 6,759（入力 8 ／ キャッシュ作成 4,313 ／ 出力〔推定〕 2,438）、キャッシュ読込 327,694、総処理 334,453、リクエスト 4 回
