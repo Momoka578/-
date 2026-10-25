@@ -1,0 +1,15 @@
+
+### No.71 SARD 501377 eperson-list.jsp（EPersonListServlet.java ほか）
+- 判定: **脆弱性あり**（XSS・CWE-79）
+- XSS に該当: 種別・source・sink の詳細は "xssの詳細" を参照
+根拠: EPersonListServlet.java 90 行目で request.getParameter("search") を取得し、107 行目で request 属性 "search" にそのまま設定している。eperson-list.jsp 44 行目でこの値を取り出し、187 行目の <input ... name="search" value="<%= search %>"/> でエスケープせずに HTML 属性値へ出力している。さらに 117 行目で search を URL エンコードも HTML エスケープもせずに jumpLink へ連結し、200〜205 行目と 329〜334 行目の <a href="<%= jumpLink %>..."> にそのまま出力している。そのため、二重引用符で属性値を閉じれば任意の属性やタグを注入できる。同じファイルの 214 行目だけは Utils.addEntities(search) でエスケープしており、処理が不統一である。web.xml に入力を無害化するフィルタはない（/tools/* には registered-only によるログイン要求だけがある）。
+補足: profile-form.jsp 65・70・74 行目（first_name/last_name/phone）は Utils.addEntities（上流 6.2 では Escape.html）でエスケープ済み。96 行目の lang は設定由来のロケールなので問題ない。eperson-list.jsp 298〜299 行目は escapeJavaScript→escapeXml の順で処理しており、onclick 内の JS 文字列として安全。307〜315 行目も addEntities 済み。EditProfileServlet.java は入力値を検証せずに保存するが、出力側でエスケープしているため、保存した値によるストア型 XSS は成立しない。
+- 使用トークン量（判定）: 新規 29,865（入力 10 ／ キャッシュ作成 24,594 ／ 出力〔推定〕 5,261）、キャッシュ読込 123,553、総処理 153,418、リクエスト 5 回
+# No.71 SARD 501377 eperson-list.jsp（EPersonListServlet.java ほか）
+
+- **XSS 種別**: 反射型（リクエストパラメータ search の値が、同じレスポンスの HTML にそのまま反映される。DB への保存を経由しない）
+- **source**: EPersonListServlet.java 90 行目 request.getParameter("search")（GET/POST の search パラメータ）
+- **伝播経路**: EPersonListServlet.java 90 行目 search → 107 行目 request.setAttribute("search", search) → eperson-list.jsp 44 行目 (String) request.getAttribute("search") → (a) 187 行目にそのまま出力 / (b) 117 行目で jumpLink に文字列連結 → 200〜205・329〜334 行目に出力
+- **sink**: eperson-list.jsp 187 行目 value="<%= search %>"（input の value 属性）、および 200〜205 行目・329〜334 行目 href="<%= jumpLink %>..."（a の href 属性。jumpLink は 117 行目で組み立て）
+- **脆弱性の位置**: sink 側。source（サーブレット）で値を受け取ること自体は問題ないが、JSP の出力時（187 行目、および 117 行目の連結を経た 200〜205・329〜334 行目）に HTML エスケープ（href は URL エンコードも）がないことが原因
+- **攻撃例**: 攻撃者は、search パラメータに二重引用符で value 属性（または href 属性）を閉じ、イベントハンドラ属性やスクリプトタグを続ける値を入れた /tools/eperson-list への URL を作る。これをログイン済みの DSpace ユーザー（管理者など）に踏ませると、被害者のブラウザ上で DSpace のオリジンとしてスクリプトが実行され、セッションの悪用や管理操作の代行が可能になる。
