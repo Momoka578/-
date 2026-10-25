@@ -1,0 +1,12 @@
+### No.85 CVE-2019-10747 set-value 3.0.0 (jonschlinkert/set-value, index.js)
+- 判定: **脆弱性あり**（プロトタイプ汚染 Prototype Pollution・CWE-915 / CWE-1321。XSS ではない）
+根拠:
+- index.js 12-53 行の set(target, path, value, options) は、path を split()（63-86 行、既定の区切りは '.'）でキー配列にし、37-50 行のループで target[prop] を順にたどる。キー名が "__proto__"、"constructor"、"prototype" かどうかを一切検査していない。配列 path（18 行・28 行）でもそのまま使われる。
+- path が "__proto__.polluted" の場合: i=0 で prop="__proto__"。target["__proto__"] は Object.prototype（object）なので、40 行の isObject は真となり置き換えられない。49 行の target = target[prop] で target が Object.prototype になる。i=1 で 45 行 result() → 59 行 target[path] = value が実行され、Object.prototype.polluted = value となる。プロセス内のすべてのオブジェクトに属性が生える。
+- path が "constructor.prototype.x" の場合も同様。{}.constructor は Object（function なので 101-111 行の isObject で真）、Object.prototype へたどり着き、59 行で書き込まれる。
+- options.merge を指定した場合は 57 行 target[path] = merge({}, target[path], value) となるが、書き込み先は同じく汚染されたプロトタイプである。
+- 影響: set-value はクエリ文字列・JSON・設定ファイルのキーを使って入れ子のオブジェクトを作る用途で使われる。攻撃者がキー（path）を制御できると、全オブジェクトのプロトタイプを書き換えられる。その結果、アプリによって次の問題が起きうる: DoS（toString などを上書きして例外を起こす。CWE-400）、認可判定の迂回（isAdmin などの既定値を注入）、テンプレートや child_process の options などのガジェットを経由したコード実行・コマンド注入・XSS（CWE-94/78/79）。根本原因はこのライブラリの 37-50 行・59 行にある。
+- 補足（副次的な問題）: 65 行の set.memo は {} のプレーンオブジェクトで、上限のないキャッシュである。攻撃者が制御する path を大量に渡すとメモリが増え続ける（CWE-400 の可能性）。また path="__proto__" のときは set.memo["__proto__"] が Object.prototype を返してしまう（キャッシュ汚染の一種）。ただし主たる脆弱性は上記のプロトタイプ汚染である。
+- 修正案（XSS ではないため修正コードは作らない）: split 後のキー、または配列 path の各要素について、"__proto__"・"constructor"・"prototype" を拒否する（例外を投げる、または処理を中断する）。あるいは Object.prototype.hasOwnProperty で自身のプロパティだけをたどる。memo は Object.create(null) または Map にし、上限を設ける。
+- 使用トークン量（判定）: 新規 7,117（入力 6 ／ キャッシュ作成 4,662 ／ 出力〔推定〕 2,449）、キャッシュ読込 51,473、総処理 58,590、リクエスト 3 回
+
