@@ -1,0 +1,20 @@
+### No.62 SARD 501376 MyDSpaceServlet.java（processBatchImportAction）→ dspace-admin/batchimport.jsp
+- 判定: **脆弱性あり**（反射型 XSS・CWE-79。同じ入力によるパストラバーサル・CWE-22 もある）
+- XSS に該当: 種別・source・sink の詳細は "xssの詳細" を参照
+根拠1（XSS）: MyDSpaceServlet.java 747行目で、リクエストパラメータ uploadid を検証せずに uploadId に代入している。step=7（147行目 → 185-186行目）で submit_resume を押したとき（796行目）、798行目の request.setAttribute("uploadId", uploadId) でそのままリクエスト属性に入れ、810行目で /dspace-admin/batchimport.jsp に forward している。forward 先（上流 DSpace 6.2 の dspace-admin/batchimport.jsp）は、32行目で属性を受け取り、113行目の <input type="hidden" name=uploadId value="<%= uploadId %>"/> でエスケープせずに出力する。このため " で value 属性を閉じ、任意の属性やタグを差し込める。
+根拠1補足: /mydspace は registered-only フィルタ（web.xml 78-81行目）が対象なので、被害者がログイン中であることが前提になる。また forward は REQUEST ディスパッチではないため、admin-only フィルタ（web.xml 73-76行目、dispatcher 指定なし）の対象外になる。一般の登録ユーザーでも batchimport.jsp が描画される。正規の送信元フォームは mydspace/main.jsp 444-451行目（hidden の uploadid に batchUpload.getDir().getName() を入れている）。
+根拠2（CWE-22）: 同じ uploadId を、MyDSpaceServlet.java 753行目でファイルパス（<作業dir>/batchuploads/<自分のID>/ + uploadId + /mapfile）に連結している。762-781行目でそのファイルを読み、レスポンスに返す。788行目の itemImportService.deleteBatchUpload(context, uploadId) では、上流 ItemImportServiceImpl 2038行目でパスを連結し、2042行目で FileDeleteStrategy.FORCE.delete を実行して再帰的に削除する。"../<他ユーザーのUUID>/<ディレクトリ名>" を渡せば、他ユーザーの mapfile を取得したり、条件によってはディレクトリを削除したりできる。..（親ディレクトリ）や区切り文字の検査も、正規化パスの検査もない。
+参考（問題なしと判断した箇所）: 判定の対象は MyDSpaceServlet の 1 フローだけで、他の主要フローは問題なしと判断した。EditProfileServlet.java 132-141行目で保存した first_name・last_name・phone は、profile-form.jsp 65・70・74行目と main.jsp 77・140・206・272・320行目（氏名）で、すべて Utils.addEntities（上流 Utils では Escape.html。< > & " ' をエスケープする）を通して出力している。language は出力していない（profile-form.jsp 92行目で比較に使うだけ）。このため、プロフィール経由のストア型 XSS はない。main.jsp でエスケープしていないコレクション名（139・205・275・323・368行目）とグループ名（391行目）は管理者が設定する値であり、脆弱性とはしない。submitter.getEmail() を mailto の href に生で出力している点（140・206・272・320行目）は、登録時のメール検証しだいで理論上は危険になる。ただし、この入力元は本テストケースに含まれないため、参考扱いとする。
+修正方針（CWE-22 も含む）: uploadId を英数字・_・- だけに制限する（ホワイトリスト検証）。不正な値のときは処理を中止する。batchimport.jsp 113行目は Utils.addEntities でエスケープする。
+- 使用トークン量（判定）: 新規 76,477（入力 24 ／ キャッシュ作成 57,163 ／ 出力〔推定〕 19,290）、キャッシュ読込 566,116、総処理 642,593、リクエスト 12 回
+
+| No.62 SARD 501376 MyDSpaceServlet.java（processBatchImportAction）→ dspace-admin/batchimport.jsp | **反射型** |
+
+## No.62 SARD 501376 MyDSpaceServlet.java（processBatchImportAction）→ dspace-admin/batchimport.jsp
+
+- **XSS 種別**: 反射型。リクエストパラメータ uploadid が保存されず、同じリクエストへのレスポンス（forward 先の batchimport.jsp）にそのまま反映されるため。
+- **source**: MyDSpaceServlet.java 747行目 String uploadId = request.getParameter("uploadid");（POST /mydspace、step=7、submit_resume）
+- **伝播経路**: 747行目 uploadId → 796行目 submit_resume 分岐 → 798行目 request.setAttribute("uploadId", uploadId) → 810行目 JSPManager.showJSP(..., "/dspace-admin/batchimport.jsp")（forward）→ batchimport.jsp 32行目 (String)request.getAttribute("uploadId") → 112-113行目
+- **sink**: dspace-admin/batchimport.jsp（上流 DSpace 6.2）113行目 value="<%= uploadId %>"（HTML 属性値に、エスケープせずに出力）
+- **脆弱性の位置**: source 側と sink 側の両方。source 側（MyDSpaceServlet.java 747・798行目）は、ディレクトリ名として想定する形式の検証をしていない。sink 側（batchimport.jsp 113行目）は、出力時にエスケープしていない。直接の原因は sink 側のエスケープ漏れ。テストケースに含まれるファイルの範囲では、source 側の 747・798行目が問題箇所になる。
+- **攻撃例**: 攻撃者は自分のサイトに、/mydspace へ自動で POST するフォームを置く。フォームの中身は step=7、submit_resume、uploadid の 3 つで、uploadid には「" で value 属性を閉じてスクリプトを含むタグを続ける文字列」を入れる。CSRF トークンがないため、ログイン中の DSpace ユーザーがこのページを開くと、リクエストがそのまま受け付けられる。応答の batchimport.jsp に入力が生で埋め込まれ、被害者のセッションの権限で DSpace のオリジン上のスクリプトが実行される。被害者が管理者なら、管理操作の乗っ取りやセッション情報の窃取につながる。なお、クロスサイトの POST に Cookie が付くかどうかは、ブラウザの SameSite 既定値に依存する。
