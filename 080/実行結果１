@@ -1,0 +1,12 @@
+### No.80 CVE-2019-1020012 parse-server（src/Controllers/SchemaController.js の SchemaData）
+- 判定: **脆弱性あり**（サービス拒否 DoS：未処理の例外によって全リクエストのスキーマ読み込みが失敗し続ける。CWE-755/CWE-400 相当。ベンチマーク JSON の表記は CWE-444）
+根拠（prePatch 54ba9a0f のコード）:
+- SchemaController.js 397-426: SchemaData のコンストラクタは、DB の _SCHEMA から得た全クラス(allSchemas)について Object.defineProperty(this, schema.className, { get }) を実行する（398-399 行）。configurable を指定していないので、このプロパティは再定義できない。
+- 同 429-447: 続けて volatileClasses（_JobStatus, _PushStatus, _Hooks, _GlobalConfig, _JobSchedule, _Audience。161-168 行）を、同じ this に Object.defineProperty で定義する（430 行）。allSchemas に揮発性クラスと同じ名前が入っていると、2 回目の defineProperty が「TypeError: Cannot redefine property」を投げ、SchemaData の生成そのものが失敗する。重複を確認する処理も例外処理もない。
+- 揮発性クラスは _SCHEMA に入る経路がある。validateObject（1078-1120 行）→ enforceFieldExists（915-973 行）で、未知のフィールドがあると _dbAdapter.addFieldIfNotExists が呼ばれる（954-955 行）。Mongo 実装（MongoSchemaCollection.js 213-255 行）は、クラスが _SCHEMA になくても upsert でドキュメントを作る（206 行のコメントのとおり）。そのため、揮発性クラスに 1 回でも新しいフィールドを付けて POST すると、_SCHEMA に _Audience などのドキュメントができる。
+- 一般クライアントでも起こせる: rest.js 266-286 の classesWithMasterOnlyAccess に _Audience が入っていない。_Audience は systemClasses（149-159 行）にあるので classNameIsValid を通り、揮発性クラスの CLP は {}（436 行）なので、testPermissions（1168 行）で create も addField も通る。つまりマスターキーなしの POST /classes/_Audience に未知のフィールドを付けるだけで発生する（_PushStatus や _JobStatus に、マスターキーや内部処理が想定外のフィールドを書き込んだ場合も同じ）。
+- 直後の reloadData({clearCache:true})（1114 行）で、setAllClasses が汚染された一覧をキャッシュに入れ、その一覧で new SchemaData(...) を実行して例外になる（558 行）。この例外は onFulfilled の中で起きるので、同じ then の第 2 引数のエラーハンドラ（561-565 行）では捕まらない。そのため schemaData は作り直されず、delete this.reloadDataPromise も実行されない。
+- それ以降は、DatabaseController.loadSchema（417-433 行）→ SchemaController.load（1291-1298 行）→ reloadData のたびに同じ TypeError になる。スキーマを使う POST/PUT/GET（オブジェクトの作成・更新・検索のほぼすべて）が失敗する。原因のドキュメントは DB の _SCHEMA に残るので、キャッシュの期限が切れても再起動しても回復しない。永続的な DoS である。
+- 補足: 399-424 行の getter は this.__data[className] や this.__protectedFields[className] をプロトタイプ付きの普通のオブジェクトで引いている。そのため toString や constructor のようなクラス名で、Object.prototype のメンバーを拾ってしまう欠陥もある（影響はそのクラスへの要求に限られる）。
+修正案（XSS ではないため log にのみ記載）: SchemaData で、allSchemas の className が volatileClasses と重複する場合は揮発性クラスの定義を飛ばす（または defineProperty に configurable:true を付け、既存の自前プロパティを確認する）。あわせて、_Audience を classesWithMasterOnlyAccess に加えるか、揮発性クラスに addField を禁止する CLP を設定する。reloadData の例外処理は .then(ok).catch(err) の形にする。
+- 使用トークン量（判定）: 新規 54,592（入力 30 ／ キャッシュ作成 40,499 ／ 出力〔推定〕 14,063）、キャッシュ読込 531,120、総処理 585,712、リクエスト 15 回
