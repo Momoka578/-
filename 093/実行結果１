@@ -1,0 +1,9 @@
+### No.93 CVE-2020-12265 decompress 4.2.0 (kevva/decompress) index.js
+- 判定: **脆弱性あり**（パストラバーサル／Zip Slip による任意ファイル書き込み・CWE-22）
+根拠:
+- index.js 45行目 `const dest = path.join(output, x.path);` で、アーカイブのエントリ名 x.path（攻撃者が自由に決められる値。decompress-tar / decompress-unzip などのプラグインがヘッダから取り出す）を、そのまま出力先ディレクトリ output に連結している。path.join は `../` を正規化して解決するため、エントリ名が `../../` で始まると dest が output の外を指す。dest が output の配下にあるかどうかの確認（path.resolve した結果が output で始まるかの確認など）はどこにもない。
+- その dest に対して、50行目 `makeDir(dest)`（directory エントリ）、55行目 `makeDir(path.dirname(dest))`、69行目 `fsP.writeFile(dest, x.data, {mode})`（file エントリ）、58/62/66行目 `fsP.link` / `fsP.symlink`（link / symlink エントリ）、51/71行目 `fsP.utimes` が実行される。このため output の外に、任意のディレクトリ作成・任意内容のファイル書き込み（既存ファイルの上書きを含む）・リンク作成ができる。mode もアーカイブの値（46行目）なので、実行権限付きのファイルも置ける。
+- 関連する問題: 66行目の symlink は linkname（58/62/66行目）を何も検査せずに作る。先に output 内へ外部ディレクトリを指す symlink エントリを置き、後のエントリでそのリンクを経由して書き込めば、`../` を使わなくても output の外へ書き込める（symlink を経由したトラバーサル）。files は Promise.all で並列に処理され順序の保証はないが、成立する可能性がある。58行目の hard link も、linkname が任意のパス（process.cwd 基準）なので、任意の既存ファイルへのリンクを作れる。
+- 影響: 信頼できないアーカイブ（ユーザーのアップロード、ダウンロードしたパッケージなど）を decompress(input, output) で展開するアプリでは、~/.bashrc や設定ファイル、Web ルート配下のスクリプトなどを上書きされ、任意コード実行につながりうる。
+- XSS ではない（ファイルシステムのパス検証不備）ので、修正コードは作らない。修正案: 45行目の後で `const realOutput = path.resolve(output); const resolved = path.resolve(realOutput, x.path);` を求め、`resolved !== realOutput && !resolved.startsWith(realOutput + path.sep)` なら reject する。あわせて symlink/link の linkname も解決後に output 配下かを確認し、書き込み前に親ディレクトリの realpath が output 配下かを確認する（symlink 経由のトラバーサル対策）。
+- 使用トークン量（判定）: 新規 5,913（入力 6 ／ キャッシュ作成 3,611 ／ 出力〔推定〕 2,296）、キャッシュ読込 51,643、総処理 57,556、リクエスト 3 回
