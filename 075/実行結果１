@@ -1,0 +1,18 @@
+## No.75 SARD 501361 eperson-edit.jsp / EPersonAdminServlet.java (DSpace JSPUI 管理者用 EPerson 編集画面)
+- 判定: **脆弱性なし**（XSS・インジェクション・認可欠如のいずれも確認できず）
+根拠（なしと判断した理由）:
+- 対象ファイル: dspace-jspui/src/main/webapp/dspace-admin/eperson-edit.jsp（222行）、dspace-jspui/src/main/java/org/dspace/app/webui/servlet/admin/EPersonAdminServlet.java（407行）、dspace-jspui/src/main/webapp/WEB-INF/web.xml（858行）。
+- 永続化される利用者由来データ（email, firstname, lastname, netid, phone, language）は、EPersonAdminServlet.java 131-175行 / 211-243行で request.getParameter から EPerson に保存される（ストア型 XSS の source になりうる）。
+- しかし eperson-edit.jsp での出力は、すべて Utils.addEntities() を通っている:
+  86行 見出しの email（fmt:param 内）、105行 email の value 属性、113行 lastName、121行 firstName、129行 netid、138行 phone、216行 グループ名を含むリンク文字列。
+- Utils.addEntities は上流 DSpace 6.2（dspace-api/.../core/Utils.java 279-282行）で com.coverity.security.Escape.html() に委譲しており、& < > " ' を実体参照化する。そのため、ダブルクォートで囲まれた value 属性内でも、要素内容でも、属性から抜け出したりタグを挿入したりはできない。
+- エスケープされていない出力は次のとおりで、どれも利用者が制御できない値である:
+  104行 eperson.getID()（UUID）、163行 selected（固定文字列）、164行 lang / getDisplayName（設定 webui.supported.locales 由来の Locale）、88行 メッセージカタログの値、175/182行 固定文字列。保存された language パラメータは 160行で equals 比較に使うだけで、出力はしない。
+- 認可: web.xml 72-75行 で /dspace-admin/* に AdminOnlyFilter が掛かっている。EPersonAdminServlet のマッピングは 544-547行の /dspace-admin/edit-epeople で、JSP 自体も /dspace-admin/ 配下にあるため、管理者以外はアクセスできない。login-as（310-383行）は、設定フラグ・isAdmin・管理者グループ所属の確認がそろっている。
+- SQL・コマンド・パス操作などのシンクはない（DB 操作はサービス層の find/update/delete 経由）。
+注意点（脆弱性とは判定しなかったもの）:
+- 216行は、組み立てた <a> タグ全体を addEntities しているため、リンクが HTML として表示されず文字列として見える（&amp; も二重にエスケープされる）。これは機能上の不具合で、安全側に倒れている。
+- 343行は UUID を != で比較しており（参照比較）、login-as が常に拒否される。これも安全側の不具合である。
+- 125・272・292行付近では、eperson_id が不正なときに e が null のまま使われ、NullPointerException になる。管理者しか到達できないため、堅牢性の問題にとどまる。
+- フォーム（98行）に CSRF トークンがない。ただしこれは DSpace JSPUI 全体の設計上の特徴で、このテストケースに固有の欠陥ではないため、判定には含めなかった。
+- 使用トークン量（判定）: 新規 26,828（入力 14 ／ キャッシュ作成 21,126 ／ 出力〔推定〕 5,688）、キャッシュ読込 201,668、総処理 228,496、リクエスト 7 回
