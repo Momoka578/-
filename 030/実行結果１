@@ -1,0 +1,19 @@
+## No.30 CVE-2017-16006 jonschlinkert/remarkable lib/parser_inline.js（prePatch a85cf32）
+- 判定: **脆弱性あり**（XSS・CWE-79。原因は URL スキームの不完全な検査 CWE-20／CWE-184）
+- XSS に該当: 種別・source・sink の詳細は "xssの詳細" を参照
+根拠:
+- lib/parser_inline.js L146-155 validateLink(url): 拒否リスト BAD_PROTOCOLS = ['vbscript','javascript','file']（L147）を使い、url.trim().toLowerCase()（L148）と replaceEntities（L150）のあと、最初の ':' より前が拒否リストと完全一致するときだけ false を返す（L151）。
+- 抜け道 1: 'data' が拒否リストにないので、[x](data:text/html;base64,...) のようなリンクが通る。data: 文書へのトップレベル遷移を禁止する前のブラウザでは、クリックでスクリプトが実行される。
+- 抜け道 2: String.prototype.trim() は U+0001 などの C0 制御文字を削らない。そのため、先頭に制御文字を付けた '\x01javascript:...' は split(':')[0] が '\x01javascript' になって拒否リストに一致せず、通過する。一方ブラウザの URL パーサは、先頭と末尾の C0 制御文字と空白を取り除いてからスキームを判定するので、javascript: URL として実行される。
+- この URL は lib/helpers/parse_link_destination.js L49-82（< > で囲まない形式）で 0x09-0x0D と空白以外の文字をそのまま受け入れ、L77 で unescapeMd しただけで（normalizeLink/encodeURI を通らずに）L78 で validateLink に渡る。その後、lib/rules.js L157-160 link_open で '<a href="' + escapeHtml(href) + '"' として出力される。escapeHtml（utils.js L112-130）は & < > " しか変換しないので、制御文字やスキームはそのまま残る。
+- remarkable は既定で生 HTML を無効にしており、信頼できない Markdown を安全に表示する用途で使われる。リンク検証の迂回は、そのまま XSS につながる。
+- 使用トークン量（判定）: 新規 13,937（入力 10 ／ キャッシュ作成 9,673 ／ 出力〔推定〕 4,254）、キャッシュ読込 1,100,274、総処理 1,114,211、リクエスト 5 回
+
+# No.30 CVE-2017-16006 jonschlinkert/remarkable lib/parser_inline.js（prePatch a85cf32）
+
+- **XSS 種別**: ストア型（主な利用場面では、攻撃者が投稿・保存した Markdown（コメント、Issue、Wiki 等）が他の利用者向けに HTML へ変換され、閲覧者がリンクをクリックしたときにスクリプトが実行されるため。クライアント側だけで変換する使い方では DOM-base にもなりうる）
+- **source**: Markdown 入力中のリンク記法 [text](url)・参照リンク定義・autolink の URL 部分（parse_link_destination.js L77 state.src.slice(start, pos)、rules_inline/autolink.js L29-30, L56-57）
+- **伝播経路**: Markdown のリンク URL → parseLinkDestination（parse_link_destination.js L49-77）→ validateLink（parser_inline.js L146-155、data: と先頭制御文字を見逃す）→ state.linkContent（L80）→ link_open トークンの href → rules.js L160 の '<a href="' + escapeHtml(href) + '"'
+- **sink**: lib/rules.js L160 '<a href="' + escapeHtml(tokens[idx].href) + '"'（画像は L171 src="..."）。これを利用側が HTML として出力する
+- **脆弱性の位置**: sink 側に入る前の検証処理（parser_inline.js L146-155 validateLink）。危険なスキームを拒否リストで判定し、ブラウザと同じ正規化（C0 制御文字の除去）をしていないため、危険な URL が href（sink）に出力される
+- **攻撃例**: 攻撃者は remarkable で Markdown を表示するサイトに、URL の先頭に目に見えない制御文字を付けた javascript: リンク、または data: スキームのリンクを投稿する。検査を通って a 要素の href に入り、閲覧者がリンクをクリックすると、そのサイトのオリジンでスクリプトが実行される。
