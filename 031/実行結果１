@@ -1,0 +1,10 @@
+## No.31 GoogleChrome/rendertron src/renderer.js (prePatch 16ade32)
+- 判定: **脆弱性あり**（情報漏えい／ローカルファイル読み取り・SSRF、CWE-200）
+根拠:
+- src/main.js 91-99行: GET /render/:url(*) の request.params.url（利用者が任意に指定）がそのまま renderer.serialize() に渡される。isRestricted()（65-74行）は config.renderOnly が未設定なら常に false で、URL スキームやホストの検査は一切ない。
+- src/renderer.js 75行: Page.navigate({url: url}) で、検証していない URL をヘッドレス Chrome に読み込ませている。file:///etc/passwd や file:///app/config.json のような file: スキームの URL も、内部ネットワークのアドレス（http://127.0.0.1:<デバッグポート>/json、メタデータサーバなど）もそのまま開ける。
+- src/renderer.js 190-194行: 読み込んだページの document.firstElementChild.outerHTML を、そのまま HTTP レスポンスとして利用者に返す（main.js 100行）。このため、サーバ上の任意のローカルファイルや内部サービスの内容が外部に漏れる。/screenshot（renderer.js 218行）でも同じ経路でファイルの内容が画像として漏れる。
+- なお main.js 142行で --remote-debugging-address=0.0.0.0 を指定しているため、Chrome のデバッグポートが外部に公開されうる。
+修正案: navigate の前に URL を new URL() で解析し、プロトコルを http:/https: に限定する（file:, chrome:, data: などは拒否）。内部アドレスへの接続を拒否するか、renderOnly の許可リストを必須にする。
+補足（主判定とは別の副次的な指摘）: main.js 103-106行で、エラー時に `Cannot render ${request.params.url}` をエスケープせずに response.send()（Content-Type: text/html）で返しており、反射型 XSS（CWE-79）の可能性もある。ただし、この項目の主たる脆弱性は CWE-200 と判断したため、XSS 修正コードは作成しない。
+- 使用トークン量（判定）: 新規 11,698（入力 8 ／ キャッシュ作成 8,638 ／ 出力〔推定〕 3,052）、キャッシュ読込 77,461、総処理 89,159、リクエスト 4 回
