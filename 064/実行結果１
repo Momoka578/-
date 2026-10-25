@@ -1,0 +1,19 @@
+### No.64 SARD 501373 SelectEPersonTag.java（group-edit.jsp / GroupEditServlet.java / EditProfileServlet.java / profile-form.jsp）
+- 判定: **脆弱性あり**（ストア型 XSS・CWE-79）
+- XSS に該当: 種別・source・sink の詳細は "xssの詳細" を参照
+根拠:
+- SelectEPersonTag.java 124-127 行目で、グループ編集画面の <select> に e-person 1 件ごとの <option> を出力している。125 行目の氏名 getFullName() は Utils.addEntities() でエスケープしているが、126 行目のメールアドレス epeople[i].getEmail() は無加工のまま out.print() で HTML に連結している。
+- メールアドレスは利用者が自分で入力し、DB に保存される値である。上流 DSpace 6.2 の RegisterServlet.processEnterEmail（225-234 行目）は、長さ 64 文字以下・小文字化・trim しか行わず、書式を検査しない。processPersonalInfo（450-454 行目）は、netid パラメータがあると email をリクエストからそのまま受け取り、eperson.setEmail() で保存する。さらに LDAP/Shibboleth の自動登録や管理者による登録でも、外部の値がそのまま入る。このため、HTML のメタ文字（< > " など）を含むメールアドレスを保存できる。
+- 一方、zip に含まれる氏名の経路（EditProfileServlet.java 132-139 行目 → EPerson.firstName/lastName → SelectEPersonTag 125 行目 getFullName()）は、addEntities（上流 Utils.addEntities = coverity Escape.html）でエスケープしており安全。profile-form.jsp 65/70/74 行目、group-edit.jsp 72/79 行目も addEntities 済み。profile-form.jsp 96 行目の lang・表示名は設定由来で、利用者入力ではない。
+- 同じ行で氏名だけエスケープし、メールアドレスはエスケープしていない。このように出力エンコードが不完全なため、保存済みの利用者データがエスケープされずに管理画面に出る。
+補足（XSS 以外・修正対象外）: EditProfileServlet.java 66-88/159-182 行目は、現在のパスワードを確認せずにパスワードを変更でき、CSRF トークンもない（CWE-620/CWE-352 の懸念）。これは上流 DSpace JSPUI 全体の設計に共通するため、本判定の主眼には含めない。GroupEditServlet.java 94 行目は group_name が無いと NPE になる（軽微）。
+- 使用トークン量（判定）: 新規 50,460（入力 14 ／ キャッシュ作成 37,100 ／ 出力〔推定〕 13,346）、キャッシュ読込 225,484、総処理 275,944、リクエスト 7 回
+
+## No.64 SARD 501373 SelectEPersonTag.java（group-edit.jsp / GroupEditServlet.java / EditProfileServlet.java / profile-form.jsp）
+
+- **XSS 種別**: ストア型（攻撃者が登録時に入力したメールアドレスが DB の eperson.email に保存され、後で管理者がグループ編集画面を開いたときに、エスケープされずに出力されるため）
+- **source**: 利用者登録時のメールアドレス入力（上流 RegisterServlet.java 225 行目 request.getParameter("email")、または 453 行目の netid 経路）→ eperson.setEmail() で DB に保存（zip 内では、EPerson を取り出す GroupEditServlet.java 83/215/246/267 行目 group.getMembers() が保存データの入口）
+- **伝播経路**: DB の eperson.email → GroupEditServlet.java 83/215/246/267 行目 request.setAttribute("members", group.getMembers()) → group-edit.jsp 40 行目 request.getAttribute("members") → group-edit.jsp 90 行目 <dspace:selecteperson selected="<%= epeople.toArray(...) %>"> → SelectEPersonTag.java 84-95 行目 setSelected() で epeople 配列に格納 → doStartTag() 122-126 行目
+- **sink**: SelectEPersonTag.java 125-126 行目 out.print(... + " (" + epeople[i].getEmail() + ")")（126 行目の getEmail() が無エスケープ。JspWriter から group-edit.jsp の HTML に出力される）
+- **脆弱性の位置**: sink 側（SelectEPersonTag.java 126 行目で出力エンコードが欠けている）。source 側（上流 RegisterServlet）にもメールアドレスの書式検証がないが、根本の修正箇所は sink 側。
+- **攻撃例**: 攻撃者は、自分が受信できるドメインで、引用符付きのローカル部に「</select> で select を閉じてからスクリプトを実行するタグ」を含むメールアドレス（64 文字以下）を自己登録する。届いたトークンで登録を完了すると、このアドレスが DB に保存される。攻撃者がグループ（投稿者グループなど）のメンバーになると、システム管理者やコミュニティ／コレクション管理者が /tools/group-edit でそのグループを開いたときに、メールアドレスが <option> 内に無加工で出力される。その結果、管理者のブラウザ・セッションでスクリプトが実行され、管理者権限での操作の乗っ取りなどにつながる。
