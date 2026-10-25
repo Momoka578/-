@@ -1,0 +1,20 @@
+## No.66 SARD 501367 dspace-jspui/src/main/webapp/mydspace/subscriptions.jsp（関連: EditCommunitiesServlet.java, CollectionDropDown.java）
+- 判定: **脆弱性あり**（クロスサイトスクリプティング（ストア型）・CWE-79）
+- XSS に該当: 種別・source・sink の詳細は "xssの詳細" を参照
+根拠: subscriptions.jsp 117 行目で、購読中コレクションのパス文字列 CollectionDropDown.collectionPath(context, subscriptions.get(i).getCollection(), 0) を HTML エスケープせずに <%= %> で <a> 要素の本文へ出力している。
+  collectionPath()（CollectionDropDown.java 64-70 行目）は、親コミュニティ名 com.getName() とコレクション名 col.getName() を区切り文字で連結しただけの生文字列を返し、エスケープはしない。
+  同じ JSP の 79 行目（購読可能コレクションの <option>）では Utils.addEntities(...) でエスケープしているのに、117 行目だけエスケープが抜けている（不整合）。
+  コミュニティ名は EditCommunitiesServlet.java 543 行目で request.getParameter("name") がそのまま setMetadata(..., "name", ...) で DB に保存される（コレクション名も同 680 行目で同様）。入力時の検証・無害化はない。
+  edit-community.jsp 147-168 行目は Utils.addEntities で出力しており問題なし。SubscribeServlet.java は UUID パラメータのみを扱い、出力は JSP 側に委ねている。
+  116 行目の getHandle() はシステムが採番するハンドルであり、利用者は制御できないため対象外と判断した。
+修正案: 117 行目を 79 行目と同様に Utils.addEntities(...) で囲んで出力時に HTML エスケープする。
+- 使用トークン量（判定）: 新規 26,520（入力 14 ／ キャッシュ作成 21,771 ／ 出力〔推定〕 4,735）、キャッシュ読込 180,970、総処理 207,490、リクエスト 7 回
+
+## No.66 SARD 501367 dspace-jspui/src/main/webapp/mydspace/subscriptions.jsp（関連: EditCommunitiesServlet.java, CollectionDropDown.java）
+
+- **XSS 種別**: ストア型。攻撃文字列はコミュニティ名／コレクション名として DB に保存され、後で別の利用者が /subscribe（購読一覧）を開いたときに出力されるため。
+- **source**: EditCommunitiesServlet.java 543 行目 request.getParameter("name")（コミュニティ名。/tools/edit-communities の edit-community.jsp フォーム 147 行目から送信）。同様に 680 行目のコレクション名も source になる。
+- **伝播経路**: EditCommunitiesServlet.processConfirmEditCommunity() 543 行目 → communityService.setMetadata(name) → communityService.update() で DB に保存 → SubscribeServlet.showSubscriptions() 139-143 行目で subscribeService.getSubscriptions() の結果を request 属性 "subscriptions" に設定 → subscriptions.jsp 40-41 行目で取得 → 117 行目 CollectionDropDown.collectionPath()（CollectionDropDown.java 64-70 行目で com.getName()/col.getName() を連結）→ そのまま出力
+- **sink**: subscriptions.jsp 117 行目 <%= CollectionDropDown.collectionPath(context, subscriptions.get(i).getCollection(),0) %>（<a> 要素の本文、HTML 本文コンテキスト）
+- **脆弱性の位置**: sink 側。保存時（source 側）に無害化しないのは DSpace の通常の設計で、他の出力箇所（79 行目、edit-community.jsp）は出力時にエスケープしている。117 行目の出力時エスケープ漏れが脆弱性の本体。
+- **攻撃例**: コミュニティ管理者権限（サイト管理者でなくてもよい）を持つ攻撃者が、管理するコミュニティ（またはその配下のコレクション）の名前にスクリプトを含む HTML を設定して保存する。そのコレクションを購読している一般利用者やサイト管理者が「購読一覧」ページ（/subscribe）を開くと、名前がそのまま HTML として解釈され、被害者のブラウザ・セッション上でスクリプトが実行される（セッション乗っ取りや管理操作の代行などにつながる）。
