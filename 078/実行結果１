@@ -1,0 +1,20 @@
+### No.78 CVE-2019-1010091 tinymce（src/core/main/ts/api/html/SaxParser.ts ほか DomParser.ts / init/InitContentBody.ts / Writer.ts）
+- 判定: **脆弱性あり**（XSS: CWE-79。原因は不完全な複数文字サニタイズ CWE-116 / 入力検証不備 CWE-20）
+- XSS に該当: 種別・source・sink の詳細は "xssの詳細" を参照
+根拠（prePatch 8b29e00959cf37cbc9642178e686aea688a162ee）:
+- SaxParser.ts 59-61行 trimComments は text.replace(/<!--|--!?>/g, '') で「<!--」「-->」「--!>」を1回だけ除去する。除去後に文字がつながって新しい「-->」ができる入力（例: 「--」+「<!---->」+「>」→ 内側の「<!--」「-->」が消えて「-->」が残る）を再検査しないため、コメント終端を完全には除けない。
+- SaxParser.ts 273行の CDATA 用正規表現で <![CDATA[ ... ]]> の中身を取り出し、499-500行 cdata(trimComments(value)) で渡す。CDATA の中身は要素として扱われないため、スキーマ検証（要素・属性のホワイトリスト、on* 属性の除去、javascript: URL の除去 236-260行）を一切通らない。
+- DomParser.ts 433-435行で #cdata ノードを作る。エディタ本体のパーサ設定 init/InitContentBody.ts 97-106行の #cdata フィルタで、これを #comment に変換し、value = '[CDATA[' + 中身 + ']]' にする。
+- html/Serializer.ts 49-51行 → Writer.ts 138-140行 comment() は '<!--' + value + '-->' をエスケープなしで出力する。
+- content/SetContent.ts 82-85行で parse→serialize した HTML を、46行 editor.dom.setHTML(editor.getBody(), html)（innerHTML 相当）でエディタ本体に入れる。
+- このため、CDATA の中身に trimComments をすり抜けた「-->」が残るとコメントが途中で閉じる。その後ろの文字列は検証されていない生の HTML として DOM に入り、イベントハンドラ付き要素などが実行される。
+修正方針（記録）: trimComments で、変化がなくなるまで置換を繰り返す（固定点まで除去する）。これにより、除去した結果として「<!--」「-->」「--!>」が新しくできることを防ぐ。
+- 使用トークン量（判定）: 新規 44,699（入力 20 ／ キャッシュ作成 30,851 ／ 出力〔推定〕 13,828）、キャッシュ読込 312,025、総処理 356,724、リクエスト 10 回
+
+ **XSS 種別**: DOM-base（入力の解析・サニタイズ・出力のすべてがブラウザ上の TinyMCE の JavaScript 内で行われ、sink はクライアント側の innerHTML（dom.setHTML）であるため。なお実際の攻撃では、保存済みコンテンツや貼り付けを通して届くことが多く、ストア型の経路にもなりうる）
+- **source**: エディタに与えられる HTML 文字列。editor.setContent(content) / 初期化時のテキストエリアの内容 / insertContent・貼り付けなど。これが content/SetContent.ts 85行 editor.parser.parse(content, ...) を通り、SaxParser.ts 158行 parse(html) に入る。その中の <![CDATA[...]]> 部分（273行で抽出）が source。
+- **伝播経路**: SaxParser.ts 273行（CDATA 抽出）→ 500行 cdata(trimComments(value))（59-61行の1回だけの除去。ここをすり抜けると「-->」が残る）→ DomParser.ts 434行 #cdata ノード → InitContentBody.ts 97-106行で #comment に変換し value='[CDATA['+中身+']]' → html/Serializer.ts 49-51行 → Writer.ts 139行 '<!--'+value+'-->' → SetContent.ts 82-85行で直列化した文字列 → 46行 setHTML
+- **sink**: content/SetContent.ts 46行 editor.dom.setHTML(editor.getBody(), html)（エディタ iframe の body の innerHTML）。直接の出力箇所は Writer.ts 139行 html.push('<!--', text, '-->')
+- **脆弱性の位置**: source 側（入力のサニタイズ処理）。SaxParser.ts 59-61行 trimComments が1回だけの置換で不完全なのが根本原因（ベンチマークの指摘行 60）。sink 側の Writer.ts 139行もコメント本文をエスケープ・再検査しないが、主因は source 側のサニタイズ不備。
+- **攻撃例**: 攻撃者は、CDATA セクションの中に「--」「<!---->」「>」を並べた文字列と、その後ろにイベントハンドラ付きの img 要素を書いた HTML を用意する。これを、被害者が編集する保存済みの記事や貼り付け内容として TinyMCE に読み込ませる。trimComments は内側の「<!--」「-->」だけを消すため、結果として「-->」ができる。CDATA は '<!--[CDATA[' + 中身 + ']]-->' というコメントとして innerHTML に入るが、途中の「-->」でコメントが閉じる。そのため後ろの img 要素がスキーマ検証を受けずに DOM に入り、onerror の JavaScript がエディタ（同一オリジン）で実行される。
+
