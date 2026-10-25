@@ -1,0 +1,21 @@
+### No.88 CVE-2019-10759 safer-eval（src/browser.js, src/common.js, src/index.js）
+- 判定: **脆弱性あり**（サンドボックス回避による任意コード実行／コードインジェクション・CWE-94。XSS（CWE-79）ではない）
+根拠（prePatch 1ff9411b のコードを読んで判断）:
+- safer-eval は信頼できない JS 文字列を「安全に」評価するためのライブラリだが、ブラウザ版 src/browser.js の SaferEval#runInContext は本物のサンドボックスを持たない。
+  利用者が渡した code を L47 で 'return ' + code + ';' と文字列連結し、L49 で Function('__context', src).call(null, __context) により、ページと同じ realm（本物のグローバル）で実行している。
+- 抜け道1（this）: Function コンストラクタで作った関数本体には 'use strict' が無いので非 strict モードになる（モジュール先頭 L6 の 'use strict' は Function 本体には効かない）。
+  そのため .call(null) で呼ぶと this がグローバルオブジェクト（window）になる。code はこの関数本体の中にそのまま埋め込まれるので、code 内で this.document や this.fetch などを書けば、遮断したはずの window に直接届く。
+- 抜け道2（constructor）: L42 の 'this.constructor.constructor = function () {}' は Window.constructor に自前のプロパティを作るだけで、Function.prototype.constructor は変わらない。
+  common.js L56 の context.Object.constructor.constructor = '...' も、Function 自身に自前のプロパティを足すだけになる。
+  このため (()=>0).constructor や ''.sub.constructor など、任意の関数の .constructor から本物の Function が取れる。Function('return window')() で、L24-34 で undefined にしたグローバル（window/document/eval/Function）を取り戻せる。
+- 抜け道3（シャドウ漏れ）: common.js L36-42 の fillContext は Object.keys(window)（列挙可能なプロパティだけ）で遮断対象を作る。
+  そのため列挙されないグローバル（globalThis、XMLHttpRequest などのインタフェースオブジェクト）は var で上書きされず、そのまま参照できる。
+- 副次的な問題: browser.js L44-46 で、context のキー名を検証せずにソースコードへ連結している。isIdentifier（common.js L11-13）は数字始まり・'-'・予約語しか弾かない。
+  そのため 'a=式//' のようなキーを含む context を渡すと、コードが注入される。
+- 影響: アプリが利用者入力（数式やフィルタ式など）を saferEval(code) で評価している場合、攻撃者は「サンドボックス」を抜けて、ページの origin で任意の JS を実行できる（Cookie やストレージの窃取、なりすまし操作）。
+  ブラウザでの結果は XSS と同等だが、脆弱性の本質は eval サンドボックスの保護の失敗（CWE-94 / CWE-693）であり、HTML/DOM への出力のエスケープ漏れ（CWE-79）ではないので、XSS には分類しない。
+- 補足: Node 版 src/index.js も vm を使っているが脱出できる。common.js L87/L102 の cloneFunctions が作る setTimeout などのラッパー関数は、メイン realm の関数なので、vm 内から setTimeout.constructor('return process')() で本物の process が取れる。
+  index.js L43 の 'Object.constructor = function(){}' は vm 内の Object にしか効かないので、これも防げない。
+- 修正案（XSS ではないので修正コードは作らない）: ブラウザで同じ realm の Function/eval を使って隔離するのは原理的に難しい。sandbox 属性付きの iframe や Worker などの別 realm／別 origin で実行するか、
+  式パーサー（AST を評価器で解釈する方式）に置き換える。最低でも本体を "use strict" にして this を undefined にし、Function.prototype.constructor（AsyncFunction／GeneratorFunction も含む）を塞ぐ必要がある。
+- 使用トークン量（判定）: 新規 12,297（入力 6 ／ キャッシュ作成 6,735 ／ 出力〔推定〕 5,556）、キャッシュ読込 50,959、総処理 63,256、リクエスト 3 回
