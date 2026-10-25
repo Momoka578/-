@@ -1,0 +1,100 @@
+## No.97 SARD 1644 Target97.java: Target97.java
+
+- 修正対象ファイル: Target97.java
+- 修正箇所のコメント（コード内から抜粋）:
+  - `// 修正: DB から取り出した値（ストア型XSSの source）を HTML エスケープしてから出力する`
+
+```java
+/*
+Copyright 2005 Fortify Software.
+（ライセンスヘッダは元のファイルと同じため省略）
+*/
+
+import java.io.*;
+import javax.servlet.*;
+import javax.servlet.http.*;
+import javax.naming.*;
+import javax.sql.*;
+import java.sql.*;
+
+public class Target97 extends HttpServlet
+{
+	private DataSource _ds;
+
+    public void doGet(HttpServletRequest req, HttpServletResponse res)
+    	throws ServletException, IOException
+    {
+        res.setContentType("text/html");
+        ServletOutputStream out = res.getOutputStream();
+        out.println("<HTML><HEAD><TITLE>Test</TITLE></HEAD><BODY><blockquote><pre>");
+
+		String name = req.getParameter("name");
+		if(name == null)
+			name = "hi";
+
+		Connection conn = getConnection();
+		try {
+			PreparedStatement stmt = conn.prepareStatement("select val from mytab where name = ?");
+			stmt.setString(1, name);
+			ResultSet rs = stmt.executeQuery();
+			out.println("results:");
+			while(rs.next())
+				// 修正: DB から取り出した値（ストア型XSSの source）を HTML エスケープしてから出力する
+				out.println(escapeHtml(rs.getString(1)));
+		} catch(Exception e) {
+			throw new ServletException(e);
+		} finally {
+			close(conn);
+		}
+
+        out.println("</pre></blockquote></BODY></HTML>");
+        out.close();
+    }
+
+	// 追加: HTML の特殊文字（& < > " '）を文字参照に変換するメソッド
+	// （null の場合は空文字列を返す。元のコードは null 列を "null" と出力していたが、表示上の差は小さい）
+	private static String escapeHtml(String s)
+	{
+		if(s == null)
+			return "";
+		StringBuilder sb = new StringBuilder(s.length());
+		for(int i = 0; i < s.length(); i++) {
+			char c = s.charAt(i);
+			switch(c) {
+				case '&':  sb.append("&amp;");  break;
+				case '<':  sb.append("&lt;");   break;
+				case '>':  sb.append("&gt;");   break;
+				case '"':  sb.append("&quot;"); break;
+				case '\'': sb.append("&#39;");  break;
+				default:   sb.append(c);
+			}
+		}
+		return sb.toString();
+	}
+
+	public void close(Connection conn)
+		throws ServletException
+	{
+		try {
+			conn.close();
+		} catch(Exception e) {
+			throw new ServletException(e);
+		}
+	}
+
+    public Connection getConnection()
+		throws ServletException
+    {
+		try {
+			if(_ds == null) {
+				String dsname = getInitParameter("data-source");
+				Context ctx = new InitialContext();
+				_ds = (DataSource)ctx.lookup("java:comp/env/" + dsname);
+			}
+			return _ds.getConnection();
+		} catch(Exception e) {
+			throw new ServletException(e);
+		}
+	}
+}
+```
