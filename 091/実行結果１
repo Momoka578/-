@@ -1,0 +1,18 @@
+### No.91 CVE-2020-11022 jquery（src/manipulation.js の jQuery.htmlPrefilter / rxhtmlTag、src/manipulation/buildFragment.js）
+- 判定: **脆弱性あり**（XSS: mXSS / 出力の不適切なエンコード・変換、CWE-79・CWE-116）
+- XSS に該当: 種別・source・sink の詳細は "xssの詳細" を参照
+根拠: src/manipulation.js 39行目の正規表現 rxhtmlTag = /<(?!area|br|...|param)(([a-z][^\/\0>\x20\t\r\n\f]*)[^>]*)\/>/gi と、238-240行目の jQuery.htmlPrefilter が html.replace( rxhtmlTag, "<$1></$2>" ) で「自己終了タグ <x/>」を「<x></x>」へ文字列置換している。
+この置換は HTML の文脈（属性値の中、<style>/<textarea>/<title> などの RAWTEXT/RCDATA 要素の中、コメント内）を考慮せずに文字列全体へ適用される。そのため、DOMPurify 等のサニタイザで「無害」と判定済みの HTML 文字列でも、属性値やスタイル要素内のテキストに含まれた "<x .../>" 形のパターンが "</x...>" や "</style>" のような終了タグに展開され、ブラウザの再パース時に要素構造が変化（mutation）する。結果として、属性値やテキストとして閉じ込められていたはずの部分が実際の要素（イベントハンドラ属性付きの img など）として生成され、スクリプトが実行される。
+到達経路: (1) manipulation.js 401-438行目 .html(value): 412-413行目で <script|<style|<link を含まない文字列は 415行目で htmlPrefilter を通し、424行目 elem.innerHTML = value に代入。(2) .append/.prepend/.before/.after/.replaceWith（340-366,440行目）→ domManip（124行目）→ 150行目 buildFragment → buildFragment.js 46行目 tmp.innerHTML = wrap[1] + jQuery.htmlPrefilter( elem ) + wrap[2]。(3) jQuery(html) / jQuery.parseHTML（core/parseHTML.js 54行目）→ buildFragment。いずれも sink は innerHTML。
+補足: .html() の 412行目の rnoInnerhtml（<style を含むと近道を使わない）は innerHTML 近道を避けるだけで、フォールバックの append → buildFragment 46行目でも htmlPrefilter が適用されるため、<style> 内での展開も防げない。
+修正案: htmlPrefilter で自己終了タグの展開を行わず、入力文字列をそのまま返す（return html;）。
+- 使用トークン量（判定）: 新規 12,712（入力 12 ／ キャッシュ作成 7,695 ／ 出力〔推定〕 5,005）、キャッシュ読込 114,500、総処理 127,212、リクエスト 6 回
+
+# No.91 CVE-2020-11022 jquery（src/manipulation.js の jQuery.htmlPrefilter / rxhtmlTag、src/manipulation/buildFragment.js）
+
+- **XSS 種別**: DOM-base（ブラウザ上の jQuery が HTML 文字列をクライアント側で書き換え、innerHTML で DOM 化する過程で発生する。サーバの応答に直接スクリプトが現れるわけではなく、クライアント側の DOM 操作が原因。サニタイズ済み HTML がサーバ保存データ由来であればストア型的な経路にもなりうるが、脆弱性の本体はクライアント側の変換処理）
+- **source**: jQuery API に渡される HTML 文字列。manipulation.js 401行目 html( value ) の value、340-366行目 append/prepend/before/after の引数（domManip 124行目の args）、core/parseHTML.js の data。アプリ側では「サニタイズ済みだが信頼できない」ユーザー入力 HTML（コメント本文、プロフィール等）がここに渡される想定。
+- **伝播経路**: value/args → manipulation.js 415行目 jQuery.htmlPrefilter( value )（または buildFragment.js 46行目 jQuery.htmlPrefilter( elem )）→ 239行目 html.replace( rxhtmlTag, "<$1></$2>" ) で自己終了タグを開始タグ＋終了タグに展開（ここで文脈無視の変換により構造が変化）→ 変換後の文字列が innerHTML に渡る。
+- **sink**: manipulation.js 424行目 elem.innerHTML = value、manipulation/buildFragment.js 46行目 tmp.innerHTML = ...（その後 domManip でドキュメントに挿入）。
+- **脆弱性の位置**: source 側でも sink 自体でもなく、その間の伝播経路上の変換処理（manipulation.js 39行目 rxhtmlTag と 238-240行目 htmlPrefilter）にある。サニタイズ後に文字列を書き換えるため、サニタイズの前提を壊す（sink 直前の処理の問題）。
+- **攻撃例**: 攻撃者は、サニタイザが通過させる形の HTML（例: img 要素の alt 属性値の中に "<x" を、続く title 属性値の先頭に "/>" を置き、その後ろの属性値テキスト内にイベントハンドラ付き img タグ文字列を入れたもの、あるいは style 要素のテキスト内に "<style/>" と img タグ文字列を置いたもの）を投稿する。サーバ側/クライアント側のサニタイズでは属性値やスタイルのテキストとして扱われ無害と判定されるが、アプリがそれを $(elem).html(...) や .append(...) で表示すると、htmlPrefilter が "<x.../>" を "<x...></x...>"（"<style/>" を "<style></style>"）に展開する。この結果、属性値が途中で閉じられる（または style 要素が早期終了する）ため、後続のイベントハンドラ付き img が本物の要素として生成され、閲覧者のブラウザでスクリプトが実行される。
