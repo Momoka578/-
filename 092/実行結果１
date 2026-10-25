@@ -1,0 +1,11 @@
+### No.92 CVE-2020-11059 aegir（ipfs/aegir, src/config/webpack.config.js）
+- 判定: **脆弱性あり**（ビルド成果物への機密情報（環境変数）の平文埋め込み・情報漏えい／CWE-312, CWE-200 系。XSS ではない）
+根拠:
+- src/config/webpack.config.js 111 行目 `new webpack.DefinePlugin({ 'process.env': JSON.stringify(process.env) })` で、ビルドを実行したマシンの環境変数「すべて」を JSON 文字列化し、バンドル内の `process.env` 参照を置き換える定数として定義している。
+- そのため、バンドル対象コード（利用者のコードや readable-stream などの依存）に `process.env.XXX` や `process.env` の参照が 1 か所でもあると、その位置に環境変数全体のオブジェクトリテラルが平文で埋め込まれる。開発ビルドと、production 時の非 minify 版 dist/index.js（174〜188 行目）、およびソースマップ（25, 30 行目）に残る。
+- src/build/index.js 24〜38 行目は execa で webpack-cli を起動する。env オプションは追加指定だけで、execa の既定（extendEnv）により親プロセスの環境変数はすべて子に渡る。よって CI（Travis など）で `aegir build` / `aegir release` を実行すると、CI に設定した GH_TOKEN・NPM トークン・クラウドの認証情報などがビルド成果物に入る。
+- src/release/index.js では Build（38〜42 行目）のあと Publish to npm（78 行目〜）に進む。dist/ は npm や CDN（unpkg / jsDelivr など）で公開されるので、誰でも秘密情報を読める。src/config/karma.conf.js 20 行目もこの設定を merge しており、ブラウザテスト用のバンドルにも同じ値が入る。
+- 本来必要なのは NODE_ENV などごく一部の値だけで、環境変数を丸ごと注入する理由はない。
+攻撃シナリオ: 攻撃者が公開済みパッケージの dist/index.js（または .map）をダウンロードし、埋め込まれたオブジェクトリテラルからトークン類を取り出す。それを使って npm への不正な publish や GitHub リポジトリの改ざんなどを行う（サプライチェーン攻撃）。
+修正案（XSS ではないため修正コードは作らない）: DefinePlugin には許可リストの値だけを個別に定義する。例: `'process.env.NODE_ENV': JSON.stringify(process.env.NODE_ENV)`。または EnvironmentPlugin で、必要なキーとその既定値だけを指定する。
+- 使用トークン量（判定）: 新規 12,584（入力 8 ／ キャッシュ作成 9,500 ／ 出力〔推定〕 3,076）、キャッシュ読込 74,032、総処理 86,616、リクエスト 4 回
