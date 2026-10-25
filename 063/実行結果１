@@ -1,0 +1,16 @@
+### No.63 SARD 501374 profile-form.jsp / eperson-confirm-delete.jsp / edit-profile.jsp / EditProfileServlet.java / EPersonAdminServlet.java
+- 判定: **脆弱性なし**（XSS・CWE-79 を含め、悪用可能な脆弱性は見当たらない）
+根拠（なしと判断した理由）:
+- 想定される攻撃経路は、ストア型 XSS（ユーザーが自分のプロフィールに入れた値を保存し、それが表示される経路）である。しかし、ユーザーが制御できる値を出力する箇所は、すべて HTML エスケープされている。
+  - source: EditProfileServlet.java 132-135 行（last_name / first_name / phone / language）を 138-141 行で EPerson に保存する。EPersonAdminServlet.java 131-166 行・211-235 行（管理者による email / firstname / lastname / phone / language / netid の設定）も同様に保存する。
+  - sink: profile-form.jsp 65・70・74 行の input の value 属性（ダブルクォートで囲まれている）には、それぞれ Utils.addEntities(firstName / lastName / phone) を通した値が入る。eperson-confirm-delete.jsp 38・39 行の fmt:param には、Utils.addEntities(eperson.getFullName()) と Utils.addEntities(eperson.getEmail()) が入る。
+  - Utils.addEntities は、上流 DSpace 6.2 の dspace-api の org/dspace/core/Utils.java 279-282 行で com.coverity.security.Escape.html(value) に委譲している。Escape.html は & < > " ' をエンティティ化するので、ダブルクォートで囲んだ属性値にも要素の本文にも安全に出力できる。
+- profile-form.jsp 95-96 行では selected と lang、ロケールの表示名をエスケープせずに出力している。しかし、selected は固定文字列であり、lang と表示名は I18nUtil.getSupportedLocales()（サーバー設定）から来る値で、ユーザーは制御できない。ユーザー入力の language（59 行）は 86・92 行で比較に使うだけで、出力されない。
+- edit-profile.jsp 75 行の request.getContextPath() は、サーバー側で決まるコンテキストパスであり、ユーザー入力ではない。51 行の dspace:popup の page 属性も、メッセージカタログの値に固定文字列を連結したものである。その他の表示は、すべて fmt:message のキー参照である。
+- eperson-confirm-delete.jsp 36 行には、エスケープしていない <%= eperson.getEmail() %> がある。しかし、これは JSP コメント（<%-- --%>）の中にあるので、評価も出力もされない。48 行の eperson.getID() は UUID なので安全である。
+- web.xml 73-76 行と 88-91 行で、/dspace-admin/* には AdminOnlyFilter、/profile には RegisteredOnlyFilter がかかっている。EPersonAdminServlet と EditProfileServlet には、認可の欠落もない。
+参考（脆弱性ありとは数えなかった軽微な点）:
+- EPersonAdminServlet.java 332-337 行では、e.getFullName()（利用者が制御できる名前）をログに書いている。LogManager.escapeLogField はコロンとバックスラッシュしかエスケープしないので、改行を使ったログの偽装（CWE-117）の余地はある。ただし、ログが書かれるのは管理者が login-as を実行したときだけで、HTML への出力ではない。
+- JSPUI 全体として、フォームに CSRF トークンがない。これはアプリケーション全体の設計上の性質であり、本テストケースのファイルに固有の欠陥ではない。
+- EPersonAdminServlet.java 343 行では、UUID を != で参照比較している。これは login-as が常に拒否される機能バグで、安全側に倒れるので脆弱性ではない。
+- 使用トークン量（判定）: 新規 33,745（入力 14 ／ キャッシュ作成 26,670 ／ 出力〔推定〕 7,061）、キャッシュ読込 213,485、総処理 247,230、リクエスト 7 回
