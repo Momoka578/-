@@ -1,0 +1,30 @@
+
+### No.70 SARD 501350 edit-item-form.jsp（＋EditItemServlet.java / browse/full.jsp / BrowserServlet.java）
+- 判定: **脆弱性あり**（クロスサイトスクリプティング（ストア型）・CWE-79）
+- XSS に該当: 種別・source・sink の詳細は "xssの詳細" を参照
+根拠（コードを読んで判断。upstream からは同じパスでない AbstractBrowserServlet / BrowseEngine / SolrBrowseDAO / Utils だけを参照）:
+- 主な問題は tools/edit-item-form.jsp。DB に保存された、ユーザーが制御できる値を HTML エスケープせずに <%= %> で出力している。
+  (1) L601: <input ... name="bitstream_source_<key>" value="<%= ... bitstream.getSource() %>"/>
+      → ビットストリームの source を属性値にそのまま出力している。両隣の name（L598）、description（L604）、user_format_description（L610）と、L607 の format の短い説明は Utils.addEntities() でエスケープ済みで、source だけ漏れている。
+      source の値は EditItemServlet.java の L1035 でアップロードファイル名（wrapper.getFilesystemName("file")。パス区切りも除かずに丸ごと）から設定されるか、L798→L827 でリクエストパラメータ bitstream_source_<key> から設定される。どちらも攻撃者が制御できる。
+  (2) L486: <textarea ...><%= dcv.get(i).getValue() %></textarea>
+      → アイテムのメタデータ値を textarea の中に、エスケープせずに出力している。値は EditItemServlet.java の L747（value_*）と L856（addfield_value）で request.getParameter() から取り込み、L756 と L871 の itemService.addMetadata() で DB に保存される（通常の投稿フォームから投稿者が入れた値も同じ経路で表示される）。
+  (3) doAuthority()（L119-205）でも同じ: L142-143（option の value と本文）、L147/L149（選択肢の value/label）、L160（textarea の本文）、L173（authority キーを value 属性に出力）。
+      authority は EditItemServlet.java の L732 で choice_<key>_authority_<n> パラメータから取得し、そのまま L756 で保存される（readonly な入力欄でも、送信値は改ざんできる）。
+  (4) L490: language（EditItemServlet.java L718 で request から取得）を value 属性にそのまま出力している。
+  (参考) L266 のコレクション名、L473-475 のスキーマ名・要素名・修飾子名もエスケープしていない（管理者が設定する値）。
+- browse/full.jsp の L217 と L297: <input type="hidden" name="authority" value="<%=bi.getAuthority() %>"/> もエスケープしていない。直後の value（L221/L301）は Utils.addEntities() 済みで、authority だけ漏れている。
+  authority は AbstractBrowserServlet（upstream）で request.getParameter("authority") → scope.setAuthorityValue() → BrowseEngine L360 browseInfo.setAuthority() を経て、そのまま full.jsp に届く。
+  ただし full.jsp が表示されるのは検索結果が 1 件以上あるときだけ（AbstractBrowserServlet.processBrowse）。そのため、任意の文字列をそのまま反射させるのは難しい。上の (3) で不正な authority キーを保存したアイテムがあれば、その値で表示させられる。
+- (参考) BrowserServlet.java L71-76: クエリ文字列をそのままログに出力している（ログインジェクション、CWE-117 の軽微なもの）。今回の主判定ではない。
+修正方針: 出力時に Utils.addEntities() でエスケープする（edit-item-form.jsp の L486/L490/L601/doAuthority 内、full.jsp の L217/L297）
+- 使用トークン量（判定）: 新規 71,013（入力 16 ／ キャッシュ作成 59,141 ／ 出力〔推定〕 11,856）、キャッシュ読込 410,588、総処理 481,601、リクエスト 8 回
+
+## No.70 SARD 501350 edit-item-form.jsp（＋EditItemServlet.java / browse/full.jsp / BrowserServlet.java）
+
+- **XSS 種別**: ストア型（攻撃文字列はいったん DB（ビットストリームの source、メタデータ値、authority）に保存され、後で別の利用者（管理者・編集者）が編集画面を開いたときに出力されるため）
+- **source**: EditItemServlet.java L1035（アップロードファイル名 wrapper.getFilesystemName("file") → b.setSource()）、L797-799→L827（bitstream_source_<key> → bitstream.setSource()）、L747/L856（value_* / addfield_value → addMetadata()）、L732（choice_*_authority_* → addMetadata()）、L718（language_*）
+- **伝播経路**: リクエスト（multipart のファイル名・POST パラメータ）→ EditItemServlet が Bitstream / MetadataValue に保存（bitstreamService.update / itemService.update、L842/L875/L1040）→ DB → 編集画面を表示する showEditForm()（L503-644）が item を request 属性に入れて /tools/edit-item-form.jsp に転送 → JSP で bitstream.getSource()、dcv.getValue()、dcv.getAuthority()、getLanguage() をエスケープせずに出力
+- **sink**: edit-item-form.jsp L601（value 属性）、L486（textarea の本文）、L142-143/L147/L149/L160/L173（doAuthority が組み立てる HTML）、L490（value 属性）。副次的に browse/full.jsp L217/L297（hidden の value 属性）
+- **脆弱性の位置**: sink 側。source 側（EditItemServlet）で値を受け取って保存すること自体は仕様の範囲内。出力時に HTML エスケープ（Utils.addEntities）を忘れていることが原因。特に L601 は、隣のフィールドがエスケープされているのに source だけ漏れている
+- **攻撃例**: 投稿権限・編集権限を持つ低権限ユーザーが、ファイル名に二重引用符と HTML タグ（イベントハンドラ付き）を含むファイルをアップロードする（または bitstream_source パラメータを改ざんする、メタデータ値に </textarea> とスクリプトを入れる）。その後、管理者がそのアイテムの編集画面（/tools/edit-item）を開くと、value 属性や textarea から抜け出したスクリプトが管理者の権限で実行される。セッションの悪用や、管理操作（削除・権限変更）の強制につながる
