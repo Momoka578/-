@@ -1,0 +1,8 @@
+### No.48 skoranga/node-dns-sync lib/dns-sync.js (CVE-2017-16100, prePatch b748fe7)
+- 判定: **脆弱性あり**（OS コマンドインジェクション、CWE-78）
+根拠: lib/dns-sync.js 14 行目 resolve(hostname) の引数 hostname を、19 行目 util.format('"%s" "%s" %s', nodeBinary, scriptPath, hostname) で
+  引用符なし・検証なしのままシェルコマンド文字列に連結し、21 行目 shell.exec(cmd)（shelljs、/bin/sh 経由）で実行している。
+  hostname に ";" "&&" "|" "$( )" "`" などのシェルのメタ文字を含めると、任意のコマンドが実行できる。
+  ライブラリの用途はホスト名の解決であり、呼び出し側がユーザーやリクエスト由来のホスト名を渡すことは十分に考えられる。
+修正案: ホスト名を正規表現（英数字・"-"・"."のみ）で検証するか、child_process.execFileSync / spawnSync で引数配列として渡し、シェルを経由しない。XSS ではないため修正コードは作らない。
+- 使用トークン量（判定）: 新規 3,706（入力 6 ／ キャッシュ作成 2,482 ／ 出力〔推定〕 1,218）、キャッシュ読込 69,980、総処理 73,686、リクエスト 3 回
