@@ -1,0 +1,11 @@
+### No.79 CVE-2019-1010266 lodash 4.17.10 (lodash.js)
+- 判定: **脆弱性あり**（正規表現による DoS / ReDoS。CWE-400 / CWE-1333（CWE-730 系））
+根拠:
+- lodash.js L279: var reHasUnicodeWord = /[a-z][A-Z]|[A-Z]{2,}[a-z]|[0-9][a-zA-Z]|[a-zA-Z][0-9]|[^a-zA-Z0-9 ]/;
+  アンカーなしで test される。選択肢 [A-Z]{2,}[a-z] は、大文字だけが長く続く文字列に対し、各開始位置で残りの大文字を貪欲に食べてから [a-z] を探してバックトラックし、失敗する。開始位置ごとに O(n) かかるため、全体で O(n^2)（多項式時間のバックトラック）。
+- 呼び出し経路: L1150-1151 hasUnicodeWord(string) → reHasUnicodeWord.test(string)。L15221-15226 _.words(string) は pattern 未指定なら必ず hasUnicodeWord(string) を呼ぶ。L4974-4976 createCompounder が words(deburr(string)...) を呼ぶため、_.camelCase / kebabCase / snakeCase / startCase / lowerCase / upperCase なども同じ経路を通る。
+- 外部から来た文字列（リクエストのパラメータやヘッダなど）をこれらの関数に渡すアプリでは、大文字だけを数万文字並べた入力を 1 つ送るだけで、イベントループが秒単位で止まる。
+- 実測（$R/bench/redos.js。正規表現だけを写して node で計測）: 'A'×n で n=10000:111ms、20000:396ms、40000:1551ms、80000:6132ms。n が 2 倍になると時間は約 4 倍で、二乗時間であることを確認した。
+- 同じ種類の問題（参考）: L156 reTrim = /^\s+|\s+$/g（L12479 toNumber、L14961 trim で使う）と L158 reTrimEnd = /\s+$/（L14996 trimEnd）も、「非空白 + 長い空白列 + 非空白」の入力で O(n^2) になる（同じ計測で n=80000:6862ms）。
+修正案（XSS ではないため修正コードは作らない）: reHasUnicodeWord の [A-Z]{2,}[a-z] を [A-Z][A-Z][a-z] にする（意味は同じで、線形時間で済む）。trim 系は、\s+$ を正規表現に任せず、末尾からループで空白を数える実装にする。入力長の上限を設けるのも有効。
+- 使用トークン量（判定）: 新規 15,296（入力 12 ／ キャッシュ作成 11,651 ／ 出力〔推定〕 3,633）、キャッシュ読込 131,116、総処理 146,412、リクエスト 6 回
