@@ -1,0 +1,9 @@
+### No.44 OWASP-Benchmark/BenchmarkJava BenchmarkTest00089.java
+- 判定: **脆弱性なし**（検査対象の Secure 属性のない Cookie（CWE-614）には当たらず、XSS などもない）
+なしと判断した理由:
+- このテストのカテゴリは securecookie（27行の URL が /securecookie-00/）。検査の観点は「Cookie に Secure 属性を付けているか」（CWE-614）である。
+- doPost 88-94行: 利用者の Cookie の値から作った str で Cookie "SomeCookie" を作っているが、90行で cookie.setSecure(true) を呼んでいる（91行で HttpOnly も付けている）。この Cookie は HTTPS でしか送られないので、CWE-614 の脆弱性はない。doGet 36-43行で発行する Cookie にも、39行の setSecure(true) と 40行の setHttpOnly(true) が付いている。
+- XSS: 54-64行で Cookie の値（利用者が制御できる）を param に入れ、str として 96-100行で出力している。しかし 99行で ESAPI.encoder().encodeForHTML(str) によって HTML エスケープしているため、反射型 XSS にはならない。
+- Cookie の値を新しい Cookie にそのまま入れている点（88行）: 60行で URL デコードするので、CR/LF などが含まれうる。ただし、サーブレットコンテナの Cookie の生成処理（RFC 6265 に従う検証）が、不正な文字を含む値を拒否する。このため、HTTP レスポンスヘッダインジェクションは成立しない。Cookie の名前と属性は固定なので、値を変えられても属性を改ざんすることはできない。
+- 71行の bar は使っておらず、77-86行の InputStream の分岐は param が String なので通らない（どちらもデッドコード）。SQL、コマンド、ファイルなど、ほかの危険な sink もない。
+- 使用トークン量（判定）: 新規 4,152（入力 4 ／ キャッシュ作成 2,960 ／ 出力〔推定〕 1,188）、キャッシュ読込 266,997、総処理 271,149、リクエスト 2 回
