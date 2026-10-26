@@ -1,0 +1,131 @@
+## No.43 CVE-2017-16082 brianc/node-postgres lib/result.js（prePatch 51a28c2）
+
+- 修正した脆弱性: 不完全なエスケープによるコードインジェクション（CWE-94／CWE-116／CWE-20）
+- 修正対象ファイル: lib/result.js
+- 修正の内容:
+  - escapeFieldName() を加えた。JSON.stringify(String(fieldName)) で列名をダブルクォートの文字列リテラルにする（"、\、改行などの制御文字をすべてエスケープ）。JSON.stringify がそのまま出力する U+2028／U+2029 も \u2028／\u2029 に置き換える。
+  - inlineParser()（元の 67-75 行）: `"\nthis['" + fieldName.replace("'", "\\'") + "'] = "` を `"\nthis[" + escapeFieldName(fieldName) + "] = "` に変えた。Function による行のコンストラクタの生成は、速度のために残した。
+  - 防げること: 2 個目以降の '、\'、改行などを含む列名で文字列リテラルを抜け出し、Function で作るコードに任意の JavaScript を入れる攻撃（AS 別名、テーブルの列名、悪意のあるサーバが返す列名のどれからでも）。
+- 副作用・直さなかった点（エージェントの報告）:
+  - 修正前に構文エラーになっていた列名や、キーが壊れていた列名（back\slash など）も正しく扱えるようになる。
+  - 列名 __proto__ は、元と同じく行オブジェクトのプロトタイプを置き換える（その行オブジェクトだけの影響で、コード実行にはつながらない）。CWE-94／116 の範囲外として直していない。
+- 確認:
+  - 親: 元ファイルとの差分が上の 2 か所（コメントを含む）だけであること、node --check で構文エラーがないことを確認した。
+  - **MARK END の後の手直し**: Write で書き出したときに、コードとコメント中の \u2028／\u2029 の表記が実体の文字に変わり、構文エラーになっていた（ファイル2 No.29 と同じ現象）。エージェントが MARK END の後に perl でエスケープ表記に戻した。この手直しはトークン量の区間に含めていない。
+  - エージェント（MARK END の後）: 特殊な列名 16 件と注入用の列名で、元と修正版を比べた。元のコードでは `x\'];globalThis.PWN2=1;//` のような列名で任意のコードが実行され、修正版ではどの列名もコードは実行されず、__proto__ 以外の 15 件でキーと値が正しかった。10 列×100 万行の処理時間は、元が約 55.8 ms、修正版が約 52.6 ms（速度は落ちていない）。
+- 使用トークン量（修正）: 新規 5,946（入力 4 ／ キャッシュ作成 3,414 ／ 出力〔推定〕 2,528）、キャッシュ読込 31,491、総処理 37,437、リクエスト 2 回
+
+```javascript
+var types = require(__dirname + '/types/');
+
+//result object returned from query
+//in the 'end' event and also
+//passed as second argument to provided callback
+var Result = function(rowMode) {
+  this.command = null;
+  this.rowCount = null;
+  this.oid = null;
+  this.rows = [];
+  this.fields = [];
+  this._parsers = [];
+  this.RowCtor = null;
+  if(rowMode == "array") {
+    this.parseRow = this._parseRowAsArray;
+  }
+};
+
+var matchRegexp = /([A-Za-z]+) ?(\d+ )?(\d+)?/;
+
+//adds a command complete message
+Result.prototype.addCommandComplete = function(msg) {
+  var match;
+  if(msg.text) {
+    //pure javascript
+    match = matchRegexp.exec(msg.text);
+  } else {
+    //native bindings
+    match = matchRegexp.exec(msg.command);
+  }
+  if(match) {
+    this.command = match[1];
+    //match 3 will only be existing on insert commands
+    if(match[3]) {
+      //msg.value is from native bindings
+      this.rowCount = parseInt(match[3] || msg.value, 10);
+      this.oid = parseInt(match[2], 10);
+    } else {
+      this.rowCount = parseInt(match[2], 10);
+    }
+  }
+};
+
+Result.prototype._parseRowAsArray = function(rowData) {
+  var row = [];
+  for(var i = 0, len = rowData.length; i < len; i++) {
+    var rawValue = rowData[i];
+    if(rawValue !== null) {
+      row.push(this._parsers[i](rawValue));
+    } else {
+      row.push(null);
+    }
+  }
+  return row;
+};
+
+//rowData is an array of text or binary values
+//this turns the row into a JavaScript object
+Result.prototype.parseRow = function(rowData) {
+  return new this.RowCtor(this._parsers, rowData);
+};
+
+Result.prototype.addRow = function(row) {
+  this.rows.push(row);
+};
+
+// 【修正】列名を JavaScript の文字列リテラルとして完全にエスケープする関数を追加。
+// JSON.stringify は " と \ と制御文字（改行など）をすべてエスケープし、
+// 前後をダブルクォートで囲んだ正しいリテラルを返す。
+// ただし U+2028 / U+2029 は JSON では生のまま出力され、古い JavaScript エンジン
+// （ES2019 より前）では文字列リテラル内で行終端子として扱われて構文エラーになるため、
+// これらも \u2028 / \u2029 にエスケープする。
+var escapeFieldName = function(fieldName) {
+  return JSON.stringify(String(fieldName))
+    .replace(/\u2028/g, '\\u2028')
+    .replace(/\u2029/g, '\\u2029');
+};
+
+var inlineParser = function(fieldName, i) {
+  // 【修正】fieldName.replace("'", "\\'") は最初の 1 個の ' しか置換せず、
+  // バックスラッシュや改行もエスケープしないため、列名から生成コードに
+  // 任意の JavaScript を注入できた。escapeFieldName() で完全にエスケープした
+  // リテラル（前後のクォートを含む）を this[...] に埋め込むように変更。
+  return "\nthis[" +
+    escapeFieldName(fieldName) +
+    "] = " +
+    "rowData[" + i + "] == null ? null : parsers[" + i + "](rowData[" + i + "]);";
+};
+
+Result.prototype.addFields = function(fieldDescriptions) {
+  //clears field definitions
+  //multiple query statements in 1 action can result in multiple sets
+  //of rowDescriptions...eg: 'select NOW(); select 1::int;'
+  //you need to reset the fields
+  if(this.fields.length) {
+    this.fields = [];
+    this._parsers = [];
+  }
+  var ctorBody = "";
+  for(var i = 0; i < fieldDescriptions.length; i++) {
+    var desc = fieldDescriptions[i];
+    this.fields.push(desc);
+    var parser = types.getTypeParser(desc.dataTypeID, desc.format || 'text');
+    this._parsers.push(parser);
+    //this is some craziness to compile the row result parsing
+    //results in ~60% speedup on large query result sets
+    ctorBody += inlineParser(desc.name, i);
+  }
+  this.RowCtor = Function("parsers", "rowData", ctorBody);
+};
+
+module.exports = Result;
+```
