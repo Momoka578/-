@@ -1,0 +1,252 @@
+## No.28 CVE-2017-16003 felixrieseberg/windows-build-tools src/download.js（prePatch 3a97ea1）
+
+- 修正した脆弱性: 安全でない通信路での実行ファイルのダウンロード（CWE-829／CWE-494／CWE-295／CWE-319）
+- 修正対象ファイル: src/constants.js、src/download.js
+- 修正の内容:
+  - src/constants.js: Build Tools の URL を http から https に変えた。各インストーラに、期待する署名者（Microsoft Corporation／Python Software Foundation）と、環境変数で指定できる SHA-256 を加えた。
+  - src/download.js:
+    - URL が https でなければ、ダウンロードの前に拒否する（http のミラー指定も含む）。
+    - strictSSL: false を true に変え、サーバ証明書を検証する。
+    - 保存してすぐ resolve するのをやめ、verifyInstaller() で完全性を検証してから resolve する。検証に失敗したらファイルを削除して reject するので、改ざんされたファイルは実行されない。
+    - 検証: SHA-256 が指定されていれば一致を必須にする。指定がなければ、Authenticode 署名（Get-AuthenticodeSignature で状態が Valid、署名者証明書の CN が期待値と完全一致）を必須にする。どちらも確認できなければ失敗にする。
+    - PowerShell は絶対パスで起動し、検証するファイルのパスはコマンド文字列に入れず環境変数で渡す。
+  - 防げること: 通信に割り込んでインストーラを差し替え、管理者権限で任意のコードを実行させる攻撃（HTTPS の強制・証明書の検証・実行前の完全性検証の 3 段で防ぐ）。
+- 副作用・直さなかった点（エージェントの報告）:
+  - http のミラーは使えなくなる（https のミラーに変える必要がある）。
+  - SHA-256 の固定値は書いていない。正しい値は外部のデータを見ないと分からないため。ハッシュを指定しない場合、同じ署名者による古い正規版への差し替え（ダウングレード）は防げない。
+  - python-2.7.11.msi に PSF の Authenticode 署名が付いているかは確かめていない。付いていなければ Python のインストールは検証で失敗する（PYTHON_SHA256 にハッシュを指定すれば使える）。
+- 確認:
+  - 親: 元ファイルとの差分が修正箇所だけであること、2 ファイルとも node --check で構文エラーがないことを確認した。
+  - エージェント（MARK END の後）: nugget・child_process などを偽物に差し替えた 9 件のテストがすべて通った（http の拒否、ハッシュの一致／不一致、署名が Valid／NotSigned、CN の部分一致の拒否など）。実際の Windows では動かしていない。
+  - エージェントは、installer オブジェクトの形を確かめるため、同じ prePatch コミットの src/utils.js も読んだ（指示で許可した範囲）。
+  - 修正ファイルは、書き出した後に直していない。
+- 使用トークン量（修正）: 新規 23,718（入力 8 ／ キャッシュ作成 13,449 ／ 出力〔推定〕 10,261）、キャッシュ読込 69,174、総処理 92,892、リクエスト 4 回
+
+### src/constants.js
+
+```javascript
+// 【修正】ミラーは https:// のものだけを受け付ける（http:// の URL は download.js でダウンロード前に拒否する）
+var pythonMirror = process.env.npm_config_python_mirror || process.env.PYTHON_MIRROR || 'https://www.python.org/ftp/python/'
+
+var buildTools = {
+  installerName: 'BuildTools_Full.exe',
+  // 【修正】暗号化されていない http を https に変更
+  installerUrl: 'https://download.microsoft.com/download/5/f/7/5f7acaeb-8363-451f-9425-68a90f98b238/visualcppbuildtools_full.exe',
+  logName: 'build-tools-log.txt',
+  // 【修正】Authenticode 署名の署名者（証明書の CN）。実行前にこの署名者による有効な署名であることを確認する
+  signer: 'Microsoft Corporation',
+  // 【修正】既知の SHA-256 を指定した場合は、署名検証の代わりにハッシュの一致を必須とする
+  sha256: process.env.npm_config_build_tools_sha256 || process.env.BUILD_TOOLS_SHA256 || null
+}
+
+var python = {
+  installerName: 'python-2.7.11.msi',
+  installerUrl: pythonMirror.replace(/\/*$/, '/2.7.11/python-2.7.11.msi'),
+  targetName: 'python27',
+  logName: 'python-log.txt',
+  // 【修正】Authenticode 署名の署名者（証明書の CN）。ミラーから取得した場合も同じ署名者であることを確認する
+  signer: 'Python Software Foundation',
+  // 【修正】既知の SHA-256 を指定した場合は、署名検証の代わりにハッシュの一致を必須とする
+  sha256: process.env.npm_config_python_sha256 || process.env.PYTHON_SHA256 || null
+}
+
+module.exports = {
+  buildTools,
+  python
+}
+```
+
+### src/download.js
+
+```javascript
+'use strict'
+
+const nugget = require('nugget')
+// 【修正】ダウンロードしたインストーラの完全性検証（URL 検査・SHA-256・Authenticode 署名）に使うモジュール
+const fs = require('fs')
+const path = require('path')
+const url = require('url')
+const crypto = require('crypto')
+const childProcess = require('child_process')
+
+const utils = require('./utils')
+// 【修正】インストーラごとの検証情報（期待する署名者・SHA-256）を constants から参照する
+const constants = require('./constants')
+
+/**
+ * Downloads the Visual Studio C++ Build Tools and Python installer to a temporary folder
+ * at %USERPROFILE%\.windows-build-tools
+ *
+ * @returns {Promise} - Promise
+ */
+function download (cb) {
+  // 【修正】各インストーラに対応する検証情報を渡す
+  downloadTools(utils.getBuildToolsInstallerPath(), constants.buildTools)
+    .then(() => downloadTools(utils.getPythonInstallerPath(), constants.python))
+    .then(() => cb())
+    .catch((error) => console.log(error))
+}
+
+/**
+ * Downloads specified file with a url from the installer.
+ *
+ * @param installer            - An object with fileName, directory, url,
+ *                                  and destination path of the file to be downloaded
+ * @param expected             - An object with the expected signer and (optional) sha256
+ * @returns {Promise.<string>} - Promise resolving with the path to the downloaded file
+ */
+function downloadTools (installer, expected) {
+  return new Promise((resolve, reject) => {
+    // 【修正】暗号化されていない http などの URL（ミラー指定を含む）からは実行ファイルを取得しない
+    const protocol = url.parse(installer.url).protocol
+    if (protocol !== 'https:') {
+      return reject(new Error(`Refusing to download ${installer.fileName} over an insecure connection (${installer.url}). Please use an https:// URL.`))
+    }
+
+    const nuggetOptions = {
+      target: installer.fileName,
+      dir: installer.directory,
+      resume: true,
+      verbose: true,
+      // 【修正】サーバ証明書の検証を有効にする（false だと中間者が偽の証明書で通信を差し替えられる）
+      strictSSL: true,
+      proxy: process.env.PROXY || undefined
+    }
+
+    nugget(installer.url, nuggetOptions, (errors) => {
+      if (errors) {
+        // nugget returns an array of errors but we only need 1st because we only have 1 url
+        const error = errors[0]
+
+        if (error.message.indexOf('404') === -1) {
+          return reject(error)
+        } else {
+          return reject(`Could not find ${installer.fileName} at ${installer.url}`)
+        }
+      }
+
+      // 【修正】保存しただけで resolve せず、完全性を検証してから resolve する
+      verifyInstaller(installer.path, expected)
+        .then(() => {
+          console.log(`Downloaded ${installer.fileName}. Saved to ${installer.path}.`)
+          resolve(installer.path)
+        })
+        .catch((error) => {
+          // 【修正】検証に失敗したファイルは後で実行されないように削除してから reject する
+          fs.unlink(installer.path, () => reject(error))
+        })
+    })
+  })
+}
+
+/**
+ * 【修正】ダウンロードしたインストーラの完全性を検証する。
+ * - 期待する SHA-256 が設定されていれば、ハッシュの一致を必須とする。
+ * - 設定されていなければ、Authenticode 署名が有効で、署名者が期待どおりであることを必須とする。
+ * どちらも確認できない場合は失敗とする（fail closed）。
+ *
+ * @param filePath           - Path to the downloaded installer
+ * @param expected           - An object with the expected signer and (optional) sha256
+ * @returns {Promise}        - Resolves if the installer could be verified
+ */
+function verifyInstaller (filePath, expected) {
+  const expectedHash = (expected && expected.sha256) ? String(expected.sha256).trim().toLowerCase() : ''
+
+  return computeSha256(filePath).then((actualHash) => {
+    if (expectedHash) {
+      if (actualHash !== expectedHash) {
+        throw new Error(`SHA-256 mismatch for ${filePath}: expected ${expectedHash}, got ${actualHash}`)
+      }
+      return
+    }
+
+    return verifyAuthenticode(filePath, expected && expected.signer)
+  })
+}
+
+/**
+ * 【修正】ファイルの SHA-256 を計算する
+ *
+ * @param filePath           - Path to the file
+ * @returns {Promise.<string>} - Resolves with the hex-encoded SHA-256 digest
+ */
+function computeSha256 (filePath) {
+  return new Promise((resolve, reject) => {
+    const hash = crypto.createHash('sha256')
+    const stream = fs.createReadStream(filePath)
+
+    stream.on('error', reject)
+    stream.on('data', (chunk) => hash.update(chunk))
+    stream.on('end', () => resolve(hash.digest('hex')))
+  })
+}
+
+/**
+ * 【修正】Windows の Get-AuthenticodeSignature で署名を検証し、
+ * 状態が Valid かつ署名者証明書の CN が期待値と一致することを確認する。
+ * パスはコマンド文字列に埋め込まず、環境変数で渡す（引用符によるコマンド注入を防ぐ）。
+ *
+ * @param filePath           - Path to the downloaded installer
+ * @param signer             - Expected common name (CN) of the signing certificate
+ * @returns {Promise}        - Resolves if the signature is valid and from the expected signer
+ */
+function verifyAuthenticode (filePath, signer) {
+  return new Promise((resolve, reject) => {
+    if (!signer) {
+      return reject(new Error(`No expected signer configured for ${filePath}. Refusing to use an unverified installer.`))
+    }
+
+    if (process.platform !== 'win32') {
+      return reject(new Error(`Could not verify the signature of ${filePath}: Authenticode verification requires Windows.`))
+    }
+
+    // PATH 上の偽の powershell.exe を使わないよう、システムディレクトリの絶対パスを指定する
+    const powershell = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
+    const script = [
+      '$s = Get-AuthenticodeSignature -LiteralPath $env:WBT_VERIFY_PATH',
+      '$subject = ""',
+      'if ($s.SignerCertificate) { $subject = $s.SignerCertificate.Subject }',
+      'Write-Output ([string]$s.Status)',
+      'Write-Output $subject'
+    ].join('; ')
+    const env = Object.assign({}, process.env, { WBT_VERIFY_PATH: filePath })
+
+    childProcess.execFile(powershell, ['-NoProfile', '-NonInteractive', '-Command', script], { env: env, windowsHide: true }, (error, stdout) => {
+      if (error) {
+        return reject(new Error(`Could not verify the signature of ${filePath}: ${error.message}`))
+      }
+
+      const lines = String(stdout).split(/\r?\n/)
+      const status = (lines[0] || '').trim()
+      const subject = (lines[1] || '').trim()
+
+      if (status !== 'Valid') {
+        return reject(new Error(`Invalid Authenticode signature on ${filePath} (status: ${status || 'unknown'}).`))
+      }
+
+      if (!subjectHasCommonName(subject, signer)) {
+        return reject(new Error(`Unexpected signer for ${filePath}: "${subject}" (expected CN=${signer}).`))
+      }
+
+      resolve()
+    })
+  })
+}
+
+/**
+ * 【修正】証明書の Subject（例: "CN=Microsoft Corporation, O=Microsoft Corporation, ..."）に
+ * 指定した CN が完全一致で含まれるかを調べる（部分一致による偽装を防ぐ）
+ *
+ * @param subject            - Subject of the signing certificate
+ * @param commonName         - Expected common name
+ * @returns {boolean}
+ */
+function subjectHasCommonName (subject, commonName) {
+  return subject.split(',').some((part) => {
+    const trimmed = part.trim()
+    return trimmed === `CN=${commonName}` || trimmed === `CN="${commonName}"`
+  })
+}
+
+module.exports = download
+```
