@@ -1,20 +1,25 @@
-## No.45 CVE-2017-16084 KoryNunn/list-n-stream server.js（prePatch 87de3f1）
+## No.45 ：補足の XSS（CVE-2017-16084 KoryNunn/list-n-stream server.js）
 
-- 修正した脆弱性: パストラバーサル／任意のファイル・ディレクトリの読み取り（CWE-22）
+- 依頼: ユーザーから「No.45 の XSS も直して」と依頼された（2026-10-26）。判定の記録の「補足」にある XSS（CWE-79）で、上の No.45 では対象外にしていたもの。
+- 記録先: No.45 は XSS を主判定にしていない項目なので、"修正版コード"・"修正後コード"・"xssの詳細" ではなく、No.45 の続きとしてここに記録した。
+- 方法: ほかの番号と同じく、新しい文脈のエージェントを 1 つ使った（Claude Opus 5.5、effort: xhigh）。上の No.45 の修正コード（CWE-22 修正済み）を親が渡し、その上に XSS の修正だけを加えさせた。このコードで CWE-22 と XSS の両方が直っている。
+- 修正した脆弱性: XSS（CWE-79。補足で指摘した 3 か所）
 - 修正対象ファイル: server.js
 - 修正の内容:
-  - 4xx を返す clientError() を加えた。
-  - 87 行の `var path = process.cwd() + '/' + details.path;` を置き換えた。公開ルートを path.resolve(process.cwd()) で求め、`path.resolve(root, '.' + sep + details.path)` で '..' を解決した絶対パスにする。結果がルート自身でもなく、ルート＋区切り文字で始まってもいなければ 403 を返し、fs.stat・readdir・createReadStream には渡さない。NUL 文字を含むパスは 400 を返す。
-  - 防げること: '../' を重ねたパスや 'sub/../../x' による、公開ディレクトリの外のファイルの読み取り（/etc/passwd など）とディレクトリ一覧の取得。区切り文字付きで比べるので、名前の頭が同じ隣のディレクトリにも抜けられない。
+  - escapeHtml() を加えた（& < > " ' を &amp; &lt; &gt; &quot; &#39; に置き換える）。
+  - ディレクトリ一覧（元の 37 行）: currentPath と fileName をエスケープしてから、href 属性の値とリンクの表示文字列に埋め込む。
+  - ?view の表示（元の 56 行）: urlBits[0] をエスケープしてから video 要素の src 属性に埋め込む。
+  - 防げること: HTML を含むファイル名（`"><img src=x onerror=…>` など）を公開ディレクトリに置いたり、リクエストの URL に HTML を入れたりして、属性値や要素の外に抜け出し、タグやイベント属性を差し込む攻撃。
 - 副作用・直さなかった点（エージェントの報告）:
-  - 判定の記録の補足にある XSS（37 行・56 行のエスケープ漏れ）は、指示どおり変えていない。
-  - 判定時の修正案にあった decodeURIComponent は入れていない。ルーター（beeline）が URL をデコードするかを確かめられず、二重にデコードすると % を含むファイル名が開けなくなるおそれがあるため。検査は fs に実際に渡すパスに対して行うので、どちらの場合も外には出られない。
-  - 公開ディレクトリ内の、外を指すシンボリックリンクはたどる（realpath での検査はしていない）。
+  - 属性値の中の文字参照はブラウザが元の文字に戻すので、リンク先は修正前と同じ。通常のファイル名では出力も変わらない。
+  - ファイル名の URL 符号化（encodeURIComponent）は加えていない（XSS の対策にはエスケープで足りる。名前に ? や # を含むファイルのリンクが正しく動かない点は元と同じ）。
+  - XSS 以外の点（生のリクエスト `//evil.example/..` で一覧のリンク先が外部ホストになりうること、text/html に charset がないことなど）は直していない。
 - 確認:
-  - 親: 元ファイルとの差分が上の 2 か所（コメントを含む）と末尾の改行だけであること、node --check で構文エラーがないことを確認した。
-  - エージェント（MARK END の後）: beeline・http・fs などをスタブにしてルートの処理を呼んだ。元のコードでは '../etc/passwd' などがすべて 200 になり、ルートの外のパスが fs に渡った。修正版では '..'、'../etc/passwd'、'sub/../../x'、'../root2/secret' が 403、NUL 文字を含むパスが 400 になり、ルートの中のパスは 200 のままだった。
+  - 親: もとにしたファイル（CWE-22 修正版）との差分が、escapeHtml() の追加と上の 2 か所（コメントを含む）だけで、CWE-22 の修正部分が変わっていないことを確認した。node --check で構文エラーはない。
+  - エージェント（MARK END の後）: beeline などを差し替えて偽のリクエストを送った。`"><img src=x onerror=alert(1)>.mp4` というファイルを置いた一覧と、`/"><img …>.mp4?view` のリクエストで、XSS 修正前は `<img>` が差し込まれ、修正後はすべてエスケープされた。通常のファイルの出力は変わらず、`/../../etc/passwd` は 403 のままだった（CWE-22 の修正は残っている）。
   - 修正ファイルは、書き出した後に直していない。
-- 使用トークン量（修正）: 新規 6,961（入力 4 ／ キャッシュ作成 3,492 ／ 出力〔推定〕 3,465）、キャッシュ読込 31,748、総処理 38,709、リクエスト 2 回
+  - トークン量の区間・計算方法はほかの番号と同じ。記録に残っていた出力トークン数は 7,635（推定値 7,509、差 −1.7%）。
+- 使用トークン量（修正）: 新規 13,435（入力 4 ／ キャッシュ作成 5,922 ／ 出力〔推定〕 7,509）、キャッシュ読込 32,338、総処理 45,773、リクエスト 2 回
 
 ```javascript
 #! /usr/bin/env node
@@ -46,6 +51,23 @@ function clientError(response, statusCode){
     response.end();
 }
 
+// 【修正】HTML に埋め込む値をエスケープする（XSS 対策、CWE-79）。
+// & < > " ' を文字参照に置き換え、属性値（"..."）や要素の内容から抜け出して
+// タグや属性・スクリプトを差し込めないようにする。
+var htmlEscapes = {
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&#39;'
+};
+
+function escapeHtml(value){
+    return String(value).replace(/[&<>"']/g, function(character){
+        return htmlEscapes[character];
+    });
+}
+
 function serveDir(request, response, path){
     fs.readdir(path, function(error, files){
         if(error){
@@ -59,7 +81,9 @@ function serveDir(request, response, path){
         response.end(
             '<a href="../">../</a><br>' +
             files.map(function(fileName){
-            return '<a href="' + currentPath + (currentPath === '/' ? '' : '/') + fileName + '?view">' + fileName + '</a>';
+            // 【修正】currentPath（リクエストの URL 由来）と fileName（ディスク上のファイル名）を
+            // そのまま連結せず、エスケープしてから href 属性値と a 要素の内容に埋め込む。
+            return '<a href="' + escapeHtml(currentPath) + (currentPath === '/' ? '' : '/') + escapeHtml(fileName) + '?view">' + escapeHtml(fileName) + '</a>';
         }).join('<br>'));
     });
 }
@@ -78,7 +102,8 @@ function serveFile(request, response, path, info){
         response.writeHead(200, {"Content-Type": "text/html"});
         response.end(
             '<style>html, body{margin:0;background:black;}video{height:100%;width:100%}</style>' +
-            '<video src="' + urlBits[0] + '" autoplay controls></video>'
+            // 【修正】urlBits[0]（リクエストの URL のパス部分）をエスケープしてから src 属性値に埋め込む。
+            '<video src="' + escapeHtml(urlBits[0]) + '" autoplay controls></video>'
         );
         return;
     }
