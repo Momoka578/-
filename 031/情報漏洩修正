@@ -1,0 +1,564 @@
+## No.31 CVE-2017-18355 GoogleChrome/rendertron src/renderer.js（prePatch 16ade32）
+
+- 修正した脆弱性: 情報漏えい／ローカルファイル読み取り・SSRF（CWE-200）
+- 修正対象ファイル: src/main.js、src/renderer.js
+- 修正の内容:
+  - src/renderer.js:
+    - validateUrl() を加え、serialize() と captureScreenshot() でタブを開く前に URL を検査する。new URL() で解析し、スキームは http:／https: だけを許可する（file:、chrome:、data: などは拒否）。ホスト名を DNS で引き、内部向けのアドレスが 1 つでも含まれていれば拒否する。検査を通った正規化済みの URL を Page.navigate に渡す。
+    - isPrivateAddress()／isPrivateIPv4() を加えた。ループバック、10/8、172.16/12、192.168/16、169.254/16（メタデータサーバ）、IPv6 のループバック・ユニークローカル・リンクローカル、IPv4 射影アドレスなどを内部とみなす。判定できない値は拒否する。
+    - ページの読み込み中に、実際の接続先（Network.responseReceived の remoteIPAddress、リダイレクトの応答）が内部アドレスなら reject する。返す直前にも再確認する。公開ホストから内部へのリダイレクトや、DNS リバインディングで内部に接続した場合も、その内容を返さない。
+    - 付随: injectBaseHref('${url}') を JSON.stringify(url) で文字列リテラルにした（' を含む URL によるコードの注入を防ぐ）。
+    - config.allowPrivateNetwork が true のときだけ、内部アドレスの検査を外せる（テスト・社内利用向け。スキームの制限は外れない）。
+  - src/main.js: 142 行目の --remote-debugging-address=0.0.0.0 を 127.0.0.1 に変えた（外部から Chrome のデバッグポートを操作されないようにする）。この 1 行だけで、補足の XSS（103-106 行）は変えていない。
+  - 防げること: file:///etc/passwd などのローカルファイルの読み取り、127.0.0.1 やメタデータサーバ（169.254.169.254）などへの SSRF と、その内容が /render の HTML や /screenshot の画像として漏れること。
+- 副作用・直さなかった点（エージェントの報告）:
+  - localhost や社内のホストを描画する使い方は拒否される（allowPrivateNetwork: true が必要）。プロキシ経由の構成では、接続先がプロキシの内部アドレスになり、すべての描画が拒否されうる。
+  - リダイレクト先やサブリソースへのリクエストそのものは送られる（応答の内容を返さないだけ）。DNS リバインディングで読んだ内容を、ページ内の JS が攻撃者のサーバへ直接送る経路は防げない。
+  - 判定の記録の補足にある XSS（main.js の Cannot render ${url}）は、指示どおり対象外として残した。/_ah/stop に認証がない点、renderOnly の前方一致の判定も変えていない。
+- 確認:
+  - 親: 元ファイルとの差分が、ライセンスヘッダの省略と上の修正箇所だけであること、2 ファイルとも node --check で構文エラーがないことを確認した。
+  - エージェント（MARK END の後）: CDP と DNS を偽物に差し替えて、内部アドレスの判定 40 件、URL の検査 25 件、serialize／captureScreenshot の 12 の場面（file: の拒否、メタデータサーバ、内部へのリダイレクト、内部の iframe、公開サイトでの正常動作など）を確かめ、すべて通った。同じテストを元の renderer.js で動かすと 8 項目で失敗した（file: やメタデータサーバの内容を返す）。実際の Chrome では動かしていない。
+  - エージェントは、呼び出し側の扱いを確かめるため、同じ prePatch コミットの src/main.js も取得して読んだ（指示で許可した範囲）。
+  - 修正ファイルは、書き出した後に直していない。
+- 使用トークン量（修正）: 新規 71,405（入力 8 ／ キャッシュ作成 38,616 ／ 出力〔推定〕 32,781）、キャッシュ読込 80,568、総処理 151,973、リクエスト 4 回
+
+### src/main.js
+
+```javascript
+'use strict';
+
+const assert = require('assert');
+const renderer = require('./renderer');
+const chromeLauncher = require('chrome-launcher');
+const express = require('express');
+const fs = require('fs');
+const compression = require('compression');
+const path = require('path');
+const https = require('https');
+const app = express();
+const cache = require('./cache');
+const now = require('performance-now');
+const uuidv4 = require('uuid/v4');
+
+// Load config from config.json if it exists.
+let config = {};
+const configPath = path.resolve(__dirname, '../config.json');
+
+if (fs.existsSync(configPath)) {
+  config = JSON.parse(fs.readFileSync(configPath));
+  assert(config instanceof Object);
+}
+
+// Only start a cache if configured and not in testing.
+if (!module.parent && !!config['cache']) {
+  app.get('/render/:url(*)', cache.middleware());
+  app.get('/screenshot/:url(*)', cache.middleware());
+  // Always clear the cache for now, while things are changing.
+  cache.clearCache();
+}
+
+// Allows the config to be overriden
+app.setConfig = (newConfig) => {
+  const oldConfig = config;
+  config = newConfig;
+  config.chrome = oldConfig.chrome;
+  config.port = oldConfig.port;
+};
+
+app.use(compression());
+
+app.use('/node_modules', express.static(path.resolve(__dirname, '../node_modules')));
+
+app.get('/', (request, response) => {
+  response.sendFile(path.resolve(__dirname, 'index.html'));
+});
+
+function isRestricted(url) {
+  if (!config['renderOnly'])
+    return false;
+  for (let i = 0; i < config['renderOnly'].length; i++) {
+    if (url.startsWith(config['renderOnly'][i])) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// If configured, report action & time to Google Analytics.
+function track(action, time) {
+  if (config['analyticsTrackingId']) {
+    const postOptions = {
+      host: 'www.google-analytics.com',
+      path: '/collect',
+      method: 'POST'
+    };
+
+    const post = https.request(postOptions);
+    post.write(`v=1&t=event&ec=render&ea=${action}&ev=${Math.round(time)}&tid=${config['analyticsTrackingId']}&cid=${uuidv4()}`);
+    post.end();
+  }
+}
+
+app.get('/render/:url(*)', async(request, response) => {
+  if (isRestricted(request.params.url)) {
+    response.status(403).send('Render request forbidden, domain excluded');
+    return;
+  }
+
+  try {
+    const start = now();
+    const result = await renderer.serialize(request.params.url, request.query, config);
+    response.status(result.status).send(result.body);
+    track('render', now() - start);
+  } catch (err) {
+    let message = `Cannot render ${request.params.url}`;
+    if (err && err.message)
+      message += ` - "${err.message}"`;
+    response.status(400).send(message);
+  }
+});
+
+app.get('/screenshot/:url(*)', async(request, response) => {
+  if (isRestricted(request.params.url)) {
+    response.status(403).send('Render request forbidden, domain excluded');
+    return;
+  }
+
+  try {
+    const start = now();
+    const result = await renderer.captureScreenshot(request.params.url, request.query, config).catch((err) => console.error(err));
+    const img = new Buffer(result, 'base64');
+    response.set({
+      'Content-Type': 'image/jpeg',
+      'Content-Length': img.length
+    });
+    response.end(img);
+    track('screenshot', now() - start);
+  } catch (err) {
+    let message = `Cannot render ${request.params.url}`;
+    if (err && err.message)
+      message += ` - "${err.message}"`;
+    response.status(400).send(message);
+  }
+});
+
+app.get('/_ah/health', (request, response) => response.send('OK'));
+
+app.get('/_ah/stop', async(request, response) => {
+  await config.chrome.kill();
+  response.send('OK');
+});
+
+const appPromise = chromeLauncher.launch({
+  // 【修正】Chrome のデバッグポートを 0.0.0.0（全インタフェース）に公開せず、ローカルホストだけで待ち受ける。
+  // 公開したままだと、外部の誰でも DevTools プロトコル経由で file: の URL や内部アドレスを開いて内容を読める。
+  // renderer.js は同じホストから接続するので、127.0.0.1 で十分。
+  chromeFlags: ['--headless', '--disable-gpu', '--remote-debugging-address=127.0.0.1'],
+  port: 0
+}).then((chrome) => {
+  console.log('Chrome launched with debugging on port', chrome.port);
+  config.chrome = chrome;
+  config.port = chrome.port;
+  // Don't open a port when running from inside a module (eg. tests). Importing
+  // module can control this.
+  const port = process.env.PORT || '3000';
+  if (!module.parent) {
+    app.listen(port, function() {
+      console.log('Listening on port', port);
+    });
+  }
+  return app;
+}).catch((error) => {
+  console.error(error);
+  // Critical failure, exit with error code.
+  process.exit(1);
+});
+
+
+let exceptionCount = 0;
+async function logUncaughtError(error) {
+  console.error('Uncaught exception');
+  console.error(error);
+  exceptionCount++;
+  // Restart instance due to several failures.
+  if (exceptionCount > 5) {
+    console.log(`Detected ${exceptionCount} errors, shutting instance down`);
+    if (config && config.chrome)
+      await config.chrome.kill();
+    process.exit(1);
+  }
+}
+
+if (!module.parent) {
+  process.on('uncaughtException', logUncaughtError);
+  process.on('unhandledRejection', logUncaughtError);
+}
+
+module.exports = appPromise;
+```
+
+### src/renderer.js
+
+```javascript
+'use strict';
+
+const CDP = require('chrome-remote-interface');
+// 【修正】URL の検査（スキームと接続先アドレス）に使うモジュール
+const dns = require('dns');
+const net = require('net');
+const {URL} = require('url');
+
+// 【修正】レンダリングを許可する URL スキーム（file:, chrome:, data:, view-source: などは拒否する）
+const ALLOWED_PROTOCOLS = ['http:', 'https:'];
+
+// 【修正】内部アドレスへの接続を拒否したときのエラーメッセージ（利用者の入力は含めない）
+const PRIVATE_ADDRESS_MESSAGE = 'Access to private network address is forbidden';
+
+/**
+ * 【修正】IPv4 アドレス（4 つの数値）が内部向け・予約済みの範囲か判定する。
+ * @param {!Array<number>} p
+ * @return {boolean}
+ */
+function isPrivateIPv4(p) {
+  return p[0] === 0 || p[0] === 10 || p[0] === 127 ||   // 0.0.0.0/8, 10.0.0.0/8, ループバック
+      (p[0] === 100 && p[1] >= 64 && p[1] <= 127) ||    // 100.64.0.0/10（CGN）
+      (p[0] === 169 && p[1] === 254) ||                 // リンクローカル（クラウドのメタデータサーバ）
+      (p[0] === 172 && p[1] >= 16 && p[1] <= 31) ||     // 172.16.0.0/12
+      (p[0] === 192 && p[1] === 168) ||                 // 192.168.0.0/16
+      (p[0] === 192 && p[1] === 0 && p[2] === 0) ||     // 192.0.0.0/24
+      (p[0] === 198 && (p[1] === 18 || p[1] === 19)) || // 198.18.0.0/15
+      p[0] >= 224;                                      // マルチキャスト・予約・ブロードキャスト
+}
+
+/**
+ * 【修正】IP アドレスがループバック・プライベート・リンクローカルなど、
+ * 外部の利用者に接続させてはならない範囲か判定する。判定できない値は true（拒否）とする。
+ * @param {string} address
+ * @return {boolean}
+ */
+function isPrivateAddress(address) {
+  const ip = String(address).replace(/^\[|\]$/g, '').replace(/%.*$/, '').toLowerCase();
+  if (net.isIPv4(ip))
+    return isPrivateIPv4(ip.split('.').map(Number));
+  if (!net.isIPv6(ip))
+    return true;
+
+  // IPv6 を 16 ビット × 8 個に展開する（末尾が IPv4 表記なら 16 進 2 個に変換する）。
+  let s = ip;
+  const v4 = s.match(/(\d+)\.(\d+)\.(\d+)\.(\d+)$/);
+  if (v4)
+    s = s.slice(0, v4.index) + ((v4[1] << 8) | v4[2]).toString(16) + ':' + ((v4[3] << 8) | v4[4]).toString(16);
+  const halves = s.split('::');
+  const head = halves[0] ? halves[0].split(':') : [];
+  const tail = halves[1] ? halves[1].split(':') : [];
+  const groups = halves.length === 2 ?
+      head.concat(new Array(Math.max(0, 8 - head.length - tail.length)).fill('0'), tail) : head;
+  if (groups.length !== 8)
+    return true;
+  const w = groups.map((g) => parseInt(g, 16));
+  const embedded = [w[6] >> 8, w[6] & 0xff, w[7] >> 8, w[7] & 0xff];
+
+  if (w[0] === 0 && w[1] === 0 && w[2] === 0 && w[3] === 0 && w[4] === 0 && (w[5] === 0 || w[5] === 0xffff))
+    return isPrivateIPv4(embedded);   // ::, ::1, IPv4 互換アドレス, IPv4 射影アドレス（::ffff:127.0.0.1 など）
+  if (w[0] === 0x64 && w[1] === 0xff9b)
+    return isPrivateIPv4(embedded);   // NAT64（64:ff9b::/96）
+  if (w[0] === 0x2002)
+    return isPrivateIPv4([w[1] >> 8, w[1] & 0xff, w[2] >> 8, w[2] & 0xff]);  // 6to4（2002::/16）
+  return (w[0] & 0xfe00) === 0xfc00 ||  // ユニークローカル fc00::/7
+      (w[0] & 0xffc0) === 0xfe80 ||     // リンクローカル fe80::/10
+      (w[0] & 0xffc0) === 0xfec0 ||     // サイトローカル fec0::/10（廃止済み）
+      (w[0] & 0xff00) === 0xff00;       // マルチキャスト ff00::/8
+}
+
+/**
+ * 【修正】利用者が指定した URL を検査し、正規化した URL を返す。
+ * http:/https: 以外のスキーム（file: など）と、内部ネットワークのアドレスに
+ * 解決されるホスト（localhost, 127.0.0.1, 169.254.169.254 など）は拒否する。
+ * config.allowPrivateNetwork が true のときだけ内部アドレスを許可する（テスト・社内利用向け）。
+ * @param {string} url
+ * @param {!Object} config
+ * @return {!Promise<string>}
+ */
+async function validateUrl(url, config) {
+  let parsed;
+  try {
+    parsed = new URL(url);
+  } catch (e) {
+    throw new Error('Invalid URL');
+  }
+  if (!ALLOWED_PROTOCOLS.includes(parsed.protocol))
+    throw new Error('URL scheme is not allowed');
+
+  if (!config['allowPrivateNetwork']) {
+    const hostname = parsed.hostname.replace(/^\[|\]$/g, '');
+    const addresses = await new Promise((resolve, reject) => {
+      dns.lookup(hostname, {all: true}, (err, result) => {
+        if (err)
+          reject(new Error('Cannot resolve host'));
+        else
+          resolve(result);
+      });
+    });
+    if (!addresses.length || addresses.some((a) => isPrivateAddress(a.address)))
+      throw new Error(PRIVATE_ADDRESS_MESSAGE);
+  }
+  return parsed.href;
+}
+
+class Renderer {
+  _loadPage(client, url, options, config) {
+    /**
+     * Finds any meta tags setting the status code.
+     * @return {?number} status code
+     */
+    function getStatusCode() {
+      const metaElement = document.querySelector('meta[name="render:status_code"]');
+      if (!metaElement)
+        return undefined;
+      return parseInt(metaElement.getAttribute('content')) || undefined;
+    }
+
+    /**
+     * Listens for the 'render-complete' event.
+     */
+    function listenForCompletionEvent() {
+      document.addEventListener('render-complete', () => {
+        console.log('Rendering complete');
+      });
+    }
+
+    return new Promise(async(resolve, reject) => {
+      const {Page, Runtime, Network, Emulation, Console} = client;
+
+      await Promise.all([
+        Page.enable(),
+        Runtime.enable(),
+        Console.enable(),
+        Network.enable(),
+        Network.setBypassServiceWorker({bypass: true}),
+      ]);
+
+      // Inject the Shady DOM polyfill if web components v1 is used, so we can
+      // serialize the page.
+      // TODO(samli): This needs to change to use the non-deprecated API after Chrome 61
+      //   addScriptToEvaluateOnNewDocument({source: `ShadyDOM = {force: true}`})
+      const shadyFlag = options['wc-inject-shadydom'];
+      if (shadyFlag == '' || !!shadyFlag) {
+        // Deprecated in Chrome 61.
+        Page.addScriptToEvaluateOnLoad({scriptSource: `customElements.forcePolyfill = true`});
+        Page.addScriptToEvaluateOnLoad({scriptSource: `ShadyDOM = {force: true}`});
+        Page.addScriptToEvaluateOnLoad({scriptSource: `ShadyCSS = {shimcssproperties: true}`});
+      }
+
+      // Add hook for completion event.
+      Page.addScriptToEvaluateOnLoad({scriptSource: `(${listenForCompletionEvent.toString()})()`});
+
+      if (!!config['debug']) {
+        Console.messageAdded((event) => {
+          console.log(`[${event.message.level}] ${event.message.text}`);
+        });
+      }
+
+      // 【修正】実際に接続した相手の IP アドレスを応答ごとに検査する。
+      // 公開ホストからのリダイレクト、ページ内の JavaScript による遷移や iframe、
+      // DNS リバインディングで内部アドレスに接続した場合も、その内容を利用者に返さない。
+      let blocked = false;
+      const checkRemoteAddress = (response) => {
+        if (config['allowPrivateNetwork'] || !response || !response.remoteIPAddress)
+          return;
+        if (isPrivateAddress(response.remoteIPAddress)) {
+          blocked = true;
+          reject(new Error(PRIVATE_ADDRESS_MESSAGE));
+        }
+      };
+
+      Page.navigate({url: url}).catch(reject);
+
+      // Check that all outstanding network requests have finished loading.
+      const outstandingRequests = new Map();
+      let initialRequestId = undefined;
+      Network.requestWillBeSent((event) => {
+        // 【修正】リダイレクト元の応答も検査する
+        checkRemoteAddress(event.redirectResponse);
+        if (!initialRequestId)
+          initialRequestId = event.requestId;
+        outstandingRequests.set(event.requestId, event);
+      });
+
+      let statusCode = 200;
+      Network.responseReceived((event) => {
+        // 【修正】すべての応答（メイン文書・サブリソース）の接続先を検査する
+        checkRemoteAddress(event.response);
+        if (event.requestId == initialRequestId && event.response.status != 0)
+          statusCode = event.response.status;
+      });
+
+      Network.loadingFinished((event) => {
+        outstandingRequests.delete(event.requestId);
+      });
+
+      Network.loadingFailed((event) => {
+        if (event.requestId == initialRequestId) {
+          reject({message: event.errorText});
+        }
+        outstandingRequests.delete(event.requestId);
+      });
+
+      // Ensure the page load event has fired.
+      let pageLoadEventFired = false;
+      Page.loadEventFired(() => {
+        pageLoadEventFired = true;
+      });
+
+      // Set a virtual time budget of 10 seconds. This 10 second timer is paused while there are
+      // any active network requests. This allows for a maximum of 10 seconds in script/rendering
+      // time. Once the page is idle, the virtual time budget expires immediately.
+      let currentTimeBudget = 10000;
+      Emulation.setVirtualTimePolicy({policy: 'pauseIfNetworkFetchesPending', budget: currentTimeBudget});
+
+      let budgetExpired = async() => {
+        let result = await Runtime.evaluate({expression: `(${getStatusCode.toString()})()`});
+        // Original status codes which aren't either 200 or 304 always return with that
+        // status code, regardless of meta tags.
+        if ((statusCode == 200 || statusCode == 304) && result.result.value)
+          statusCode = result.result.value;
+
+        resolve({
+          status: statusCode || 200,
+          // 【修正】読み込み完了の後（内容の取り出し直前）にも、内部アドレスへの
+          // 接続がなかったかを呼び出し側で確認できるようにする
+          checkBlocked: () => {
+            if (blocked)
+              throw new Error(PRIVATE_ADDRESS_MESSAGE);
+          },
+        });
+        budgetExpired = () => {};
+        clearTimeout(timeoutId);
+      };
+
+      Emulation.virtualTimeBudgetExpired((event) => {
+        // Reset the virtual time budget if there is still outstanding work. Converge the virtual time
+        // budget just in case network requests are firing on a regular timer.
+        if (outstandingRequests.size || !pageLoadEventFired) {
+          // Budget must be an integer.
+          currentTimeBudget = Math.ceil(currentTimeBudget / 2);
+          Emulation.setVirtualTimePolicy({policy: 'pauseIfNetworkFetchesPending', budget: currentTimeBudget});
+          return;
+        }
+        budgetExpired();
+      });
+
+      // Set a hard limit of 10 seconds.
+      let timeoutId = setTimeout(() => {
+        console.log(`10 second time budget limit reached.
+          Attempted rendering: ${url}
+          Page load event fired: ${pageLoadEventFired}
+          Outstanding network requests: ${outstandingRequests.size}`);
+        budgetExpired();
+      }, 10000);
+
+      // Listen for the message that signals that rendering event was fired.
+      Console.messageAdded((event) => {
+        if (event.message.text === 'Rendering complete') {
+          budgetExpired();
+        }
+      });
+    });
+  }
+
+  serialize(url, options, config) {
+    /**
+     * Executed on the page after the page has loaded. Strips script and
+     * import tags to prevent further loading of resources.
+     */
+    function stripPage() {
+      const elements = document.querySelectorAll('script, link[rel=import]');
+      elements.forEach((e) => e.remove());
+    }
+
+    /**
+     * Injects a <base> tag which allows other resources to load. This
+     * has no effect on serialised output, but allows it to verify render quality.
+     * @param {string} url - Requested URL to set as the base.
+     */
+    function injectBaseHref(url) {
+      const base = document.createElement('base');
+      base.setAttribute('href', url);
+      document.head.appendChild(base);
+    }
+
+    return new Promise(async(resolve, reject) => {
+      // 【修正】タブを開く前に URL を検査し、以降は正規化した URL だけを使う
+      try {
+        url = await validateUrl(url, config);
+      } catch (error) {
+        reject(error);
+        return;
+      }
+
+      const tab = await CDP.New({port: config.port});
+      const client = await CDP({tab: tab, port: config.port});
+
+      const {Runtime} = client;
+
+      try {
+        let renderResult = await this._loadPage(client, url, options, config);
+
+        await Runtime.evaluate({expression: `(${stripPage.toString()})()`});
+        // 【修正】URL を JSON 文字列リテラルとして埋め込む（' を含む URL で式が壊れる・注入されるのを防ぐ）
+        await Runtime.evaluate({expression: `(${injectBaseHref.toString()})(${JSON.stringify(url)})`});
+
+        let result = await Runtime.evaluate({expression: 'document.firstElementChild.outerHTML'});
+        CDP.Close({id: client.target.id, port: config.port});
+        // 【修正】内容を返す直前に、内部アドレスへの接続がなかったか再確認する
+        renderResult.checkBlocked();
+        resolve({
+          status: renderResult.status,
+          body: result.result.value});
+      } catch (error) {
+        reject(error);
+      }
+    });
+  }
+
+  captureScreenshot(url, options, config) {
+    return new Promise(async(resolve, reject) => {
+      // 【修正】タブを開く前に URL を検査し、以降は正規化した URL だけを使う
+      try {
+        url = await validateUrl(url, config);
+      } catch (error) {
+        reject(error);
+        return;
+      }
+
+      const tab = await CDP.New({port: config.port});
+      const client = await CDP({tab: tab, port: config.port});
+
+      const {Animation, Page, Emulation} = client;
+
+      // Accelerate global animation timeline so that loading animations
+      // are hopefully complete by the time we take the screenshot.
+      Animation.setPlaybackRate({playbackRate: 1000});
+
+      const width = Math.min(2000, parseInt(options['width']) || 1000);
+      const height = Math.min(2000, parseInt(options['height']) || 1000);
+      await Emulation.setDeviceMetricsOverride({width: width, height: height, mobile: true, deviceScaleFactor: 3.5, fitWindow: false, screenWidth: width, screenHeight: height});
+      await Emulation.setVisibleSize({width: width, height: height});
+
+      try {
+        // 【修正】結果を受け取り、撮影後に内部アドレスへの接続がなかったか確認する
+        let renderResult = await this._loadPage(client, url, options, config);
+        let {data} = await Page.captureScreenshot({format: 'jpeg', quality: 60});
+
+        CDP.Close({id: client.target.id, port: config.port});
+        renderResult.checkBlocked();
+        resolve(data);
+      } catch (error) {
+        reject(error);
+      }
+    });
+  }
+}
+
+module.exports = new Renderer();
+```
