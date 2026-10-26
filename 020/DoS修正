@@ -1,0 +1,239 @@
+## No.20 CVE-2017-16117 Trott/node-slug slug.js（prePatch 85ded30）
+
+- 修正した脆弱性: 正規表現 DoS（ReDoS）
+- 修正対象ファイル: slug.js
+- 修正の内容:
+  - L64 `result = result.replace(/^\s+|\s+$/g, '')` を `result = result.trim()` に変えた。trim() は \s と同じ空白・改行文字を線形時間で削るので、結果を変えずに二乗時間のバックトラックをなくせる。
+  - L57 の同じ正規表現（短い Unicode 文字名が対象で実害はない）も、同じ書き方を残さないよう trim() に変えた。
+- 直さなかった点（エージェントの判断）:
+  - 入力長の上限（判定時の修正案のメモにあった）は入れていない。例外を投げるか切り詰めるかでライブラリの挙動が変わり、最小限の修正でなくなるため。
+  - L66 `result.replace(opts.replacement+"$", '')` は文字列として置換されるため末尾の区切り文字を削れていない（機能上のバグ）。ReDoS とは関係がなく、直すと出力が変わるので触っていない。
+- 確認:
+  - 親: 元ファイルとの差分が上の 2 行（コメントを含む）だけであること、node --check で構文エラーがないことを確認した。
+  - エージェント（MARK END の後）: 元と修正版の出力を、固定の入力とランダムな入力の計 20,120 件で比べ、違いは 0 件だった。'a'＋空白 n 個＋'a' の処理時間は、n=10000／20000／40000 で、元が 96.7／377.0／1494.1 ms、修正版が 3.4／7.2／12.2 ms（二乗時間から線形時間に変わった）。
+  - 修正ファイルは、書き出した後に直していない。
+- 使用トークン量（修正）: 新規 16,304（入力 6 ／ キャッシュ作成 8,687 ／ 出力〔推定〕 7,611）、キャッシュ読込 51,161、総処理 67,465、リクエスト 3 回
+
+```javascript
+(function (root) {
+// lazy require symbols table
+var _symbols, removelist;
+function symbols(code) {
+    if (_symbols) return _symbols[code];
+    _symbols = require('unicode/category/So');
+    removelist = ['sign','cross','of','symbol','staff','hand','black','white']
+        .map(function (word) {return new RegExp(word, 'gi')});
+    return _symbols[code];
+}
+
+function slug(string, opts) {
+    string = string.toString();
+    if ('string' === typeof opts)
+        opts = {replacement:opts};
+    opts = opts || {};
+    opts.mode = opts.mode || slug.defaults.mode;
+    var defaults = slug.defaults.modes[opts.mode];
+    var keys = ['replacement','multicharmap','charmap','remove','lower'];
+    for (var key, i = 0, l = keys.length; i < l; i++) { key = keys[i];
+        opts[key] = (key in opts) ? opts[key] : defaults[key];
+    }
+    if ('undefined' === typeof opts.symbols)
+        opts.symbols = defaults.symbols;
+
+    var lengths = [];
+    for (var key in opts.multicharmap) {
+        if (!opts.multicharmap.hasOwnProperty(key))
+            continue;
+
+        var len = key.length;
+        if (lengths.indexOf(len) === -1)
+            lengths.push(len);
+    }
+
+    var code, unicode, result = "";
+    for (var char, i = 0, l = string.length; i < l; i++) { char = string[i];
+        if (!lengths.some(function (len) {
+            var str = string.substr(i, len);
+            if (opts.multicharmap[str]) {
+                i += len - 1;
+                char = opts.multicharmap[str];
+                return true;
+            } else return false;
+        })) {
+            if (opts.charmap[char]) {
+                char = opts.charmap[char];
+                code = char.charCodeAt(0);
+            } else {
+                code = string.charCodeAt(i);
+            }
+            if (opts.symbols && (unicode = symbols(code))) {
+                char = unicode.name.toLowerCase();
+                for(var j = 0, rl = removelist.length; j < rl; j++) {
+                    char = char.replace(removelist[j], '');
+                }
+                // 【修正】/^\s+|\s+$/g による前後空白の除去は、空白の連続の後に空白以外が続くと
+                // 照合が二乗時間になる（ReDoS）。ここは短い Unicode 文字名だけが対象だが、
+                // 同じ書き方を残さないよう、線形時間で同じ空白集合を削る trim() に置き換える。
+                char = char.trim();
+            }
+        }
+        char = char.replace(/[^\w\s\-\.\_~]/g, ''); // allowed
+        if (opts.remove) char = char.replace(opts.remove, ''); // add flavour
+        result += char;
+    }
+    // 【修正】外部入力に由来する result に /^\s+|\s+$/g を使うと、'a' + 長い空白列 + 'a' のような
+    // 入力で \s+$ の照合が各開始位置で空白列を最後まで読んで失敗し、O(n^2) の時間がかかる（ReDoS）。
+    // String.prototype.trim() は \s と同じ空白・改行文字を前後から線形時間で削るので、結果を変えずに
+    // 正規表現のバックトラックをなくせる。
+    result = result.trim(); // trim leading/trailing spaces
+    result = result.replace(/[-\s]+/g, opts.replacement); // convert spaces
+    result = result.replace(opts.replacement+"$",''); // remove trailing separator
+    if (opts.lower)
+      result = result.toLowerCase();
+    return result;
+};
+
+slug.defaults = {
+    mode: 'pretty',
+};
+
+slug.multicharmap = slug.defaults.multicharmap = {
+    '<3': 'love', '&&': 'and', '||': 'or', 'w/': 'with',
+};
+
+// https://code.djangoproject.com/browser/django/trunk/django/contrib/admin/media/js/urlify.js
+slug.charmap  = slug.defaults.charmap = {
+    // latin
+    'À': 'A', 'Á': 'A', 'Â': 'A', 'Ã': 'A', 'Ä': 'A', 'Å': 'A', 'Æ': 'AE',
+    'Ç': 'C', 'È': 'E', 'É': 'E', 'Ê': 'E', 'Ë': 'E', 'Ì': 'I', 'Í': 'I',
+    'Î': 'I', 'Ï': 'I', 'Ð': 'D', 'Ñ': 'N', 'Ò': 'O', 'Ó': 'O', 'Ô': 'O',
+    'Õ': 'O', 'Ö': 'O', 'Ő': 'O', 'Ø': 'O', 'Ù': 'U', 'Ú': 'U', 'Û': 'U',
+    'Ü': 'U', 'Ű': 'U', 'Ý': 'Y', 'Þ': 'TH', 'ß': 'ss', 'à':'a', 'á':'a',
+    'â': 'a', 'ã': 'a', 'ä': 'a', 'å': 'a', 'æ': 'ae', 'ç': 'c', 'è': 'e',
+    'é': 'e', 'ê': 'e', 'ë': 'e', 'ì': 'i', 'í': 'i', 'î': 'i', 'ï': 'i',
+    'ð': 'd', 'ñ': 'n', 'ò': 'o', 'ó': 'o', 'ô': 'o', 'õ': 'o', 'ö': 'o',
+    'ő': 'o', 'ø': 'o', 'ù': 'u', 'ú': 'u', 'û': 'u', 'ü': 'u', 'ű': 'u',
+    'ý': 'y', 'þ': 'th', 'ÿ': 'y', 'ẞ': 'SS',
+    // greek
+    'α':'a', 'β':'b', 'γ':'g', 'δ':'d', 'ε':'e', 'ζ':'z', 'η':'h', 'θ':'8',
+    'ι':'i', 'κ':'k', 'λ':'l', 'μ':'m', 'ν':'n', 'ξ':'3', 'ο':'o', 'π':'p',
+    'ρ':'r', 'σ':'s', 'τ':'t', 'υ':'y', 'φ':'f', 'χ':'x', 'ψ':'ps', 'ω':'w',
+    'ά':'a', 'έ':'e', 'ί':'i', 'ό':'o', 'ύ':'y', 'ή':'h', 'ώ':'w', 'ς':'s',
+    'ϊ':'i', 'ΰ':'y', 'ϋ':'y', 'ΐ':'i',
+    'Α':'A', 'Β':'B', 'Γ':'G', 'Δ':'D', 'Ε':'E', 'Ζ':'Z', 'Η':'H', 'Θ':'8',
+    'Ι':'I', 'Κ':'K', 'Λ':'L', 'Μ':'M', 'Ν':'N', 'Ξ':'3', 'Ο':'O', 'Π':'P',
+    'Ρ':'R', 'Σ':'S', 'Τ':'T', 'Υ':'Y', 'Φ':'F', 'Χ':'X', 'Ψ':'PS', 'Ω':'W',
+    'Ά':'A', 'Έ':'E', 'Ί':'I', 'Ό':'O', 'Ύ':'Y', 'Ή':'H', 'Ώ':'W', 'Ϊ':'I',
+    'Ϋ':'Y',
+    // turkish
+    'ş':'s', 'Ş':'S', 'ı':'i', 'İ':'I',
+    'ğ':'g', 'Ğ':'G',
+    // russian
+    'а':'a', 'б':'b', 'в':'v', 'г':'g', 'д':'d', 'е':'e', 'ё':'yo', 'ж':'zh',
+    'з':'z', 'и':'i', 'й':'j', 'к':'k', 'л':'l', 'м':'m', 'н':'n', 'о':'o',
+    'п':'p', 'р':'r', 'с':'s', 'т':'t', 'у':'u', 'ф':'f', 'х':'h', 'ц':'c',
+    'ч':'ch', 'ш':'sh', 'щ':'sh', 'ъ':'u', 'ы':'y', 'ь':'', 'э':'e', 'ю':'yu',
+    'я':'ya',
+    'А':'A', 'Б':'B', 'В':'V', 'Г':'G', 'Д':'D', 'Е':'E', 'Ё':'Yo', 'Ж':'Zh',
+    'З':'Z', 'И':'I', 'Й':'J', 'К':'K', 'Л':'L', 'М':'M', 'Н':'N', 'О':'O',
+    'П':'P', 'Р':'R', 'С':'S', 'Т':'T', 'У':'U', 'Ф':'F', 'Х':'H', 'Ц':'C',
+    'Ч':'Ch', 'Ш':'Sh', 'Щ':'Sh', 'Ъ':'U', 'Ы':'Y', 'Ь':'', 'Э':'E', 'Ю':'Yu',
+    'Я':'Ya',
+    // ukranian
+    'Є':'Ye', 'І':'I', 'Ї':'Yi', 'Ґ':'G', 'є':'ye', 'і':'i', 'ї':'yi', 'ґ':'g',
+    // czech
+    'č':'c', 'ď':'d', 'ě':'e', 'ň': 'n', 'ř':'r', 'š':'s', 'ť':'t', 'ů':'u',
+    'ž':'z', 'Č':'C', 'Ď':'D', 'Ě':'E', 'Ň': 'N', 'Ř':'R', 'Š':'S', 'Ť':'T',
+    'Ů':'U', 'Ž':'Z',
+    // polish
+    'ą':'a', 'ć':'c', 'ę':'e', 'ł':'l', 'ń':'n', 'ś':'s', 'ź':'z',
+    'ż':'z', 'Ą':'A', 'Ć':'C', 'Ę':'E', 'Ł':'L', 'Ń':'N', 'Ś':'S',
+    'Ź':'Z', 'Ż':'Z',
+    // latvian
+    'ā':'a', 'ē':'e', 'ģ':'g', 'ī':'i', 'ķ':'k', 'ļ':'l', 'ņ':'n',
+    'ū':'u', 'Ā':'A', 'Ē':'E', 'Ģ':'G', 'Ī':'I',
+    'Ķ':'K', 'Ļ':'L', 'Ņ':'N', 'Ū':'U',
+    // lithuanian
+    'ė':'e', 'į':'i', 'ų':'u', 'Ė': 'E', 'Į': 'I', 'Ų':'U',
+    // romanian
+    'ț':'t', 'Ț':'T', 'ţ':'t', 'Ţ':'T', 'ș':'s', 'Ș':'S', 'ă':'a', 'Ă':'A',
+    // vietnamese
+    'Ạ': 'A', 'Ả': 'A', 'Ầ': 'A', 'Ấ': 'A', 'Ậ': 'A', 'Ẩ': 'A', 'Ẫ': 'A',
+    'Ằ': 'A', 'Ắ': 'A', 'Ặ': 'A', 'Ẳ': 'A', 'Ẵ': 'A', 'Ẹ': 'E', 'Ẻ': 'E',
+    'Ẽ': 'E', 'Ề': 'E', 'Ế': 'E', 'Ệ': 'E', 'Ể': 'E', 'Ễ': 'E', 'Ị': 'I',
+    'Ỉ': 'I', 'Ĩ': 'I', 'Ọ': 'O', 'Ỏ': 'O', 'Ồ': 'O', 'Ố': 'O', 'Ộ': 'O',
+    'Ổ': 'O', 'Ỗ': 'O', 'Ơ': 'O', 'Ờ': 'O', 'Ớ': 'O', 'Ợ': 'O', 'Ở': 'O',
+    'Ỡ': 'O', 'Ụ': 'U', 'Ủ': 'U', 'Ũ': 'U', 'Ư': 'U', 'Ừ': 'U', 'Ứ': 'U',
+    'Ự': 'U', 'Ử': 'U', 'Ữ': 'U', 'Ỳ': 'Y', 'Ỵ': 'Y', 'Ỷ': 'Y', 'Ỹ': 'Y',
+    'Đ': 'D', 'ạ': 'a', 'ả': 'a', 'ầ': 'a', 'ấ': 'a', 'ậ': 'a', 'ẩ': 'a',
+    'ẫ': 'a', 'ằ': 'a', 'ắ': 'a', 'ặ': 'a', 'ẳ': 'a', 'ẵ': 'a', 'ẹ': 'e',
+    'ẻ': 'e', 'ẽ': 'e', 'ề': 'e', 'ế': 'e', 'ệ': 'e', 'ể': 'e', 'ễ': 'e',
+    'ị': 'i', 'ỉ': 'i', 'ĩ': 'i', 'ọ': 'o', 'ỏ': 'o', 'ồ': 'o', 'ố': 'o',
+    'ộ': 'o', 'ổ': 'o', 'ỗ': 'o', 'ơ': 'o', 'ờ': 'o', 'ớ': 'o', 'ợ': 'o',
+    'ở': 'o', 'ỡ': 'o', 'ụ': 'u', 'ủ': 'u', 'ũ': 'u', 'ư': 'u', 'ừ': 'u',
+    'ứ': 'u', 'ự': 'u', 'ử': 'u', 'ữ': 'u', 'ỳ': 'y', 'ỵ': 'y', 'ỷ': 'y',
+    'ỹ': 'y', 'đ': 'd',
+    // currency
+    '€': 'euro', '₢': 'cruzeiro', '₣': 'french franc', '£': 'pound',
+    '₤': 'lira', '₥': 'mill', '₦': 'naira', '₧': 'peseta', '₨': 'rupee',
+    '₩': 'won', '₪': 'new shequel', '₫': 'dong', '₭': 'kip', '₮': 'tugrik',
+    '₯': 'drachma', '₰': 'penny', '₱': 'peso', '₲': 'guarani', '₳': 'austral',
+    '₴': 'hryvnia', '₵': 'cedi', '¢': 'cent', '¥': 'yen', '元': 'yuan',
+    '円': 'yen', '﷼': 'rial', '₠': 'ecu', '¤': 'currency', '฿': 'baht',
+    "$": 'dollar', '₹': 'indian rupee',
+    // symbols
+    '©':'(c)', 'œ': 'oe', 'Œ': 'OE', '∑': 'sum', '®': '(r)', '†': '+',
+    '“': '"', '”': '"', '‘': "'", '’': "'", '∂': 'd', 'ƒ': 'f', '™': 'tm',
+    '℠': 'sm', '…': '...', '˚': 'o', 'º': 'o', 'ª': 'a', '•': '*',
+    '∆': 'delta', '∞': 'infinity', '♥': 'love', '&': 'and', '|': 'or',
+    '<': 'less', '>': 'greater',
+};
+
+slug.defaults.modes = {
+    rfc3986: {
+        replacement: '-',
+        symbols: true,
+        remove: null,
+        lower: true,
+        charmap: slug.defaults.charmap,
+        multicharmap: slug.defaults.multicharmap,
+    },
+    pretty: {
+        replacement: '-',
+        symbols: true,
+        remove: /[.]/g,
+        lower: false,
+        charmap: slug.defaults.charmap,
+        multicharmap: slug.defaults.multicharmap,
+    },
+};
+
+// Be compatible with different module systems
+
+if (typeof define !== 'undefined' && define.amd) { // AMD
+    // dont load symbols table in the browser
+    for (var key in slug.defaults.modes) {
+        if (!slug.defaults.modes.hasOwnProperty(key))
+            continue;
+
+        slug.defaults.modes[key].symbols = false;
+    }
+    define([], function () {return slug});
+} else if (typeof module !== 'undefined' && module.exports) { // CommonJS
+    symbols(); // preload symbols table
+    module.exports = slug;
+} else { // Script tag
+    // dont load symbols table in the browser
+    for (var key in slug.defaults.modes) {
+        if (!slug.defaults.modes.hasOwnProperty(key))
+            continue;
+
+        slug.defaults.modes[key].symbols = false;
+    }
+    root.slug = slug;
+}
+
+}(this));
+```
+
+---
