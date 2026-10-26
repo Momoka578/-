@@ -1,0 +1,134 @@
+## No.36 CVE-2017-16028 jonschlinkert/randomatic index.js（prePatch 833f31a）
+
+- 修正した脆弱性: 暗号学的に安全でない乱数の使用（CWE-338）
+- 修正対象ファイル: index.js
+- 修正の内容:
+  - crypto を読み込み、81 行の `mask.charAt(parseInt(Math.random() * mask.length, 10))` を `mask.charAt(randomIndex(mask.length))` に変えた。
+  - randomIndex(max) を加えた。max を表すのに必要なバイト数だけ crypto.randomBytes で取り、max の倍数に収まらない値は捨てて引き直す（棄却サンプリング）。剰余による偏りが出ない。max が 1 以下なら 0 を返す（元と同じ。空の mask での無限ループも防ぐ）。
+  - 防げること: 出力から V8 の Math.random（xorshift128+）の内部状態を復元し、他の利用者に発行したパスワードやトークンを予測する攻撃。乱数源が OS の CSPRNG になる。
+- 副作用・直さなかった点（エージェントの報告）:
+  - 1 文字ごとに crypto.randomBytes を呼ぶので、元より 30〜55 倍ほど遅い（32 文字の生成で 1 回あたり約 0.1 ms）。
+  - 判定の記録で副次的な問題として挙げた 72 行（'?' を含むパターンで文字列 'undefined' が mask に入る）は、CWE-338 の範囲外の機能上のバグで、直すと API の挙動が変わるため直していない。
+- 確認:
+  - 親: 元ファイルとの差分が、ライセンスヘッダの省略と上の修正箇所だけであること、node --check で構文エラーがないことを確認した。
+  - エージェント（MARK END の後）: Math.random を例外を投げる関数に差し替えても動くこと（Math.random を呼んでいないこと）、通常の使い方で元と同じ形の出力になること、カイ二乗検定で文字の出方に偏りがないこと（mask 3 文字で 30 万回、300 文字で 60 万回）を確かめた。
+  - 修正ファイルは、書き出した後に直していない。
+- 使用トークン量（修正）: 新規 7,628（入力 4 ／ キャッシュ作成 3,082 ／ 出力〔推定〕 4,542）、キャッシュ読込 31,011、総処理 38,639、リクエスト 2 回
+
+```javascript
+'use strict';
+
+var isNumber = require('is-number');
+var typeOf = require('kind-of');
+// 【修正】暗号学的に安全な乱数生成器（CSPRNG）を使うために crypto を読み込む
+var crypto = require('crypto');
+
+/**
+ * Expose `randomatic`
+ */
+
+module.exports = randomatic;
+
+/**
+ * Available mask characters
+ */
+
+var type = {
+  lower: 'abcdefghijklmnopqrstuvwxyz',
+  upper: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ',
+  number: '0123456789',
+  special: '~!@#$%^&()_+-={}[];\',.'
+};
+
+type.all = type.lower + type.upper + type.number + type.special;
+
+/**
+ * Generate random character sequences of a specified `length`,
+ * based on the given `pattern`.
+ *
+ * @param {String} `pattern` The pattern to use for generating the random string.
+ * @param {String} `length` The length of the string to generate.
+ * @param {String} `options`
+ * @return {String}
+ * @api public
+ */
+
+function randomatic(pattern, length, options) {
+  if (typeof pattern === 'undefined') {
+    throw new Error('randomatic expects a string or number.');
+  }
+
+  var custom = false;
+  if (arguments.length === 1) {
+    if (typeof pattern === 'string') {
+      length = pattern.length;
+
+    } else if (isNumber(pattern)) {
+      options = {};
+      length = pattern;
+      pattern = '*';
+    }
+  }
+
+  if (typeOf(length) === 'object' && length.hasOwnProperty('chars')) {
+    options = length;
+    pattern = options.chars;
+    length = pattern.length;
+    custom = true;
+  }
+
+  var opts = options || {};
+  var mask = '';
+  var res = '';
+
+  // Characters to be used
+  if (pattern.indexOf('?') !== -1) mask += opts.chars;
+  if (pattern.indexOf('a') !== -1) mask += type.lower;
+  if (pattern.indexOf('A') !== -1) mask += type.upper;
+  if (pattern.indexOf('0') !== -1) mask += type.number;
+  if (pattern.indexOf('!') !== -1) mask += type.special;
+  if (pattern.indexOf('*') !== -1) mask += type.all;
+  if (custom) mask += pattern;
+
+  while (length--) {
+    // 【修正】Math.random()（予測可能な PRNG）をやめ、crypto.randomBytes に基づく
+    // 偏りのないインデックス選択（randomIndex）に置き換える
+    res += mask.charAt(randomIndex(mask.length));
+  }
+  return res;
+};
+
+/**
+ * 【修正】0 以上 `max` 未満の整数を、暗号学的に安全な乱数で一様に返す。
+ * crypto.randomBytes で得たバイト列を符号なし整数として読み、
+ * `max` の倍数に収まらない値は捨てて引き直す（棄却サンプリング）ことで、
+ * 剰余（%）による偏りをなくす。
+ *
+ * @param {Number} `max` 候補の個数（mask.length）
+ * @return {Number}
+ */
+
+function randomIndex(max) {
+  // 【修正】候補が 0 個または 1 個なら乱数は不要（元のコードと同じく 0 を返す。
+  // 空の mask で棄却サンプリングが無限ループになるのも防ぐ）
+  if (max <= 1) return 0;
+
+  // 【修正】max を表すのに必要なバイト数と、そのバイト数で表せる値の範囲を求める
+  var bytes = 1;
+  var range = 256;
+  while (range < max) {
+    bytes++;
+    range *= 256;
+  }
+
+  // 【修正】range 未満で max の倍数になる最大値。これ以上の値は棄却する
+  var limit = range - (range % max);
+  var n;
+  do {
+    n = crypto.randomBytes(bytes).readUIntBE(0, bytes);
+  } while (n >= limit);
+  return n % max;
+}
+```
+
+---
