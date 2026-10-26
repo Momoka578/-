@@ -1,0 +1,348 @@
+## No.41 CVE-2017-16042 tj/node-growl lib/growl.js（prePatch dc8aae0）
+
+- 修正した脆弱性: OS コマンドインジェクション（CWE-78／CWE-88）
+- 修正対象ファイル: lib/growl.js
+- 修正の内容:
+  - 7 行・289 行: `exec(args.join(' '), fn)` をやめ、`execFile(String(args[0]), args.slice(1).map(String), fn)` にした。/bin/sh -c を通らないので、$(...)、バッククォート、$VAR、;、| はただの文字として渡る。
+  - 12 行の `quote = JSON.stringify` を削除し、msg・title・subtitle・url・image は文字列のまま 1 つの引数として渡す。
+  - 216 行 priority: 照合に使った文字列をそのまま渡す（照合の後で値が変わるオブジェクトによる注入を防ぐ）。222 行 sound・227 行 name: isSafeOptionValue() を加え、空でない文字列で '-' で始まらない値だけを渡す（オプションの注入、CWE-88 を防ぐ）。
+  - 277-284 行 Custom（options.exec）: コマンド文字列を空白で区切ってコマンド名と引数に分け、%s を含む引数に message を埋め込む（replace には関数を渡し、$& などが置換パターンとして解釈されないようにした）。
+  - notify-send（Linux）: title・msg の前に '--' を入れ、'-' で始まる値がオプションとして解釈されないようにした。
+  - execFile に合わせた調整: '-t 0' を ['-t', '0'] に分けるなど。
+  - 防げること: 通知メッセージや sound・name などの値に $(コマンド) や ; を入れて、任意の OS コマンドを実行させる攻撃。
+- 副作用・直さなかった点（エージェントの報告）:
+  - options.exec では、シェルの構文（パイプ、クォート、リダイレクト、環境変数の展開）が使えなくなる。Windows では、シェルなしで .bat/.cmd を実行できない。
+  - terminal-notifier、growlnotify、growl では '--' を付けていない（各ツールが対応しているか確かめられないため）。msg などが '-' で始まるとオプションとして解釈される余地が残る（シェルのコマンド注入は起きない）。
+  - 脆弱性と関係しない既存の不具合（Linux-Growl や Custom で priority を指定すると TypeError になるなど）は直していない。
+- 確認:
+  - 親: 元ファイルとの差分を確認し、node --check で構文エラーがないことを確認した。
+  - エージェント（MARK END の後）: exec・execFile などを差し替えて、渡されるコマンドを記録した。元のコードでは `terminal-notifier -sound Purr; touch …` のような注入できる文字列ができ、修正版ではどの値も 1 つの引数にとどまった。options.exec に /bin/echo を指定して実際に実行すると、元のコードでは目印のファイルが作られ（注入が成立）、修正版では作られなかった。
+  - 修正ファイルは、書き出した後に直していない。
+- 使用トークン量（修正）: 新規 26,589（入力 4 ／ キャッシュ作成 5,768 ／ 出力〔推定〕 20,817）、キャッシュ読込 31,304、総処理 57,893、リクエスト 2 回
+
+```javascript
+// Growl - Copyright TJ Holowaychuk <tj@vision-media.ca> (MIT Licensed)
+
+/**
+ * Module dependencies.
+ */
+
+// 【修正】exec は /bin/sh -c（Windows では cmd.exe）を経由してシェルのメタ文字を解釈するため、
+//        シェルを経由せずにコマンド名と引数の配列を渡す execFile に置き換えた。
+var execFile = require('child_process').execFile
+  , fs = require('fs')
+  , path = require('path')
+  , exists = fs.existsSync || path.existsSync
+  , os = require('os')
+  // 【修正】quote = JSON.stringify は削除した。ダブルクォートで囲むだけで $(...) や `...` を防げず、
+  //        引数を配列で渡す execFile ではクォート自体が不要になるため。
+  , cmd;
+
+function which(name) {
+  var paths = process.env.PATH.split(':');
+  var loc;
+
+  for (var i = 0, len = paths.length; i < len; ++i) {
+    loc = path.join(paths[i], name);
+    if (exists(loc)) return loc;
+  }
+}
+
+// 【修正】sound や name のように、利用側から来た値をコマンドのオプションの値として渡してよいかを確かめる。
+//        文字列だけを受け付け、'-' で始まる値（別のオプションとして解釈されうる）は渡さない。
+function isSafeOptionValue(value) {
+  return typeof value === 'string' && value !== '' && value.charAt(0) !== '-';
+}
+
+switch(os.type()) {
+  case 'Darwin':
+    if (which('terminal-notifier')) {
+      cmd = {
+          type: "Darwin-NotificationCenter"
+        , pkg: "terminal-notifier"
+        , msg: '-message'
+        , title: '-title'
+        , subtitle: '-subtitle'
+        , icon: '-appIcon'
+        , sound:  '-sound'
+        , url: '-open'
+        , priority: {
+              cmd: '-execute'
+            , range: []
+          }
+      };
+    } else {
+      cmd = {
+          type: "Darwin-Growl"
+        , pkg: "growlnotify"
+        , msg: '-m'
+        , sticky: '--sticky'
+        , priority: {
+              cmd: '--priority'
+            , range: [
+                -2
+              , -1
+              , 0
+              , 1
+              , 2
+              , "Very Low"
+              , "Moderate"
+              , "Normal"
+              , "High"
+              , "Emergency"
+            ]
+          }
+      };
+    }
+    break;
+  case 'Linux':
+    if (which('growl')) {
+      cmd = {
+          type: "Linux-Growl"
+        , pkg: "growl"
+        , msg: '-m'
+        , title: '-title'
+        , subtitle: '-subtitle'
+        , host: {
+            cmd: '-H'
+          , hostname: '192.168.33.1'
+        }
+      };
+    } else {
+      cmd = {
+          type: "Linux"
+        , pkg: "notify-send"
+        , msg: ''
+        // 【修正】execFile では配列の 1 要素が 1 つの引数になるので、'-t 0' を 2 つの引数に分けて持つ。
+        , sticky: ['-t', '0']
+        , icon: '-i'
+        , priority: {
+            cmd: '-u'
+          , range: [
+              "low"
+            , "normal"
+            , "critical"
+          ]
+        }
+      };
+    }
+    break;
+  case 'Windows_NT':
+    cmd = {
+        type: "Windows"
+      , pkg: "growlnotify"
+      , msg: ''
+      , sticky: '/s:true'
+      , title: '/t:'
+      , icon: '/i:'
+      , url: '/cu:'
+      , priority: {
+            cmd: '/p:'
+          , range: [
+              -2
+            , -1
+            , 0
+            , 1
+            , 2
+          ]
+        }
+    };
+    break;
+}
+
+/**
+ * Expose `growl`.
+ */
+
+exports = module.exports = growl;
+
+/**
+ * Node-growl version.
+ */
+
+exports.version = '1.4.1'
+
+/**
+ * Send growl notification _msg_ with _options_.
+ *
+ * Options:
+ *
+ *  - title   Notification title
+ *  - sticky  Make the notification stick (defaults to false)
+ *  - priority  Specify an int or named key (default is 0)
+ *  - name    Application name (defaults to growlnotify)
+ *  - sound   Sound efect ( in OSx defined in preferences -> sound -> effects) * works only in OSX > 10.8x
+ *  - image
+ *    - path to an icon sets --iconpath
+ *    - path to an image sets --image
+ *    - capitalized word sets --appIcon
+ *    - filename uses extname as --icon
+ *    - otherwise treated as --icon
+ *
+ * Examples:
+ *
+ *   growl('New email')
+ *   growl('5 new emails', { title: 'Thunderbird' })
+ *   growl('5 new emails', { title: 'Thunderbird', sound: 'Purr' })
+ *   growl('Email sent', function(){
+ *     // ... notification sent
+ *   })
+ *
+ * @param {string} msg
+ * @param {object} options
+ * @param {function} fn
+ * @api public
+ */
+
+function growl(msg, options, fn) {
+  var image
+    , args
+    , options = options || {}
+    , fn = fn || function(){};
+
+  if (options.exec) {
+    cmd = {
+        type: "Custom"
+      , pkg: options.exec
+      , range: []
+    };
+  }
+
+  // noop
+  if (!cmd) return fn(new Error('growl not supported on this platform'));
+  args = [cmd.pkg];
+
+  // image
+  // 【修正】image は quote() で囲まず、そのまま 1 つの引数として渡す（この switch 内すべて）。
+  if (image = options.image) {
+    switch(cmd.type) {
+      case 'Darwin-Growl':
+        var flag, ext = path.extname(image).substr(1)
+        flag = flag || ext == 'icns' && 'iconpath'
+        flag = flag || /^[A-Z]/.test(image) && 'appIcon'
+        flag = flag || /^png|gif|jpe?g$/.test(ext) && 'image'
+        flag = flag || ext && (image = ext) && 'icon'
+        flag = flag || 'icon'
+        args.push('--' + flag, image)
+        break;
+      case 'Darwin-NotificationCenter':
+        args.push(cmd.icon, image);
+        break;
+      case 'Linux':
+        args.push(cmd.icon, image);
+        // libnotify defaults to sticky, set a hint for transient notifications
+        if (!options.sticky) args.push('--hint=int:transient:1');
+        break;
+      case 'Windows':
+        args.push(cmd.icon + image);
+        break;
+    }
+  }
+
+  // sticky
+  // 【修正】sticky のオプションがない種類（cmd.sticky が undefined）では引数を足さない
+  //        （execFile では undefined が "undefined" という引数になってしまうため）。
+  //        Linux の ['-t', '0'] のような配列は別々の引数として足す。
+  if (options.sticky && cmd.sticky) args.push.apply(args, [].concat(cmd.sticky));
+
+  // priority
+  if (options.priority) {
+    var priority = options.priority + '';
+    var checkindexOf = cmd.priority.range.indexOf(priority);
+    if (~cmd.priority.range.indexOf(priority)) {
+      // 【修正】照合に使った文字列 priority をそのまま渡す（options.priority を渡すと、照合後に
+      //        別の値へ文字列化されるオブジェクトを渡されうるため）。また、オブジェクトの
+      //        cmd.priority ではなく、オプション名の cmd.priority.cmd を渡す。
+      args.push(cmd.priority.cmd, priority);
+    }
+  }
+
+  //sound
+  // 【修正】sound は文字列で、'-' で始まらない場合だけ渡す。
+  if(options.sound && cmd.type === 'Darwin-NotificationCenter' && isSafeOptionValue(options.sound)){
+    args.push(cmd.sound, options.sound)
+  }
+
+  // name
+  // 【修正】name も sound と同じく、文字列で '-' で始まらない場合だけ渡す。
+  if (options.name && cmd.type === "Darwin-Growl" && isSafeOptionValue(options.name)) {
+    args.push('--name', options.name);
+  }
+
+  // 【修正】以下の switch では quote() とその後の改行の置換をやめ、msg・title・subtitle・url を
+  //        文字列のまま 1 つずつの引数として渡す（シェルを通らないので改行もそのまま保たれる）。
+  switch(cmd.type) {
+    case 'Darwin-Growl':
+      args.push(cmd.msg);
+      args.push(String(msg));
+      if (options.title) args.push(String(options.title));
+      break;
+    case 'Darwin-NotificationCenter':
+      args.push(cmd.msg);
+      args.push(String(msg));
+      if (options.title) {
+        args.push(cmd.title);
+        args.push(String(options.title));
+      }
+      if (options.subtitle) {
+        args.push(cmd.subtitle);
+        args.push(String(options.subtitle));
+      }
+      if (options.url) {
+        args.push(cmd.url);
+        args.push(String(options.url));
+      }
+      break;
+    case 'Linux-Growl':
+      args.push(cmd.msg);
+      args.push(String(msg));
+      if (options.title) args.push(String(options.title));
+      if (cmd.host) {
+        args.push(cmd.host.cmd, cmd.host.hostname)
+      }
+      break;
+    case 'Linux':
+      // 【修正】title や msg が '-' で始まっても notify-send のオプションとして解釈されないよう、
+      //        '--' でオプションの終わりを示してから渡す。
+      args.push('--');
+      if (options.title) {
+        args.push(String(options.title));
+        // 【修正】cmd.msg は空文字で、execFile では空の引数になってしまうため渡さない。
+        args.push(String(msg));
+      } else {
+        args.push(String(msg));
+      }
+      break;
+    case 'Windows':
+      args.push(String(msg));
+      if (options.title) args.push(cmd.title + options.title);
+      if (options.url) args.push(cmd.url + options.url);
+      break;
+    case 'Custom':
+      // 【修正】options.exec のコマンド文字列を空白で区切ってコマンド名と引数に分け、message は
+      //        シェルを通さずに引数として渡す。%s を含む引数には message を埋め込み（replace には関数を渡し、
+      //        message 内の $& や $1 などが置換パターンとして解釈されないようにする）、%s がなければ
+      //        最後の引数として足す。
+      (function(origCommand) {
+        var message = String(options.title
+          ? options.title + ': ' + msg
+          : msg);
+        var replaced = false;
+        var parts = String(origCommand).trim().split(/\s+/).map(function(part) {
+          return part.replace(/(^|[^%])%s/g, function(all, before) {
+            replaced = true;
+            return before + message;
+          });
+        });
+        args = parts.concat(args.slice(1));
+        if (!replaced) args.push(message);
+      })(args[0]);
+      break;
+  }
+
+  // execute
+  // 【修正】args.join(' ') を exec でシェルに渡すのをやめ、execFile でコマンド名と引数の配列を直接渡す。
+  //        引数はシェルに解釈されないので、$(...)・`...`・$VAR・;・| などを含んでいてもコマンドは実行されない。
+  execFile(String(args[0]), args.slice(1).map(String), fn);
+};
+```
