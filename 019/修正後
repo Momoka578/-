@@ -1,12 +1,20 @@
-# No.19 CVE-2018-16480 tnantoka/public bin/public（prePatch 6d152eb）
+## No.19 CVE-2018-16480 tnantoka/public bin/public（prePatch 6d152eb）
 
-- 修正対象ファイル: public
-- 修正箇所のコメント（コード内から抜粋）:
-  - `// 修正: HTML に埋め込む文字列をエスケープする関数を追加`
-  - `// 修正: エラー内容（パスを含む）をエスケープしてから出力`
-  - `// 修正: エラー内容（パスを含む）をエスケープしてから出力`
-  - `// 修正: ファイル名を href 属性と要素内容に埋め込む前に HTML エスケープする`
-  - `// 修正: リクエストパスから作った abs も HTML エスケープしてから出力`
+- 修正した脆弱性: パストラバーサル（CWE-22）
+- 修正対象ファイル: bin/public（"修正版コード" No.19 の XSS 修正版をもとにした。このコードで XSS と CWE-22 の両方が直っている）
+- 修正の内容:
+  - `var root = path.resolve(dir);` の直後に、root の末尾に区切り文字を付けた rootPrefix を加えた。root が "/" のように最初から区切り文字で終わる場合は、二重に付けない。
+  - アクセスの判定を `abs.indexOf(root) !== 0` から `abs !== root && abs.indexOf(rootPrefix) !== 0` に変えた。root と完全に一致するか、root＋区切り文字で始まるパスだけを許可する。
+  - 防げること: root が /srv/pub のときの /srv/pub/../pub2/secret のように、同じ接頭辞を持つ兄弟ディレクトリのファイルを読む攻撃。
+- 直さなかった点:
+  - 公開ディレクトリ内のシンボリックリンクが外を指す場合（fs.realpath は使っていない）。判定で指摘したのはプレフィックス比較だけなので、最小限の修正にした（エージェントの判断）。
+  - 判定の根拠で触れた「内部パスの開示」（エラー時に err の内容を表示する）は、判定の脆弱性の種類に入れていないので対象外にした。表示する内容は XSS の修正でエスケープされている。
+  - エージェントは、機能上の不具合（今の Node では err.errno が負の値になるため 404 の分岐に入らない）にも気づいたが、安全には影響しないので直していない。
+- 確認:
+  - 親: XSS 修正版との差分が上の 2 か所（コメントを含む）だけであること、XSS の修正部分が変わっていないこと、node --check で構文エラーがないことを確認した。
+  - エージェント（MARK END の後）: テスト用のディレクトリでサーバを起動して確かめた。/../pub2/secret.txt などの兄弟ディレクトリへのアクセスは、修正前は 200（読める）、修正後は 403 になった。通常のファイルとディレクトリ一覧は 200 のままだった。
+  - 修正ファイルは、書き出した後に直していない。
+- 使用トークン量（修正）: 新規 9,811（入力 4 ／ キャッシュ作成 6,127 ／ 出力〔推定〕 3,680）、キャッシュ読込 31,583、総処理 41,394、リクエスト 2 回
 
 ```javascript
 #!/usr/bin/env node
@@ -93,6 +101,9 @@ switch (args[0]) {
     }
 }
 var root = path.resolve(dir);
+// 【修正】公開ルートの末尾に区切り文字を付けた接頭辞を用意する
+// （root が "/" や "C:\" のように既に区切り文字で終わる場合は二重に付けない）
+var rootPrefix = root.slice(-1) === path.sep ? root : root + path.sep;
 
 if (path) {
   http.createServer(function(req, res) {
@@ -102,7 +113,10 @@ if (path) {
     var abs = path.resolve(filePath);
     console.log(new Date().toString(), abs);
 
-    if (abs.indexOf(root) !== 0) {
+    // 【修正】区切り文字なしの前方一致（abs.indexOf(root) !== 0）では、root が /srv/pub のとき
+    // /srv/pub/../pub2/secret（= /srv/pub2/secret）も通ってしまうため、
+    // 「root と完全に一致する」か「root + 区切り文字 で始まる」場合だけ許可する
+    if (abs !== root && abs.indexOf(rootPrefix) !== 0) {
       res.writeHead(403, { 'Content-Type': 'text/plain' });
       res.end('Forbidden\n');
       return;
@@ -152,5 +166,3 @@ if (path) {
   error(USAGE);
 }
 ```
-
----
