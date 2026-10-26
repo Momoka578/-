@@ -1,0 +1,165 @@
+## No.35 CVE-2017-16026 request/request lib/multipart.js（prePatch 85f8235）
+
+- 修正した脆弱性: 無制限のメモリ確保と未初期化メモリの漏えい（CWE-770／CWE-908・CWE-200）
+- 修正対象ファイル: lib/multipart.js
+- 修正の内容:
+  - isValidBody() を加え、Buffer に変換してよい body の型を、文字列・Buffer・型付き配列に限定した（型付き配列の判定には、同じコミットの request.js も使っている is-typedarray を使う）。
+  - toBuffer() を加えた。Buffer はそのまま使い、それ以外は Buffer.from でコピーする（Buffer.from がない古い Node だけ new Buffer を使う。渡るのは検査済みの文字列か型付き配列だけ）。
+  - isChunked（元の 34 行の後）: body がストリームでもなく、許可した型でもないときは、既存の「Body attribute missing」と同じく request.emit('error') でエラーを通知する。
+  - add()（元の 71 行）: new Buffer(part) を直接呼ばない。型が不正なら何も確保せずに捨て、正しい型なら toBuffer() で変換する。
+  - 防げること: 数値の body による巨大なメモリ確保（DoS）と、未初期化のヒープ内容が通信先に送られる漏えい。{length: 1e9} のようなオブジェクトによる大量確保も拒否する。
+- 副作用・直さなかった点（エージェントの報告）:
+  - Buffer の body はコピーせずにそのまま使う（判定時の修正案のとおり）。
+  - 不正な型のときはエラーを通知するだけで、リクエストは中止しない（既存のエラー処理と同じ扱い）。
+  - 判定の記録で副次的な問題として挙げた、パートのヘッダの CRLF インジェクション（元の 82 行）は、今回の対象（CWE-770／908／200）の範囲外として直していない。
+- 確認:
+  - 親: 元ファイルとの差分が上の修正箇所だけであること、node --check で構文エラーがないことを確認した。
+  - エージェント（MARK END の後）: 依存パッケージをスタブにして 12 件のテストを行い、すべて通った（文字列と Buffer の正常系、body が 1e10 のときメモリが増えずにエラーになること、body が 64 のとき未初期化のバッファが本文に入らないこと、ストリームの転送、古い Node 用の分岐など）。元のコードは実行していない。
+  - エージェントは、エラー処理と依存パッケージを確かめるため、同じ prePatch コミットの request.js も取得して読んだ（指示で許可した範囲）。
+  - 修正ファイルは、書き出した後に直していない（確認の途中でテストスクリプトの誤りを直したが、修正ファイルは変えていない）。
+- 使用トークン量（修正）: 新規 20,995（入力 12 ／ キャッシュ作成 11,062 ／ 出力〔推定〕 9,921）、キャッシュ読込 116,729、総処理 137,724、リクエスト 6 回
+
+```javascript
+'use strict'
+
+var uuid = require('node-uuid')
+  , CombinedStream = require('combined-stream')
+  , isstream = require('isstream')
+  , isTypedArray = require('is-typedarray').strict // 【修正】型検査のため追加（request.js と同じ依存パッケージ）
+
+
+// 【修正】Buffer に変換してよい body の型を、文字列・Buffer・型付き配列に限定する。
+// 数値やその他の値を new Buffer() に渡すと、その値の長さの未初期化メモリが確保されるため拒否する。
+function isValidBody (body) {
+  return typeof body === 'string' || Buffer.isBuffer(body) || isTypedArray(body)
+}
+
+// 【修正】検査済みの値だけを Buffer に変換する。Buffer はそのまま使い、
+// それ以外は Buffer.from（古い Node では new Buffer）で内容をコピーする。
+// 引数は数値にならないので、未初期化メモリの確保や巨大な確保は起きない。
+function toBuffer (data) {
+  if (Buffer.isBuffer(data)) {
+    return data
+  }
+  if (typeof Buffer.from === 'function' &&
+      (typeof Uint8Array === 'undefined' || Buffer.from !== Uint8Array.from)) {
+    return Buffer.from(data)
+  }
+  return new Buffer(data)
+}
+
+function Multipart (request) {
+  this.request = request
+  this.boundary = uuid()
+  this.chunked = false
+  this.body = null
+}
+
+Multipart.prototype.isChunked = function (options) {
+  var self = this
+    , chunked = false
+    , parts = options.data || options
+
+  if (!parts.forEach) {
+    self.request.emit('error', new Error('Argument error, options.multipart.'))
+  }
+
+  if (options.chunked !== undefined) {
+    chunked = options.chunked
+  }
+
+  if (self.request.getHeader('transfer-encoding') === 'chunked') {
+    chunked = true
+  }
+
+  if (!chunked) {
+    parts.forEach(function (part) {
+      if (typeof part.body === 'undefined') {
+        self.request.emit('error', new Error('Body attribute missing in multipart.'))
+      } else if (!isstream(part.body) && !isValidBody(part.body)) {
+        // 【修正】数値などの不正な型の body を拒否してエラーにする
+        self.request.emit('error', new Error('Invalid body type in multipart. ' +
+          'Body must be a string, Buffer, typed array or stream.'))
+      }
+      if (isstream(part.body)) {
+        chunked = true
+      }
+    })
+  }
+
+  return chunked
+}
+
+Multipart.prototype.setHeaders = function (chunked) {
+  var self = this
+
+  if (chunked && !self.request.hasHeader('transfer-encoding')) {
+    self.request.setHeader('transfer-encoding', 'chunked')
+  }
+
+  var header = self.request.getHeader('content-type')
+
+  if (!header || header.indexOf('multipart') === -1) {
+    self.request.setHeader('content-type', 'multipart/related; boundary=' + self.boundary)
+  } else {
+    if (header.indexOf('boundary') !== -1) {
+      self.boundary = header.replace(/.*boundary=([^\s;]+).*/, '$1')
+    } else {
+      self.request.setHeader('content-type', header + '; boundary=' + self.boundary)
+    }
+  }
+}
+
+Multipart.prototype.build = function (parts, chunked) {
+  var self = this
+  var body = chunked ? new CombinedStream() : []
+
+  function add (part) {
+    if (chunked) {
+      return body.append(part)
+    }
+    // 【修正】new Buffer(part) を直接呼ばない。不正な型（数値など）はメモリを確保せずに捨てる
+    // （エラーは isChunked で通知済み）。
+    if (!isValidBody(part)) {
+      return
+    }
+    return body.push(toBuffer(part))
+  }
+
+  if (self.request.preambleCRLF) {
+    add('\r\n')
+  }
+
+  parts.forEach(function (part) {
+    var preamble = '--' + self.boundary + '\r\n'
+    Object.keys(part).forEach(function (key) {
+      if (key === 'body') { return }
+      preamble += key + ': ' + part[key] + '\r\n'
+    })
+    preamble += '\r\n'
+    add(preamble)
+    add(part.body)
+    add('\r\n')
+  })
+  add('--' + self.boundary + '--')
+
+  if (self.request.postambleCRLF) {
+    add('\r\n')
+  }
+
+  return body
+}
+
+Multipart.prototype.onRequest = function (options) {
+  var self = this
+
+  var chunked = self.isChunked(options)
+    , parts = options.data || options
+
+  self.setHeaders(chunked)
+  self.chunked = chunked
+  self.body = self.build(parts, chunked)
+}
+
+exports.Multipart = Multipart
+```
