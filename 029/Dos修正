@@ -1,0 +1,282 @@
+## No.29 CVE-2017-18077 juliangruber/brace-expansion index.js（prePatch 265f6cd）
+
+- 修正した脆弱性: 正規表現 DoS（ReDoS, 指数時間）＋連番展開によるメモリ枯渇
+- 修正対象ファイル: index.js
+- 修正の内容:
+  - L109（ReDoS, 指数時間）: `/^(.*,)+(.+)?$/.test(m.body)` を、`m.body.indexOf(',') !== -1 && !/[\n\r\u2028\u2029]/.test(m.body)` に変えた。元の正規表現が真になるのは「カンマを含み、'.' に一致しない行終端文字を含まない」場合なので、同じ条件を線形時間の 2 つの判定で調べる（判定結果は元と同じ）。
+  - L112（判定の記録にはない、同じ種類の O(n^2) の ReDoS。エージェントが追加で直した）: `/,.*\}/` を、同じ条件を線形時間で調べる `/,[^,}\n\r\u2028\u2029]*\}/` に変えた。
+  - 連番展開・直積の上限（付随して指摘したメモリ枯渇の DoS）: 1 回の展開で作る要素数（100,000）と合計文字数（64Mi）の上限を設け、超えたら RangeError を投げる。連番のループ、選択肢の展開、直積のループなど 4 か所で確認する。2^53 を超える数値で i += incr が値を変えずに無限ループになる場合も、ここで止まる。
+  - 増分 0（`{1..5..0}`）: 元は無限ループになっていたので、Bash と同じく 1 として扱うようにした。
+- 副作用・直さなかった点（エージェントの報告）:
+  - 上限を超えると例外を投げるので、公開 API の挙動が変わる（例: `{1..100001}` は元では成功し、修正後は例外になる）。途中で打ち切ると誤った結果を黙って返すことになるため、例外にした。
+  - L112 の再帰（'}' が多い入力で再帰が深くなる）、parseCommaParts の再帰、依存先の balanced-match は、判定の記録の範囲外なので触れていない。
+- 確認:
+  - 親: 元ファイルとの差分が上の修正箇所（コメントを含む）だけであること、node --check で構文エラーがないことを確認した。
+  - **MARK END の後の手直し**: Write で書き出したときに、コードとコメント中の `\u2028` `\u2029`（行区切り文字のエスケープ表記）が実体の文字に変わり、構文エラーになっていた。エージェントが MARK END の後に、perl でエスケープ表記に戻した（処理の中身は変えていない）。この手直しの 2 リクエストは、トークン量の区間に含めていない。
+  - エージェント（MARK END の後）: 新しい判定が元の正規表現 2 つと同じ結果になることを 2,622,222 件で確認した（不一致 0）。展開結果は 300,038 件で元と一致した。カンマ 26 個の ReDoS 入力は元が 10.0 秒、修正版が 0 ms。`{1..100000000}` は元がヒープ枯渇、修正版が 19 ms で RangeError。
+  - エージェントは動作確認のため、prePatch の package.json と、依存ライブラリ（balanced-match 0.4.2、concat-map 0.0.1）を npm レジストリから取得した（MARK END の後。正解データではない）。
+  - エージェントの確認スクリプトの出力が長かったため、ハーネスがその出力を ~/.claude/ 以下の tool-results に自動で保存した。エージェントはそのファイルを読んでいない（記録で確認した）。
+- 使用トークン量（修正）: 新規 27,055（入力 4 ／ キャッシュ作成 4,693 ／ 出力〔推定〕 22,358）、キャッシュ読込 31,514、総処理 58,569、リクエスト 2 回
+
+```javascript
+var concatMap = require('concat-map');
+var balanced = require('balanced-match');
+
+module.exports = expandTop;
+
+var escSlash = '\0SLASH'+Math.random()+'\0';
+var escOpen = '\0OPEN'+Math.random()+'\0';
+var escClose = '\0CLOSE'+Math.random()+'\0';
+var escComma = '\0COMMA'+Math.random()+'\0';
+var escPeriod = '\0PERIOD'+Math.random()+'\0';
+
+// 【修正】展開結果の上限。連番展開（{1..100000000} など）や中かっこの組み合わせ（直積）で
+// 巨大な配列・文字列が作られ、メモリと CPU を使い果たす DoS を防ぐ。
+// 1 回の expand が作る要素数と合計文字数（中間結果を含む）がこれを超えたら例外を投げる。
+var MAX_EXPANSIONS = 100000;
+var MAX_TOTAL_LENGTH = 64 * 1024 * 1024;
+
+// 【修正】上限の確認。超えた場合は途中で打ち切って黙って誤った結果を返すのではなく、例外にする
+function checkLimit(count, length) {
+  if (count > MAX_EXPANSIONS || length > MAX_TOTAL_LENGTH)
+    throw new RangeError('brace-expansion: too many expansions (max ' +
+      MAX_EXPANSIONS + ' items, ' + MAX_TOTAL_LENGTH + ' chars)');
+}
+
+// 【修正】配列内の文字列の合計文字数
+function totalLength(arr) {
+  var len = 0;
+  for (var i = 0; i < arr.length; i++)
+    len += arr[i].length;
+  return len;
+}
+
+function numeric(str) {
+  return parseInt(str, 10) == str
+    ? parseInt(str, 10)
+    : str.charCodeAt(0);
+}
+
+function escapeBraces(str) {
+  return str.split('\\\\').join(escSlash)
+            .split('\\{').join(escOpen)
+            .split('\\}').join(escClose)
+            .split('\\,').join(escComma)
+            .split('\\.').join(escPeriod);
+}
+
+function unescapeBraces(str) {
+  return str.split(escSlash).join('\\')
+            .split(escOpen).join('{')
+            .split(escClose).join('}')
+            .split(escComma).join(',')
+            .split(escPeriod).join('.');
+}
+
+
+// Basically just str.split(","), but handling cases
+// where we have nested braced sections, which should be
+// treated as individual members, like {a,{b,c},d}
+function parseCommaParts(str) {
+  if (!str)
+    return [''];
+
+  var parts = [];
+  var m = balanced('{', '}', str);
+
+  if (!m)
+    return str.split(',');
+
+  var pre = m.pre;
+  var body = m.body;
+  var post = m.post;
+  var p = pre.split(',');
+
+  p[p.length-1] += '{' + body + '}';
+  var postParts = parseCommaParts(post);
+  if (post.length) {
+    p[p.length-1] += postParts.shift();
+    p.push.apply(p, postParts);
+  }
+
+  parts.push.apply(parts, p);
+
+  return parts;
+}
+
+function expandTop(str) {
+  if (!str)
+    return [];
+
+  // I don't know why Bash 4.3 does this, but it does.
+  // Anything starting with {} will have the first two bytes preserved
+  // but *only* at the top level, so {},a}b will not expand to anything,
+  // but a{},b}c will be expanded to [a}c,abc].
+  // One could argue that this is a bug in Bash, but since the goal of
+  // this module is to match Bash's rules, we escape a leading {}
+  if (str.substr(0, 2) === '{}') {
+    str = '\\{\\}' + str.substr(2);
+  }
+
+  return expand(escapeBraces(str), true).map(unescapeBraces);
+}
+
+function identity(e) {
+  return e;
+}
+
+function embrace(str) {
+  return '{' + str + '}';
+}
+function isPadded(el) {
+  return /^-?0\d/.test(el);
+}
+
+function lte(i, y) {
+  return i <= y;
+}
+function gte(i, y) {
+  return i >= y;
+}
+
+function expand(str, isTop) {
+  var expansions = [];
+
+  var m = balanced('{', '}', str);
+  if (!m || /\$$/.test(m.pre)) return [str];
+
+  var isNumericSequence = /^-?\d+\.\.-?\d+(?:\.\.-?\d+)?$/.test(m.body);
+  var isAlphaSequence = /^[a-zA-Z]\.\.[a-zA-Z](?:\.\.-?\d+)?$/.test(m.body);
+  var isSequence = isNumericSequence || isAlphaSequence;
+  // 【修正】元の /^(.*,)+(.+)?$/ は量指定子の入れ子 (.*,)+ により、一致しない入力
+  // （カンマの列の後に改行など）で指数時間のバックトラックを起こす（ReDoS）。
+  // 元の正規表現が真になる条件は「カンマを 1 個以上含み、かつ '.' に一致しない
+  // 行終端文字（\n \r \u2028 \u2029）を含まない」ことなので、同じ条件を線形時間の
+  // 2 つの判定で調べる（判定結果は元と同じ）。
+  var isOptions = m.body.indexOf(',') !== -1 &&
+    !/[\n\r\u2028\u2029]/.test(m.body);
+  if (!isSequence && !isOptions) {
+    // {a},b}
+    // 【修正】元の /,.*\}/ は '}' のないカンマの列などで O(n^2) のバックトラックになる。
+    // 「カンマの後に行終端文字を挟まずに '}' がある」という同じ条件を、
+    // カンマと '}' と行終端文字を除いた文字クラスで線形時間に調べる。
+    if (m.post.match(/,[^,}\n\r\u2028\u2029]*\}/)) {
+      str = m.pre + '{' + m.body + escClose + m.post;
+      return expand(str);
+    }
+    return [str];
+  }
+
+  var n;
+  if (isSequence) {
+    n = m.body.split(/\.\./);
+  } else {
+    n = parseCommaParts(m.body);
+    if (n.length === 1) {
+      // x{{a,b}}y ==> x{a}y x{b}y
+      n = expand(n[0], false).map(embrace);
+      if (n.length === 1) {
+        var post = m.post.length
+          ? expand(m.post, false)
+          : [''];
+        // 【修正】結果の要素数・合計文字数を確認してから返す
+        var single = post.map(function(p) {
+          return m.pre + n[0] + p;
+        });
+        checkLimit(single.length, totalLength(single));
+        return single;
+      }
+    }
+  }
+
+  // at this point, n is the parts, and we know it's not a comma set
+  // with a single entry.
+
+  // no need to expand pre, since it is guaranteed to be free of brace-sets
+  var pre = m.pre;
+  var post = m.post.length
+    ? expand(m.post, false)
+    : [''];
+
+  var N;
+
+  if (isSequence) {
+    var x = numeric(n[0]);
+    var y = numeric(n[1]);
+    var width = Math.max(n[0].length, n[1].length)
+    var incr = n.length == 3
+      ? Math.abs(numeric(n[2]))
+      : 1;
+    // 【修正】増分 0（{1..5..0} など）では i が進まず無限ループになり配列が際限なく
+    // 大きくなるため、Bash と同じく 1 として扱う
+    if (incr === 0)
+      incr = 1;
+    var test = lte;
+    var reverse = y < x;
+    if (reverse) {
+      incr *= -1;
+      test = gte;
+    }
+    var pad = n.some(isPadded);
+
+    N = [];
+    var seqLength = 0; // 【修正】連番の合計文字数
+
+    for (var i = x; test(i, y); i += incr) {
+      var c;
+      if (isAlphaSequence) {
+        c = String.fromCharCode(i);
+        if (c === '\\')
+          c = '';
+      } else {
+        c = String(i);
+        if (pad) {
+          var need = width - c.length;
+          if (need > 0) {
+            var z = new Array(need + 1).join('0');
+            if (i < 0)
+              c = '-' + z + c.slice(1);
+            else
+              c = z + c;
+          }
+        }
+      }
+      N.push(c);
+      // 【修正】連番の個数と合計文字数（ゼロ埋めの長さを含む）が上限を超えたら中止する。
+      // 2^53 を超える巨大な数値で i += incr が値を変えない場合の無限ループもここで止まる
+      seqLength += c.length;
+      checkLimit(N.length, seqLength);
+    }
+  } else {
+    // 【修正】選択肢を 1 つ展開するたびに、それまでの合計の要素数・文字数を確認する
+    var optCount = 0;
+    var optLength = 0;
+    N = concatMap(n, function(el) {
+      var r = expand(el, false);
+      optCount += r.length;
+      optLength += totalLength(r);
+      checkLimit(optCount, optLength);
+      return r;
+    });
+  }
+
+  // 【修正】直積（N × post）の組み合わせ数を先に確認する。トップレベルでは空文字列が
+  // 結果から除かれるため、push の数だけでなくループの回数そのものを制限する
+  checkLimit(N.length * post.length, 0);
+  var outLength = 0; // 【修正】結果の合計文字数
+
+  for (var j = 0; j < N.length; j++) {
+    for (var k = 0; k < post.length; k++) {
+      var expansion = pre + N[j] + post[k];
+      if (!isTop || isSequence || expansion) {
+        expansions.push(expansion);
+        // 【修正】結果の合計文字数が上限を超えたら中止する
+        outLength += expansion.length;
+        checkLimit(expansions.length, outLength);
+      }
+    }
+  }
+
+  return expansions;
+}
+```
