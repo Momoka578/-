@@ -1,0 +1,161 @@
+## No.37 CVE-2017-16029 henrytseng/hostr lib/routes/statics.js（prePatch 5827ba4）
+
+- 修正した脆弱性: パストラバーサル／任意ファイルの読み取り（CWE-22）
+- 修正対象ファイル: lib/routes/statics.js
+- 修正の内容:
+  - _resolveFilePath() を加えた。パス名を decodeURIComponent でデコードし（不正なエンコードは拒否）、ヌルバイトを含むパスを拒否し、path.join で '..' や '.' を解決した絶対パスにする。その結果が公開ルート（path.resolve(process.cwd()) ＋ 区切り文字）で始まらなければ null を返す。
+  - 25-28 行の `process.cwd()+pathname` の単純な連結をやめ、_resolveFilePath() の結果だけを使う。null のときは fs.stat を呼ばずに 403 を返す。
+  - 403 で早めに返す場合もログが残るよう、ログ出力（res.on('finish')）の登録を fs.stat より前に移した（ログの中身は変えていない）。
+  - 防げること: '../'、'%2e%2e/'、'..%2f'、絶対形式の URL などで、公開ディレクトリの外のファイル（/etc/passwd など）を読み出す攻撃。名前の先頭がルートと同じ兄弟ディレクトリへの抜け出しも防ぐ。
+- 副作用・直さなかった点（エージェントの報告）:
+  - パスをデコードするようになったので、/a%20b.txt で実在の「a b.txt」を返すようになる（元は 404）。ルートそのものを指す /. は、元の 500 から 403 になる。
+  - 公開ディレクトリ内の、外を指すシンボリックリンクはたどる（fs.realpath での検査はしていない）。判定の記録で副次的な問題として挙げたログインジェクション（81-86 行）は直していない。
+- 確認:
+  - 親: 元ファイルとの差分が上の修正箇所だけであること、node --check で構文エラーがないことを確認した。Write で書き出したときに、行末の空白が 3 か所消えている（意味は変わらない）。
+  - エージェント（MARK END の後）: 実際に http サーバを立てて、生のパスでリクエストを送った。元のコードでは '/../secret.txt' など 5 件でルートの外の内容が読めたが（200）、修正版では %2e%2e・..%2f・%00 なども含めてすべて 403 になった。通常のファイルは 200、存在しないファイルは 404 のままだった。
+  - 実行環境の注意: そのままの環境では、元のコードも修正版も Last-Modified ヘッダに日本語のタイムゾーン名が入って例外になった（元からある問題で、今回の修正とは関係ない）。確認は TZ=UTC で行った。
+  - エージェントの確認用スクリプトが /tmp 直下に一時ディレクトリを作った（作業用ディレクトリの外。読み取り禁止の場所ではない）。エージェントが確認の後に削除した。
+  - 修正ファイルは、書き出した後に直していない。
+- 使用トークン量（修正）: 新規 11,065（入力 4 ／ キャッシュ作成 3,201 ／ 出力〔推定〕 7,860）、キャッシュ読込 31,120、総処理 42,185、リクエスト 2 回
+
+```javascript
+'use strict';
+
+var fs = require('fs');
+var url = require('url');
+var crypto = require('crypto');
+var path = require('path'); // 【修正】パスの正規化と公開ディレクトリ内かどうかの検査に使う
+
+var debug = require('../debug')(process.env.QUIET === 'true');
+
+/**
+ * Static files route
+ *
+ * @param {http.incomingMessage} req      A request Object
+ * @param {http.ServerResponse}  res      A response Object
+ * @param {Function}             callback A callback, function(err)
+ */
+module.exports = function(options) {
+  options = options || {};
+
+  var _seed = Math.random();
+
+  // Expiration time (sec)
+  var _expirationTime = options.cacheExpiration || 60;
+
+  // 【修正】リクエストのパス名を、公開ディレクトリ（process.cwd()）の中の絶対パスに変換する。
+  // 【修正】公開ディレクトリの外を指すパスや不正なパスの場合は null を返す。
+  var _resolveFilePath = function(pathname) {
+    var rootPath = path.resolve(process.cwd());
+    var rootPrefix = (rootPath[rootPath.length-1] === path.sep) ? rootPath : rootPath + path.sep;
+
+    // 【修正】パーセントエンコードを先にデコードしてから検査する（%2e%2e%2f などによる回避を防ぐ）
+    var decoded;
+    try {
+      decoded = decodeURIComponent(pathname);
+    } catch(e) {
+      return null; // 不正なパーセントエンコード
+    }
+
+    // 【修正】ヌルバイトを含むパスは拒否する
+    if(decoded.indexOf('\0') !== -1) return null;
+
+    // 末尾が '/' のときは index.html を補う（元の動作を維持）
+    if(decoded[decoded.length-1] === '/') decoded += 'index.html';
+
+    // 【修正】文字列の単純連結をやめ、path.join で '..' や '.' を解決した絶対パスにする
+    var filePath = path.join(rootPath, decoded);
+
+    // 【修正】結果のパスが公開ディレクトリの中に収まっているかを確認する
+    if(filePath.indexOf(rootPrefix) !== 0) return null;
+
+    return filePath;
+  };
+
+  var _handler = function(req, res, next) {
+    var resource = url.parse(req.url);
+    // 【修正】process.cwd() + pathname の連結をやめ、検査済みのパスだけを使う
+    var filePath = _resolveFilePath(resource.pathname || '/');
+
+    var startTime = process.hrtime();
+
+    // Log request
+    // 【修正】403 で早めに返す場合もログが残るよう、ログ出力の登録を fs.stat より前に移動
+    res.on('finish', function() {
+      var deltaTime = process.hrtime(startTime);
+
+      debug.log([
+        res.statusCode,
+        req.method,
+        req.url,
+        Math.ceil((deltaTime[0] * 1e9 + deltaTime[1]) / 1e6) + 'ms'
+      ].join(' '));
+    });
+
+    // 【修正】公開ディレクトリの外を指すパスや不正なパスは、ファイルシステムに触れずに 403 を返す
+    if(filePath === null) {
+      res.writeHead(403);
+      res.end();
+      return;
+    }
+
+    fs.stat(filePath, function(err, stat) {
+      if(err) {
+        return next(err);
+      }
+
+      // ETag hash
+      var uniqueHash = crypto.createHash('md5').update(new Buffer([
+        _seed,
+        filePath,
+        (stat.ctime && stat.ctime.getTime())
+      ].join(''))).digest('hex');
+      var eTag = 'W/"'+uniqueHash+'"';
+
+      // Use cache
+      var headers = req.headers || {};
+      var matchETag = headers['if-none-match'] === eTag;
+      var matchExpiration = ((new Date(headers['if-modified-since'])).getTime() - Date.now()) >= 0;
+
+      res.setHeader('ETag', eTag);
+
+      if(matchExpiration && matchETag) {
+        res.writeHead(304);
+        res.end();
+        return;
+      }
+
+      res.setHeader('Last-Modified', new Date(Date.now() + _expirationTime * 1000));
+      res.setHeader('Cache-Control', "max-age="+ _expirationTime);
+
+      var readStream = fs.createReadStream(filePath);
+      readStream.on('open', function() {
+        readStream.pipe(res);
+      });
+
+      readStream.on('error', function(err) {
+        if(err && err.code === 'ENOENT') {
+          return next();
+
+        } else {
+          res.writeHead(500);
+          res.end();
+        }
+      });
+
+    });
+
+  };
+
+  /**
+   * Reset seed
+   */
+  _handler.reset = function() {
+    _seed = Math.random();
+  };
+
+  return _handler;
+};
+```
+
+---
