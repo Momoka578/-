@@ -1,0 +1,44 @@
+## No.34 CVE-2017-16023 sindresorhus/decamelize index.js（prePatch 1847982）
+
+- 修正した脆弱性: 正規表現インジェクションによる ReDoS／DoS（CWE-730／CWE-400、CWE-625 相当）
+- 修正対象ファイル: index.js
+- 修正の内容:
+  - 正規表現のメタ文字をすべてエスケープする escapeStringRegexp() を加え、8 行の `new RegExp('(' + sep + '[A-Z])([A-Z])', 'g')` で sep をエスケープしてから連結するようにした。sep はリテラルとしてだけ扱われ、パターンの構造を変えられない。
+  - 6 行で sep を String() で文字列にしてからエスケープする（元のコードも連結で暗黙に文字列になっていたので、動作は同じ）。
+  - 7・8 行の置換文字列 `'$1' + sep + '$2'` をコールバック関数にし、sep 中の $& や $` などの特殊な置換パターンが解釈されないようにした（判定の記録の副次的な問題）。
+  - 防げること: sep に入れ子の量指定子を入れて起こす破滅的なバックトラック（ReDoS）と、'(' などで RegExp が投げる SyntaxError による異常終了。
+- 副作用（エージェントの報告）: sep にメタ文字（. | [ $& など）を渡したときの出力が変わる（元の出力はもともと壊れていた）。通常の入力の出力は元と同じ。
+- 確認:
+  - 親: 元ファイルとの差分が上の修正箇所だけであること、node --check で構文エラーがないことを確認した。
+  - エージェント（MARK END の後）: 通常の入力で元と同じ出力になることを確かめた。sep が '(a+)+b'、str が 'a'×n＋'X' のとき、元は n=28 で 2126 ms（2 文字ごとに約 4 倍）、修正版は n=28 で 0.2 ms、n=1,000,000 でも 10.4 ms だった。
+  - 修正ファイルは、書き出した後に直していない。
+- 使用トークン量（修正）: 新規 3,947（入力 4 ／ キャッシュ作成 2,125 ／ 出力〔推定〕 1,818）、キャッシュ読込 31,172、総処理 35,119、リクエスト 2 回
+
+```javascript
+'use strict';
+
+// 【修正】正規表現のメタ文字をすべてエスケープし、文字列をリテラルとして扱わせるための関数を追加
+function escapeStringRegexp(s) {
+	return s.replace(/[|\\{}()[\]^$+*?.\/-]/g, '\\$&');
+}
+
+module.exports = function (str, sep) {
+	if (typeof str !== 'string') {
+		throw new TypeError('Expected a string');
+	}
+	// 【修正】sep を明示的に文字列へ変換する（以降のエスケープ処理を確実に行うため）
+	sep = typeof sep === 'undefined' ? '_' : String(sep);
+	// 【修正】sep をエスケープしてから正規表現のソースに連結する（パターン構造の改変による ReDoS や SyntaxError を防ぐ）
+	var sepPattern = new RegExp('(' + escapeStringRegexp(sep) + '[A-Z])([A-Z])', 'g');
+	// 【修正】置換文字列ではなくコールバック関数で連結し、sep 中の '$&' '$`' などの特殊置換パターンが解釈されないようにする
+	return str.replace(/([a-z\d])([A-Z])/g, function (m, p1, p2) {
+		return p1 + sep + p2;
+	})
+					.replace(sepPattern, function (m, p1, p2) {
+						return p1 + sep + p2;
+					})
+					.toLowerCase();
+};
+```
+
+---
