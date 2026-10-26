@@ -1,0 +1,158 @@
+## No.45 CVE-2017-16084 KoryNunn/list-n-stream server.js（prePatch 87de3f1）
+
+- 修正した脆弱性: パストラバーサル／任意のファイル・ディレクトリの読み取り（CWE-22）
+- 修正対象ファイル: server.js
+- 修正の内容:
+  - 4xx を返す clientError() を加えた。
+  - 87 行の `var path = process.cwd() + '/' + details.path;` を置き換えた。公開ルートを path.resolve(process.cwd()) で求め、`path.resolve(root, '.' + sep + details.path)` で '..' を解決した絶対パスにする。結果がルート自身でもなく、ルート＋区切り文字で始まってもいなければ 403 を返し、fs.stat・readdir・createReadStream には渡さない。NUL 文字を含むパスは 400 を返す。
+  - 防げること: '../' を重ねたパスや 'sub/../../x' による、公開ディレクトリの外のファイルの読み取り（/etc/passwd など）とディレクトリ一覧の取得。区切り文字付きで比べるので、名前の頭が同じ隣のディレクトリにも抜けられない。
+- 副作用・直さなかった点（エージェントの報告）:
+  - 判定の記録の補足にある XSS（37 行・56 行のエスケープ漏れ）は、指示どおり変えていない。
+  - 判定時の修正案にあった decodeURIComponent は入れていない。ルーター（beeline）が URL をデコードするかを確かめられず、二重にデコードすると % を含むファイル名が開けなくなるおそれがあるため。検査は fs に実際に渡すパスに対して行うので、どちらの場合も外には出られない。
+  - 公開ディレクトリ内の、外を指すシンボリックリンクはたどる（realpath での検査はしていない）。
+- 確認:
+  - 親: 元ファイルとの差分が上の 2 か所（コメントを含む）と末尾の改行だけであること、node --check で構文エラーがないことを確認した。
+  - エージェント（MARK END の後）: beeline・http・fs などをスタブにしてルートの処理を呼んだ。元のコードでは '../etc/passwd' などがすべて 200 になり、ルートの外のパスが fs に渡った。修正版では '..'、'../etc/passwd'、'sub/../../x'、'../root2/secret' が 403、NUL 文字を含むパスが 400 になり、ルートの中のパスは 200 のままだった。
+  - 修正ファイルは、書き出した後に直していない。
+- 使用トークン量（修正）: 新規 6,961（入力 4 ／ キャッシュ作成 3,492 ／ 出力〔推定〕 3,465）、キャッシュ読込 31,748、総処理 38,709、リクエスト 2 回
+
+```javascript
+#! /usr/bin/env node
+
+var http = require('http');
+var fs = require("fs");
+var pathHelpers = require('path');
+var beeline = require('beeline');
+var packageJson = require('./package');
+var program = require('commander');
+var querystring = require('querystring');
+var urlHelpers = require('url');
+
+
+program
+  .version(packageJson.version)
+  .option('-p, --port [port]', 'Run on a custom port')
+  .parse(process.argv);
+
+function serverError(response, error){
+    console.log(error);
+    response.statusCode = 500;
+    response.end();
+}
+
+// 【修正】公開ルート外へのアクセスやパスとして不正な値を拒否するための応答
+function clientError(response, statusCode){
+    response.statusCode = statusCode;
+    response.end();
+}
+
+function serveDir(request, response, path){
+    fs.readdir(path, function(error, files){
+        if(error){
+            serverError(response, error);
+            return;
+        }
+
+        var currentPath = urlHelpers.parse(request.url).pathname;
+
+        response.writeHead(200, {"Content-Type": "text/html"});
+        response.end(
+            '<a href="../">../</a><br>' +
+            files.map(function(fileName){
+            return '<a href="' + currentPath + (currentPath === '/' ? '' : '/') + fileName + '?view">' + fileName + '</a>';
+        }).join('<br>'));
+    });
+}
+
+var mimeTypes = {
+    'avi': 'video/x-msvideo',
+    'mpg': 'video/mpeg',
+    'mpeg': 'video/mpeg',
+    'mp4': 'video/mp4'
+}
+
+function serveFile(request, response, path, info){
+    var urlBits = request.url.split('?');
+
+    if('view' in querystring.parse(urlBits[1])){
+        response.writeHead(200, {"Content-Type": "text/html"});
+        response.end(
+            '<style>html, body{margin:0;background:black;}video{height:100%;width:100%}</style>' +
+            '<video src="' + urlBits[0] + '" autoplay controls></video>'
+        );
+        return;
+    }
+
+    var total = info.size,
+        contentType = mimeTypes[urlBits[0].split('.').pop()];
+
+    // https://gist.github.com/paolorossi/1993068
+
+    if (request.headers['range']) {
+        var range = request.headers.range;
+        var parts = range.replace(/bytes=/, "").split("-");
+        var partialstart = parts[0];
+        var partialend = parts[1];
+
+        var start = parseInt(partialstart, 10);
+        var end = partialend ? parseInt(partialend, 10) : total-1;
+        var chunksize = (end-start)+1;
+
+        var file = fs.createReadStream(path, {start: start, end: end});
+        response.writeHead(206, { 'Content-Range': 'bytes ' + start + '-' + end + '/' + total, 'Accept-Ranges': 'bytes', 'Content-Length': chunksize, 'Content-Type': contentType });
+        file.pipe(response);
+    } else {
+        response.writeHead(200, { 'Content-Length': total, 'Content-Type': contentType });
+        fs.createReadStream(path).pipe(response);
+    }
+}
+
+var router = beeline.route({
+    '/`path...`': function(request, response, details){
+        // 【修正】公開ルート（process.cwd()）を絶対パスで求める。
+        // 末尾が区切り文字のとき（ルートが "/" など）は二重にしない。
+        var root = pathHelpers.resolve(process.cwd());
+        var rootPrefix = root.charAt(root.length - 1) === pathHelpers.sep ? root : root + pathHelpers.sep;
+        var requestedPath = String(details.path || '');
+
+        // 【修正】NUL 文字を含むパスは fs が例外を投げるため、先に 400 で拒否する。
+        if(requestedPath.indexOf('\0') !== -1){
+            clientError(response, 400);
+            return;
+        }
+
+        // 【修正】文字列連結（process.cwd() + '/' + details.path）をやめ、
+        // '..' などを解決した正規化済みの絶対パスを作る。
+        // 先頭に '.' + sep を付けて、絶対パス指定（'/etc/passwd' など）でもルート基準で解決させる。
+        var path = pathHelpers.resolve(root, '.' + pathHelpers.sep + requestedPath);
+
+        // 【修正】解決後のパスが公開ルートの中（ルート自身か、ルート + 区切り文字で始まる）に
+        // 収まっていなければ 403 を返し、fs.stat / readdir / createReadStream に渡さない。
+        if(path !== root && path.indexOf(rootPrefix) !== 0){
+            clientError(response, 403);
+            return;
+        }
+
+        fs.stat(path, function(error, info){
+            if(error){
+                serverError(response, error);
+                return;
+            }
+
+            if(info.isDirectory()){
+                serveDir(request, response, path);
+            }else{
+                serveFile(request, response, path, info);
+            }
+        });
+    }
+});
+
+var server = http.createServer(router);
+
+var port = program.port || process.env.PORT || 8080;
+
+server.listen(port);
+
+console.log('serving ' + __dirname + ' on ' + port);
+```
