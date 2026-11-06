@@ -1,0 +1,118 @@
+## No.77 CVE-2019-10061 peterbraden/node-opencv utils/find-opencv.js（prePatch cfc96ba）
+
+- 修正した脆弱性: OS コマンドインジェクション／引数インジェクション（CWE-78・CWE-88）
+- 修正対象ファイル: utils/find-opencv.js
+- 修正の内容（行番号は元のファイル）:
+  - 3 行目の後: `var execFile = require("child_process").execFile;` を加えた。
+  - 5 行目（`var flag = process.argv[2] || "--exists";`）の後: 許可リスト `ALLOWED_FLAGS = ["--exists", "--libs", "--cflags"]` を加え、リストにない値は exec の前に `throw new Error("Error: unknown argument '...'")` で止めるようにした。
+  - 11 行目: `'"opencv >= 2.3.1"'` の内側のダブルクォートを外し、`"opencv >= 2.3.1"` にした（シェルを通さなくなるので、1 つの引数として渡すため）。
+  - 15 行目: `exec("pkg-config " + opencv + " " + flag, ...)` を `execFile("pkg-config", [opencv, flag], ...)` に変えた。シェル（/bin/sh -c、cmd.exe）を通さず、引数を配列で渡す。
+- この修正で防げること: flag に入れたシェルメタ文字（; | & $() ` など）による任意コマンドの実行（CWE-78）と、pkg-config への余分なオプションの注入（--define-variable=...、--libs --static など。CWE-88）。許可リストと execFile の二重の防御になる。
+- 副作用（エージェントの最終報告による）:
+  - 許可リスト外の引数（--modversion など）は、これまで pkg-config にそのまま渡していたが、すべてエラーになる。binding.gyp の呼び出しは --libs と --cflags、既定値は --exists なので、通常のビルドには影響しない。
+  - Windows で pkg-config が .bat/.cmd のラッパーとしてしか入っていない環境では、execFile では起動できず、既存の fallback（OPENCV_DIR を使う経路）に進む。
+- 直さなかった点: 33 行目の `exec("echo %OPENCV_DIR%")` は固定の文字列で外部入力が入らないので、変えていない。21 行目の `new Error(msg, opencv, flag)`（余分な引数がメッセージに入らない元からの不具合）も、脆弱性とは関係がないので変えていない。
+- 確認（MARK END の後に行ったもので、トークン量の区間には含めていない）:
+  - 親とエージェント: node --check で構文エラーなし。元ファイルとの差分は上の 4 か所（とコメント）だけ（行末の空白の変化もない）。
+  - エージェントが、child_process の exec・execFile をモックに置き換えるスクリプト（bench/mock_run.js）を作り、実際のコマンドは実行せずに呼び出しの内容を確かめた。
+    - 引数なし・--exists・--libs・--cflags では、どれも `execFile "pkg-config" ["opencv >= 2.3.1", <flag>]` になった。PKG_CONFIG_OPENCV3=1 では `["opencv3", "--libs"]` になった。
+    - 注入を試す引数（`--libs; touch /tmp/pwned_nx77`、`--cflags $(id)`、`--define-variable=prefix=/evil`、`--libs --static`）は、どれも exec の前に「unknown argument」で止まった。
+    - 比べるために元のファイルもモックで動かし、注入した文字列がそのまま 1 つのシェルコマンドとして exec に渡ることを確かめた。マーカーファイル /tmp/pwned_nx77 は作られていない（親も確認）。
+  - エージェントが、実機の pkg-config に「モジュール名 >= 版」を 1 つの引数として execFile で渡し、バージョン条件が正しく解釈されることを確かめた（この環境には opencv がないため、別のモジュールで確認）。
+- 使用トークン量（修正）: 新規 5,323（入力 4 ／ キャッシュ作成 3,136 ／ 出力〔推定〕 2,183）、キャッシュ読込 31,645、総処理 36,968、リクエスト 2 回
+
+```javascript
+"use strict";
+
+var exec = require("child_process").exec;
+// 【修正】pkg-config の呼び出しはシェルを通さない execFile を使う（引数を配列で渡す）
+var execFile = require("child_process").execFile;
+var fs = require("fs");
+var flag = process.argv[2] || "--exists";
+
+// 【修正】コマンドライン引数 flag を許可リストで検証する。
+// binding.gyp からは --libs / --cflags、既定値は --exists なので、この 3 つ以外は拒否する。
+// （シェルメタ文字や pkg-config への余分なオプションの注入を防ぐ）
+var ALLOWED_FLAGS = ["--exists", "--libs", "--cflags"];
+if (ALLOWED_FLAGS.indexOf(flag) === -1) {
+    throw new Error("Error: unknown argument '" + flag + "'");
+}
+
+// Normally |pkg-config opencv ...| could report either OpenCV 2.x or OpenCV 3.y
+// depending on what is installed.  To enable both 2.x and 3.y to co-exist on
+// the same machine, the opencv.pc for 3.y can be installed as opencv3.pc and
+// then selected by |export PKG_CONFIG_OPENCV3=1| before building node-opencv.
+// 【修正】シェルを通さないので、"opencv >= 2.3.1" を囲んでいたクォートを外し、1 つの引数として渡す
+var opencv = process.env.PKG_CONFIG_OPENCV3 === "1" ? "opencv3" : "opencv >= 2.3.1";
+
+function main(){
+    //Try using pkg-config, but if it fails and it is on Windows, try the fallback
+    // 【修正】文字列連結 + exec（/bin/sh -c / cmd.exe 経由）をやめ、execFile に引数配列で渡す
+    execFile("pkg-config", [opencv, flag], function(error, stdout, stderr){
+        if(error){
+            if(process.platform === "win32"){
+                fallback();
+            }
+            else{
+                throw new Error("ERROR: failed to run: pkg-config", opencv, flag);
+            }
+        }
+        else{
+            console.log(stdout);
+        }
+    });
+}
+
+//======================Windows Specific=======================================
+
+function fallback(){
+    exec("echo %OPENCV_DIR%", function(error, stdout, stderr){
+        stdout = cleanupEchoOutput(stdout);
+        if(error){
+            throw new Error("ERROR: There was an error reading OPENCV_DIR");
+        }
+        else if(stdout === "%OPENCV_DIR%") {
+            throw new Error("ERROR: OPENCV_DIR doesn't seem to be defined");
+        }
+        else {
+            printPaths(stdout);
+        }
+    });
+}
+
+function printPaths(opencvPath){
+    if(flag === "--cflags") {
+        console.log("\"" + opencvPath + "\\..\\..\\include\"");
+        console.log("\"" + opencvPath + "\\..\\..\\include\\opencv\"");
+    }
+    else if(flag === "--libs") {
+        var libPath = opencvPath + "\\lib\\";
+
+        fs.readdir(libPath, function(err, files){
+            if(err){
+                throw new Error("ERROR: couldn't read the lib directory " + err);
+            }
+
+            var libs = "";
+            for(var i = 0; i < files.length; i++){
+                if(getExtension(files[i]) === "lib"){
+                    libs = libs + " \"" + libPath + files[i] + "\" \r\n ";
+                }
+            }
+            console.log(libs);
+        });
+    }
+    else {
+        throw new Error("Error: unknown argument '" + flag + "'");
+    }
+}
+
+function cleanupEchoOutput(s){
+    return s.slice(0, s.length - 2);
+}
+
+function getExtension(s){
+    return s.substr(s.lastIndexOf(".") + 1);
+}
+main();
+```
