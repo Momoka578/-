@@ -1,0 +1,309 @@
+## No.81 CVE-2019-10742 axios/axios lib/adapters/http.js（prePatch 047501f）
+
+- 修正した脆弱性: maxContentLength を超えたときにレスポンスストリームを閉じない資源枯渇型の DoS（CWE-404・CWE-400）
+- 修正対象ファイル: lib/adapters/http.js
+- 修正の内容（元の 213〜222 行目の handleStreamData の中だけ）:
+  - `var totalResponseBytes = 0;` を加え、チャンクを受け取るたびに `chunk.length` を足す。上限の判定を `Buffer.concat(responseBuffer).length` から `totalResponseBytes > config.maxContentLength` に変えた（チャンクごとに全体を連結し直す O(n^2) のコピーがなくなる）。
+  - 上限を超えたときは、`responseBuffer = []` で溜めたデータを解放し、`stream.destroy()`（gzip/deflate の展開ストリームを含む。destroy がない古い Node のために typeof で確かめてから呼ぶ）と `req.abort()` で接続を閉じてから reject し、return で処理を止める。
+  - `responseBuffer.push(chunk)` を上限の判定の後ろに移し、上限を超えたチャンクはバッファに入れないようにした。
+- この修正で防げること: 上限を超えた後も接続とストリームが開いたままで responseBuffer が際限なく大きくなる問題（メモリ枯渇）、Buffer.concat の繰り返しによる CPU の浪費、timer が消された後に接続が残り続ける問題。gzip の展開で大きく膨らむ応答も、展開ストリームを閉じるので止まる。
+- 副作用・直さなかった点（エージェントの最終報告による）: req.abort() は Node 22 では非推奨の警告が出るが、元のコードもタイムアウトとキャンセルで同じ req.abort() を使っているのに合わせた。上限ちょうどの大きさは今までどおり受け付ける。responseType: 'stream' のときに maxContentLength を確かめない点（元のコードでも確かめておらず、判定の記録の範囲外）と、送信側の上限 maxBodyLength は変えていない。
+- 確認（MARK END の後）:
+  - 親とエージェント: node --check で問題なし。元ファイルとの差分は handleStreamData の中だけ。
+  - 親: check_nx.py が "/issues" を違反の候補として出したが、元のコード 35 行目のコメントにある URL（`See https://github.com/axios/axios/issues/69`）を修正ファイルに書き写したもので、アクセスはしていない。
+  - エージェント: 元のコードと修正コードを、依存モジュールのスタブ（utils・settle・buildURL・createError・enhanceError・follow-redirects）と一緒に作業用ディレクトリに置き、ローカル（127.0.0.1）の HTTP サーバに対して動かした。maxContentLength 1MB で延々と送り続けるサーバに対し、元のコードはサーバ側の切断がなく、reject の後も 13,696KB を受信し続けた（RSS 117MB）。修正コードは 42ms で切断し、reject の後の受信は 0（RSS 72MB）。gzip でも、元のコードは reject の後も展開出力が 8.5MB まで増え続け、修正コードは 74ms で切断した。
+  - エージェント: 小さい応答（平文・gzip）、ちょうど 1MB（resolve）と 1MB+1 バイト（reject）、maxContentLength: -1 で 5MB の応答は、元のコードと修正コードで同じ結果になった。上限 64MB で 8MB の応答を受け取る時間は、元のコードが約 2,020〜2,040ms、修正コードが約 65〜70ms。
+- 使用トークン量（修正）: 新規 14,190（入力 4 ／ キャッシュ作成 5,980 ／ 出力〔推定〕 8,206）、キャッシュ読込 31,646、総処理 45,836、リクエスト 2 回
+
+```javascript
+'use strict';
+
+var utils = require('./../utils');
+var settle = require('./../core/settle');
+var buildURL = require('./../helpers/buildURL');
+var http = require('http');
+var https = require('https');
+var httpFollow = require('follow-redirects').http;
+var httpsFollow = require('follow-redirects').https;
+var url = require('url');
+var zlib = require('zlib');
+var pkg = require('./../../package.json');
+var createError = require('../core/createError');
+var enhanceError = require('../core/enhanceError');
+
+var isHttps = /https:?/;
+
+/*eslint consistent-return:0*/
+module.exports = function httpAdapter(config) {
+  return new Promise(function dispatchHttpRequest(resolvePromise, rejectPromise) {
+    var timer;
+    var resolve = function resolve(value) {
+      clearTimeout(timer);
+      resolvePromise(value);
+    };
+    var reject = function reject(value) {
+      clearTimeout(timer);
+      rejectPromise(value);
+    };
+    var data = config.data;
+    var headers = config.headers;
+
+    // Set User-Agent (required by some servers)
+    // Only set header if it hasn't been set in config
+    // See https://github.com/axios/axios/issues/69
+    if (!headers['User-Agent'] && !headers['user-agent']) {
+      headers['User-Agent'] = 'axios/' + pkg.version;
+    }
+
+    if (data && !utils.isStream(data)) {
+      if (Buffer.isBuffer(data)) {
+        // Nothing to do...
+      } else if (utils.isArrayBuffer(data)) {
+        data = Buffer.from(new Uint8Array(data));
+      } else if (utils.isString(data)) {
+        data = Buffer.from(data, 'utf-8');
+      } else {
+        return reject(createError(
+          'Data after transformation must be a string, an ArrayBuffer, a Buffer, or a Stream',
+          config
+        ));
+      }
+
+      // Add Content-Length header if data exists
+      headers['Content-Length'] = data.length;
+    }
+
+    // HTTP basic authentication
+    var auth = undefined;
+    if (config.auth) {
+      var username = config.auth.username || '';
+      var password = config.auth.password || '';
+      auth = username + ':' + password;
+    }
+
+    // Parse url
+    var parsed = url.parse(config.url);
+    var protocol = parsed.protocol || 'http:';
+
+    if (!auth && parsed.auth) {
+      var urlAuth = parsed.auth.split(':');
+      var urlUsername = urlAuth[0] || '';
+      var urlPassword = urlAuth[1] || '';
+      auth = urlUsername + ':' + urlPassword;
+    }
+
+    if (auth) {
+      delete headers.Authorization;
+    }
+
+    var isHttpsRequest = isHttps.test(protocol);
+    var agent = isHttpsRequest ? config.httpsAgent : config.httpAgent;
+
+    var options = {
+      path: buildURL(parsed.path, config.params, config.paramsSerializer).replace(/^\?/, ''),
+      method: config.method.toUpperCase(),
+      headers: headers,
+      agent: agent,
+      auth: auth
+    };
+
+    if (config.socketPath) {
+      options.socketPath = config.socketPath;
+    } else {
+      options.hostname = parsed.hostname;
+      options.port = parsed.port;
+    }
+
+    var proxy = config.proxy;
+    if (!proxy && proxy !== false) {
+      var proxyEnv = protocol.slice(0, -1) + '_proxy';
+      var proxyUrl = process.env[proxyEnv] || process.env[proxyEnv.toUpperCase()];
+      if (proxyUrl) {
+        var parsedProxyUrl = url.parse(proxyUrl);
+        var noProxyEnv = process.env.no_proxy || process.env.NO_PROXY;
+        var shouldProxy = true;
+
+        if (noProxyEnv) {
+          var noProxy = noProxyEnv.split(',').map(function trim(s) {
+            return s.trim();
+          });
+
+          shouldProxy = !noProxy.some(function proxyMatch(proxyElement) {
+            if (!proxyElement) {
+              return false;
+            }
+            if (proxyElement === '*') {
+              return true;
+            }
+            if (proxyElement[0] === '.' &&
+                parsed.hostname.substr(parsed.hostname.length - proxyElement.length) === proxyElement &&
+                proxyElement.match(/\./g).length === parsed.hostname.match(/\./g).length) {
+              return true;
+            }
+
+            return parsed.hostname === proxyElement;
+          });
+        }
+
+
+        if (shouldProxy) {
+          proxy = {
+            host: parsedProxyUrl.hostname,
+            port: parsedProxyUrl.port
+          };
+
+          if (parsedProxyUrl.auth) {
+            var proxyUrlAuth = parsedProxyUrl.auth.split(':');
+            proxy.auth = {
+              username: proxyUrlAuth[0],
+              password: proxyUrlAuth[1]
+            };
+          }
+        }
+      }
+    }
+
+    if (proxy) {
+      options.hostname = proxy.host;
+      options.host = proxy.host;
+      options.headers.host = parsed.hostname + (parsed.port ? ':' + parsed.port : '');
+      options.port = proxy.port;
+      options.path = protocol + '//' + parsed.hostname + (parsed.port ? ':' + parsed.port : '') + options.path;
+
+      // Basic proxy authorization
+      if (proxy.auth) {
+        var base64 = Buffer.from(proxy.auth.username + ':' + proxy.auth.password, 'utf8').toString('base64');
+        options.headers['Proxy-Authorization'] = 'Basic ' + base64;
+      }
+    }
+
+    var transport;
+    var isHttpsProxy = isHttpsRequest && (proxy ? isHttps.test(proxy.protocol) : true);
+    if (config.transport) {
+      transport = config.transport;
+    } else if (config.maxRedirects === 0) {
+      transport = isHttpsProxy ? https : http;
+    } else {
+      if (config.maxRedirects) {
+        options.maxRedirects = config.maxRedirects;
+      }
+      transport = isHttpsProxy ? httpsFollow : httpFollow;
+    }
+
+    if (config.maxContentLength && config.maxContentLength > -1) {
+      options.maxBodyLength = config.maxContentLength;
+    }
+
+    // Create the request
+    var req = transport.request(options, function handleResponse(res) {
+      if (req.aborted) return;
+
+      // uncompress the response body transparently if required
+      var stream = res;
+      switch (res.headers['content-encoding']) {
+      /*eslint default-case:0*/
+      case 'gzip':
+      case 'compress':
+      case 'deflate':
+        // add the unzipper to the body stream processing pipeline
+        stream = stream.pipe(zlib.createUnzip());
+
+        // remove the content-encoding in order to not confuse downstream operations
+        delete res.headers['content-encoding'];
+        break;
+      }
+
+      // return the last request in case of redirects
+      var lastRequest = res.req || req;
+
+      var response = {
+        status: res.statusCode,
+        statusText: res.statusMessage,
+        headers: res.headers,
+        config: config,
+        request: lastRequest
+      };
+
+      if (config.responseType === 'stream') {
+        response.data = stream;
+        settle(resolve, reject, response);
+      } else {
+        var responseBuffer = [];
+        // 【修正】受信済みのバイト数を加算方式で保持する（チャンクごとの Buffer.concat による O(n^2) のコピーをやめる）
+        var totalResponseBytes = 0;
+        stream.on('data', function handleStreamData(chunk) {
+          // 【修正】受信量を加算してから上限判定を行う
+          totalResponseBytes += chunk.length;
+
+          // make sure the content length is not over the maxContentLength if specified
+          if (config.maxContentLength > -1 && totalResponseBytes > config.maxContentLength) {
+            // 【修正】上限を超えた分はバッファに溜めず、それまでに溜めたデータも解放する
+            responseBuffer = [];
+            // 【修正】レスポンスストリーム（展開用の zlib ストリームを含む）を閉じて、以降の 'data' を止める
+            if (typeof stream.destroy === 'function') {
+              stream.destroy();
+            }
+            // 【修正】HTTP 接続（ソケット）も中断して、サーバからの受信を打ち切る
+            req.abort();
+            reject(createError('maxContentLength size of ' + config.maxContentLength + ' exceeded',
+              config, null, lastRequest));
+            // 【修正】reject 後は処理を続けない
+            return;
+          }
+
+          // 【修正】上限内のチャンクだけをバッファに追加する
+          responseBuffer.push(chunk);
+        });
+
+        stream.on('error', function handleStreamError(err) {
+          if (req.aborted) return;
+          reject(enhanceError(err, config, null, lastRequest));
+        });
+
+        stream.on('end', function handleStreamEnd() {
+          var responseData = Buffer.concat(responseBuffer);
+          if (config.responseType !== 'arraybuffer') {
+            responseData = responseData.toString(config.responseEncoding);
+          }
+
+          response.data = responseData;
+          settle(resolve, reject, response);
+        });
+      }
+    });
+
+    // Handle errors
+    req.on('error', function handleRequestError(err) {
+      if (req.aborted) return;
+      reject(enhanceError(err, config, null, req));
+    });
+
+    // Handle request timeout
+    if (config.timeout) {
+      timer = setTimeout(function handleRequestTimeout() {
+        req.abort();
+        reject(createError('timeout of ' + config.timeout + 'ms exceeded', config, 'ECONNABORTED', req));
+      }, config.timeout);
+    }
+
+    if (config.cancelToken) {
+      // Handle cancellation
+      config.cancelToken.promise.then(function onCanceled(cancel) {
+        if (req.aborted) return;
+
+        req.abort();
+        reject(cancel);
+      });
+    }
+
+    // Send the request
+    if (utils.isStream(data)) {
+      data.on('error', function handleStreamError(err) {
+        reject(enhanceError(err, config, null, req));
+      }).pipe(req);
+    } else {
+      req.end(data);
+    }
+  });
+};
+```
