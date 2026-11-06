@@ -1,0 +1,142 @@
+## No.65 SARD 501365 v1.0.1 dspace-jspui PasswordServlet.java
+
+- 修正した脆弱性: ログインジェクション／ログ偽造（CWE-117）
+- 修正対象ファイル: dspace-jspui/src/main/java/org/dspace/app/webui/servlet/PasswordServlet.java
+- 修正の内容（行番号は元のファイル）:
+  - 100〜101 行目（ログイン失敗時の log.info）で、`"email=" + email` を `"email=" + sanitizeForLog(email)` に変えた。
+  - メソッド `private static String sanitizeForLog(String value)` を追加した。中身は `value.replaceAll("[\\p{Cc}\\u2028\\u2029]", "_")`。
+    - Unicode の制御文字（Cc）全体（U+0000〜001F の CR・LF・タブなどと、U+007F〜009F の NEL など）と、行区切り U+2028・段落区切り U+2029 を "_" に置き換える。
+    - 入力が null のときは null を返す。ログには元のコードと同じく `email=null` と出る。
+- この修正で防げること: login_email に改行を入れても、失敗ログは必ず 1 行で出る。dspace.log に偽の行（他ユーザーの login 成功行など）を差し込めなくなり、監査ログや LogAnalyser の統計の改ざんを防げる。
+  - 「\」と「:」は、これまでどおり上流の LogManager.escapeLogField がエスケープする。
+- 副作用: 制御文字を含む email は、ログでは "_" に置き換わった形で記録される。認証（authenticationService.authenticate）には元の値をそのまま渡すので、認証の動きは変わらない。正常なメールアドレスの出力は変わらない。
+- 直さなかった点（エージェントの最終報告による）:
+  - 上流の LogManager.escapeLogField（dspace-api の共通部品で、zip には入っていない）は変えていない。変えると DSpace 全体のログに影響するため、呼び出し側だけを最小限に直した。
+  - getHeader が加える session_id・ip_addr もエスケープされないが、判定の記録の対象外なので調べていない。
+  - login/incorrect.jsp・components/login-form.jsp・web.xml は変えていない（判定で XSS なしとされ、CWE-117 にも関係しない）。
+- ライセンスヘッダ（元の 1〜7 行目）は省略している。また、Write のときに元の 34・48・71・72 行目の行末の空白が消えた。空白だけの差分で動作には影響しないので、そのままにした。
+  - エージェントの最終報告では、これを「27・41・64・65 行目」と書いている。これはライセンスヘッダを除いたファイルでの行番号で、元のファイルでは 34・48・71・72 行目にあたる（親が確認）。
+- 確認（MARK END の後に行ったもので、トークン量の区間には含めていない）:
+  - java・javac がないため、コンパイルはしていない。
+  - エージェントが自作スクリプトで、括弧の対応（中括弧 8/8、丸括弧 29/29）を確かめた。
+  - さらに、修正の正規表現を Python で再現し、上流の escapeLogField と log4j の PatternLayout（`%m%n`）をまねたログ出力を作った。14 種類の入力（正常値、null、偽の成功行を差し込む値、CRLF・CR・TAB・NUL・ESC・DEL・U+0085・U+2028・U+2029、日本語、「:」「\」を含む値）のすべてで、出力が 1 行になった。
+  - 親が diff で、変更がこの 2 か所（とコメント）と、行末の空白だけであることを確認した。
+  - Java のソースの `\\u2028` は、前にバックスラッシュがあるので Java の Unicode エスケープとしては処理されず、正規表現に `\u2028` として渡る。Write で実体の文字に変わっていないことも親が確認した（ファイル2 No.29 で起きた問題の確認）。
+- 使用トークン量（修正）: 新規 9,599（入力 8 ／ キャッシュ作成 5,676 ／ 出力〔推定〕 3,915）、キャッシュ読込 70,293、総処理 79,892、リクエスト 4 回
+
+```java
+package org.dspace.app.webui.servlet;
+
+import java.io.IOException;
+import java.sql.SQLException;
+import java.util.Locale;
+
+import javax.servlet.ServletException;
+import javax.servlet.http.HttpServletRequest;
+import javax.servlet.http.HttpServletResponse;
+import javax.servlet.jsp.jstl.core.Config;
+
+import org.apache.log4j.Logger;
+import org.dspace.app.webui.util.Authenticate;
+import org.dspace.app.webui.util.JSPManager;
+import org.dspace.authenticate.AuthenticationMethod;
+import org.dspace.authenticate.factory.AuthenticateServiceFactory;
+import org.dspace.authenticate.service.AuthenticationService;
+import org.dspace.authorize.AuthorizeException;
+import org.dspace.core.Context;
+import org.dspace.core.I18nUtil;
+import org.dspace.core.LogManager;
+
+/**
+ * Simple username and password authentication servlet. Displays the login form
+ * <code>/login/password.jsp</code> on a GET, otherwise process the parameters
+ * as an email and password.
+ *
+ * Calls stackable authentication to give credentials to all
+ * authentication methods that can make use of them, not just DSpace-internal.
+ *
+ * @author Robert Tansley
+ * @version $Revision$
+ */
+public class PasswordServlet extends DSpaceServlet
+{
+    /** log4j logger */
+    private static final Logger log = Logger.getLogger(PasswordServlet.class);
+
+    private final transient AuthenticationService authenticationService
+             = AuthenticateServiceFactory.getInstance().getAuthenticationService();
+
+    @Override
+    protected void doDSGet(Context context, HttpServletRequest request,
+            HttpServletResponse response) throws ServletException, IOException,
+            SQLException, AuthorizeException
+    {
+        // Simply forward to the plain form
+        JSPManager.showJSP(request, response, "/login/password.jsp");
+    }
+
+    @Override
+    protected void doDSPost(Context context, HttpServletRequest request,
+            HttpServletResponse response) throws ServletException, IOException,
+            SQLException, AuthorizeException
+    {
+        // Process the POSTed email and password
+        String email = request.getParameter("login_email");
+        String password = request.getParameter("login_password");
+        String jsp = null;
+
+        // Locate the eperson
+        int status = authenticationService.authenticate(context, email, password,
+                null, request);
+
+
+        if (status == AuthenticationMethod.SUCCESS)
+        {
+            // Logged in OK.
+            Authenticate.loggedIn(context, request, context.getCurrentUser());
+
+            // Set the Locale according to user preferences
+            Locale epersonLocale = I18nUtil.getEPersonLocale(context.getCurrentUser());
+            context.setCurrentLocale(epersonLocale);
+            Config.set(request.getSession(), Config.FMT_LOCALE, epersonLocale);
+
+            log.info(LogManager.getHeader(context, "login", "type=explicit"));
+
+                // resume previous request
+                Authenticate.resumeInterruptedRequest(request, response);
+
+                return;
+        }
+        else if (status == AuthenticationMethod.CERT_REQUIRED)
+        {
+            jsp = "/error/require-certificate.jsp";
+        }
+        else
+        {
+            jsp = "/login/incorrect.jsp";
+        }
+
+        // If we reach here, supplied email/password was duff.
+        // 【修正】利用者が送った email をそのままログに書かず、改行などの制御文字を
+        // 置き換えてから書く（ログインジェクション／ログ偽造 CWE-117 の対策）。
+        log.info(LogManager.getHeader(context, "failed_login",
+                "email=" + sanitizeForLog(email) + ", result=" + String.valueOf(status)));
+        JSPManager.showJSP(request, response, jsp);
+    }
+
+    // 【修正】ログ出力用に、制御文字（CR・LF・タブなど Unicode の Cc 全体）と
+    // Unicode の行区切り（U+2028）・段落区切り（U+2029）を "_" に置き換える。
+    // LogManager.escapeLogField は「\」と「:」しかエスケープしないため、ここで
+    // 改行を消して、1 回の失敗ログが必ず 1 行に収まるようにする。
+    // null はこれまでどおり "null" として出力されるよう、そのまま返す。
+    private static String sanitizeForLog(String value)
+    {
+        if (value == null)
+        {
+            return null;
+        }
+        return value.replaceAll("[\\p{Cc}\\u2028\\u2029]", "_");
+    }
+}
+```
+
