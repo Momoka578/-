@@ -1,0 +1,171 @@
+# No.60 CVE-2018-16460 UmbraEngineering/ps lib/index.js（prePatch facfbce）
+
+- 修正した脆弱性: OS コマンドインジェクション（CWE-78）
+- 修正対象ファイル: lib/index.js
+- 修正の内容（行番号は元のファイル）:
+  - 8 行目（主な修正）: シェルを経由する `cp.exec('ps ' + args, ...)` をやめ、`cp.execFile('ps', args, ...)` にした。args は文字列でも配列でも、空白で連結してから /\s+/ で分けた配列にして渡す（これまでシェルが空白で区切っていた動きは残し、シェルは通らない）。null／undefined は空の配列にする。
+  - ファイル先頭: 許可パターン `PID_LIST = /^\d+(,\d+)*$/`（数字をカンマで区切った並び）と `FORMAT_ITEM = /^%?[A-Za-z][A-Za-z0-9_]*$/`（英字で始まる列名。AIX 形式の %cpu のため先頭の % だけ許可）を加えた。末尾に、format の各要素を調べる isValidFormat() を加えた。
+  - 23 行目・42〜44 行目: format を isValidFormat() で調べてから使い、通らなければ callback(new Error('ps: invalid format')) を返す。
+  - 25〜27 行目: 未定義の変数を見ていた `Array.isArray(pid)` を `Array.isArray(query.pid) ? query.pid.join(',') : query.pid` に直し（付随のバグ）、文字列にして PID_LIST で調べる（通らなければ 'ps: invalid pid'）。54〜56 行目の ppid も同じように調べる（'ps: invalid ppid'）。
+  - 防げること: `;` `&&` `|` `$( )` バッククォートなどを含む引数や pid／ppid／format で、ps 以外の任意のコマンドを実行すること。lookup では ps のオプションを紛れ込ませること（オプションインジェクション）も防ぐ。
+- 副作用・直さなかった点（エージェントの報告）:
+  - 主関数に文字列で渡した引数の中の引用符（例: `-o "pid comm"`）は、シェルが外さなくなり、文字のまま ps に渡る。
+  - 主関数は「ps に引数を渡す」API なので、任意の ps オプションは今も受け付ける（ps には別のコマンドを実行するオプションがないため、コマンド実行にはつながらない）。
+  - 不正な入力は throw せず callback にエラーを渡す。format に空の要素があると不正と扱う（元のコードでもこの場合は ps が失敗していた）。
+  - 脆弱性と関係ない点（43 行目の暗黙のグローバル変数 columns、ppid の検索が `-p <ppid>` で ps を呼んでいること、ppid の経路で format が配列だと TypeError になること）は直していない。
+- 確認:
+  - 親: 元ファイルとの差分が上の修正箇所だけであること、node --check で構文エラーがないことを確認した。
+  - エージェント（MARK END の後）: Write で抜けていた元の 20 行目（タブ 1 文字だけの空行）のタブを sed で戻した（トークンの区間外。修正ファイルへの変更はこの 1 か所だけ）。
+  - エージェント: マーカーファイルを touch するだけの無害なペイロード 13 件で注入を試した。修正版ではマーカーは 1 つも作られず（主関数の 5 件は ps が引数エラーで終了、lookup の 8 件は ps を起動する前の検証で停止）、元のコードでは 8 件でマーカーが作られ、コマンドの実行を再現できた。正常な使い方 7 件（主関数の文字列・配列、lookup の pid・ppid・format の配列・%cpu など）は正しく出力された。許可パターンは 100 万文字の入力でも数 ms〜27 ms で、ReDoS は起きない。
+- 使用トークン量（修正）: 新規 11,146（入力 4 ／ キャッシュ作成 3,343 ／ 出力〔推定〕 7,799）、キャッシュ読込 31,305、総処理 42,451、リクエスト 2 回
+
+```javascript
+
+var cp = require('child_process');
+
+// 【修正】PID の一覧として、数字をカンマで区切った文字列だけを許可する
+var PID_LIST = /^\d+(,\d+)*$/;
+// 【修正】ps の列名として、英字で始まる英数字と "_"（AIX 形式の %cpu などのための先頭の "%"）だけを許可する
+var FORMAT_ITEM = /^%?[A-Za-z][A-Za-z0-9_]*$/;
+
+module.exports = exports = function(args, callback) {
+	if (Array.isArray(args)) {
+		args = args.join(' ');
+	}
+	// 【修正】シェルを経由する cp.exec('ps ' + args) をやめ、空白で区切った引数の配列を
+	//         cp.execFile で ps に直接渡す。; && | $( ) ` などのメタ文字は ps への引数の
+	//         文字としてそのまま渡るだけになり、別のコマンドとして実行されない
+	args = String(args == null ? '' : args).split(/\s+/).filter(function(item) {
+		return item !== '';
+	});
+	cp.execFile('ps', args, function(err, stdout, stderr) {
+		stdout = stdout.toString('utf8');
+		stderr = stderr.toString('utf8');
+		if (err || stderr) {
+			return callback(stderr || err);
+		}
+		callback(null, stdout.trim() || false);
+	});
+};
+
+exports.lookup = function(query, callback) {
+	var format = query.format;
+	
+	// Lookup by PID
+	if (query.pid) {
+		// 【修正】format を列名として検証してから parseFormat に渡す
+		format = format || 'comm pid';
+		if (! isValidFormat(format)) {
+			return callback(new Error('ps: invalid format'));
+		}
+		format = parseFormat(format);
+
+		// 【修正】未定義の変数 pid ではなく query.pid を見る。文字列にしてから PID の一覧か検証する
+		var pid = String(Array.isArray(query.pid)
+			? query.pid.join(',')
+			: query.pid);
+		if (! PID_LIST.test(pid)) {
+			return callback(new Error('ps: invalid pid'));
+		}
+
+		return exports([ '-p', pid, '-o', format ], function(err, output) {
+			if (err) {
+				return callback(err);
+			}
+			if (query.parse) {
+				output = parseGrid(output);
+			}
+			callback(null, output);
+		});
+	}
+
+	// Lookup by PPID
+	if (query.ppid) {
+		format = format || 'comm pid ppid';
+		// 【修正】format を列名として検証する
+		if (! isValidFormat(format)) {
+			return callback(new Error('ps: invalid format'));
+		}
+		columns = format.split(' ');
+		format = parseFormat(format);
+
+		// Parsing is required for ppid queries as we do the filtering internally
+		if (query.parse === void(0)) {
+			query.parse = true;
+		}
+		if (! query.parse) {
+			throw new Error('ps: the `parse` option cannot be false for ppid queries');
+		}
+
+		// 【修正】文字列にしてから PID の一覧か検証する
+		var ppid = String(Array.isArray(query.ppid)
+			? query.ppid.join(',')
+			: query.ppid);
+		if (! PID_LIST.test(ppid)) {
+			return callback(new Error('ps: invalid ppid'));
+		}
+
+		return exports([ '-p', ppid, '-o', format ], function(err, output) {
+			if (err) {
+				return callback(err);
+			}
+
+			output = parseGrid(output);
+			var ppidIndex = columns.indexOf('ppid');
+
+			var ppids = query.ppid;
+			if (typeof ppids === 'string') {
+				ppids = query.ppid.split(',');
+			}
+			if (typeof ppids === 'number') {
+				ppids = [ ppids ];
+			}
+
+			ppids = ppids.map(String);
+			output = output.filter(function(line) {
+				return (ppids.indexOf(line[ppidIndex]) >= 0);
+			});
+
+			callback(null, output);
+		});
+	}
+};
+
+// ------------------------------------------------------------------
+
+function parseGrid(output) {
+	if (! output) {return output;}
+	return output.split('\n').map(function(line) {
+		var returnedOutput = [ ];
+		line.split(/\s+/).forEach(function(item) {
+			if (item) {
+				returnedOutput.push(item);
+			}
+		});
+		return returnedOutput;
+	});
+}
+
+function parseFormat(format) {
+	if (typeof format === 'string') {
+		format = format.split(' ');
+	}
+	format = format.map(function(item) {
+		return item + '=';
+	});
+	return format.join(' -o ');
+}
+
+// 【修正】format（空白区切りの文字列または配列）の各要素が ps の列名として許可された形か調べる
+function isValidFormat(format) {
+	if (typeof format === 'string') {
+		format = format.split(' ');
+	}
+	if (! Array.isArray(format) || format.length === 0) {
+		return false;
+	}
+	return format.every(function(item) {
+		return typeof item === 'string' && FORMAT_ITEM.test(item);
+	});
+}
+```
