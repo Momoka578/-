@@ -1,0 +1,572 @@
+# No.31 GoogleChrome/rendertron src/renderer.js (prePatch 16ade32)
+
+- 検証した修正コード: "xss以外の修正コード"
+- 検証結果: **不備あり** — 直接指定した URL・file: スキーム・内部への解決・リダイレクトは止まる。ただし接続先の検査はページ自身のセッションの Network イベントだけで、(1) 別プロセスの iframe（OOPIF）と Worker の通信、(2) WebSocket の接続先が検査されず、内部の内容が /render・/screenshot で漏れた（Chrome 156 で確認。Local Network Access がない環境が条件）。修正コード2: 子ターゲットに自動でアタッチして同じ検査をかけ、監視できなければ返さない。WebSocket の URL のホストも検査。chrome-remote-interface は sessionId を扱える版が必要
+- 修正コード2 のファイル: src/renderer.js
+- 親の確認: src/renderer.js: node --check で構文エラーなし。エージェントが読み取り専用の材料（orig・given）を変えていないこと、読まない範囲のファイルを読んでいないことを、記録で確認した。
+- 親の注記: 不備 2（WebSocket）は、VERIFY_END の時点では「未確認」だったが、エージェントが再修正の区間の試験で、元の修正コードでも漏れることを確かめた（下の説明に経緯がある）。
+- 使用トークン量（検証）: 新規 179,012（入力 50 ／ キャッシュ作成 114,252 ／ 出力〔推定〕 64,710）、キャッシュ読込 1,564,811、総処理 1,743,823、リクエスト 22 回
+- 使用トークン量（再修正）: 新規 96,503（入力 44 ／ キャッシュ作成 61,959 ／ 出力〔推定〕 34,500）、キャッシュ読込 3,407,064、総処理 3,503,567、リクエスト 21 回
+
+- 再修正したファイル: `src/renderer.js` だけ（`$R/fix2/src/renderer.js`）。`src/main.js` は元の修正コード（`--remote-debugging-address=127.0.0.1` への変更）のままでよいので、作り直していない。
+- 元の修正コードのうち、URL の検査（validateUrl：http/https 以外の拒否、DNS で内部アドレスに解決されるホストの拒否）、isPrivateAddress、リダイレクトや応答ごとの接続先 IP の検査、injectBaseHref の JSON.stringify 化は正しく動いていたので、そのまま残した。
+
+### 元の修正コードの不備
+
+#### 不備1: 別プロセスの子ターゲット（cross-site の iframe＝OOPIF、Dedicated Worker）の通信が検査されない
+
+- 場所: `given/fix_nx/src/renderer.js` 160-203 行。
+  ```js
+  const checkRemoteAddress = (response) => { ... isPrivateAddress(response.remoteIPAddress) ... };   // 164-171 行
+  Network.requestWillBeSent((event) => { checkRemoteAddress(event.redirectResponse); ... });         // 178-184 行
+  Network.responseReceived((event) => { checkRemoteAddress(event.response); ... });                   // 187-192 行
+  ```
+  これらのハンドラに届くのは、タブのページ自身のセッションの Network イベントだけ。Chrome のサイト分離では cross-site の iframe は別プロセス（OOPIF）になり、Dedicated Worker も別のターゲットになる。これらの中で起きる通信のイベントは子ターゲットのセッションにしか届かない。元の修正コードは Target.setAutoAttach で子ターゲットにアタッチしておらず、子のセッションで Network も有効にしていないので、その通信の接続先は一度も検査されない。161-162 行のコメント「iframe ... 内部アドレスに接続した場合も、その内容を利用者に返さない」、188 行の「すべての応答（メイン文書・サブリソース）の接続先を検査する」は、子ターゲットについては成り立っていない。
+  （OOPIF の文書そのものの読み込みは親のセッションに届くので、`<iframe src="http://127.0.0.1/...">` を 1 段置くだけの場合は検出できていた。漏れるのは、OOPIF の「中」で起きる通信と Worker の通信。）
+- 問題になる入力（Chrome 156 で実際に確認。公開サーバ役 pub.test・pub2.test は 127.0.0.1 で待ち受け、CDP イベントの remoteIPAddress を 93.184.216.34 に書き換えて公開ホストに見せかけた）:
+  1. `/screenshot/http://pub.test/nested`。pub.test のページが cross-site の pub2.test を iframe で開き、その中に `<iframe src="http://127.0.0.1:<内部ポート>/secret">` を置く。200 で画像が返り、内部ページの内容（INTERNAL-SECRET-4242）が写っていた（bench/out_fix/shot-nested.jpg）。
+  2. `/render/http://pub.test/nestedfetch`。pub2.test の iframe 内の JavaScript が `fetch("http://127.0.0.1:<内部ポート>/cors")` で内部 API（Access-Control-Allow-Origin: * を返す）を読み、`parent.postMessage` で親に渡して DOM に書く。200 で、本文に CORS-INTERNAL-SECRET-4242 が入って返った。同じ fetch をトップレベルの文書で行うと 400 で止まる。iframe を 1 段挟むだけで検査を回り込める。
+  3. `/render/http://pub.test/worker`。Dedicated Worker の中の fetch で同じ内部 API を読み、postMessage で DOM に書く。200 で CORS-INTERNAL-SECRET-4242 が返った。
+
+#### 不備2: WebSocket の接続先が検査されない
+
+- 場所: 同じく `given/fix_nx/src/renderer.js` 163-192 行。検査は HTTP の応答（Network.responseReceived の `response.remoteIPAddress`）だけで行っている。WebSocket の CDP イベント（Network.webSocketCreated / webSocketHandshakeResponseReceived）は responseReceived を出さず、接続先 IP も持たないので、検査が一度もかからない。WebSocket には CORS がないため、ページの JavaScript は内部の WebSocket サービスから受け取った内容をそのまま読める。
+- 問題になる入力（Chrome 156 で実際に確認）: `/render/http://pub.test/ws2`。トップレベルのページが `new WebSocket("ws://127.0.0.1:<内部ポート>/ws")` で受け取ったメッセージを DOM に書く（応答の遅い画像を置いて、受信の後に load が起きるようにした）。元の修正コードでも 200 が返り、本文に WS-INTERNAL-SECRET-4242 が入った。`ws://localhost:<内部ポート>/ws`（ws2name）も同じ。
+- 検証の記録（log.txt の VERIFY_END）を書いた時点では、WebSocket の試験は受信が DOM への書き込みより遅れて結果が出ず、「未確認」としていた。修正コード2 の試験中に受信のタイミングをそろえた試験（ws2）を作り、元の修正コードでも漏れることを確かめたので、不備として加えた。
+
+#### 不備が実際に問題になる条件
+
+- 内部への通信をブラウザ自身が止めない場合に漏れる。Chrome 156 に `--ip-address-space-overrides=127.0.0.1:<公開役ポート>=public` を与え、公開サーバ役を「public」アドレス空間として扱わせた試験では、Chrome の Local Network Access（公開サイトからローカルネットワークへの通信を制限する仕組み）によって、1〜3 と WebSocket の通信は Chrome 自身が遮断した。ただしこれはブラウザの版と設定に頼った防御で、修正コードの効果ではない。サイト分離が既定で、LNA を強制しない版の Chrome や、LNA をポリシー・フラグで無効にした環境では漏えいが残る。判定の脆弱性（内部アドレスの内容が /render の HTML や /screenshot の画像として漏れる）が、一部の経路で残っている。
+
+### 再修正の内容
+
+行番号は `$R/fix2/src/renderer.js` のもの。今回直した箇所には `【修正2】` のコメントを付けた。
+
+#### 1. 定数の追加（15-21 行）
+- `UNMONITORED_TARGET_MESSAGE`: 子ターゲットの監視を始められなかったときのエラーメッセージ。利用者の入力は含めない固定文字列。
+- `AUTO_ATTACH_PARAMS = {autoAttach: true, waitForDebuggerOnStart: true, flatten: true}`: 子ターゲットへの自動アタッチの設定。
+  - `flatten: true` にしたのは、子のセッションへのコマンドを `client.send(method, params, sessionId)` で送れ、子のセッションのイベントも同じ WebSocket 接続の同じイベント名（`Network.responseReceived` など）で届くから。元の修正コードのハンドラを、手を入れずにそのまま子にも使える。
+  - `waitForDebuggerOnStart: true` にしたのは、子ターゲットを起動直後に一時停止させ、Network を有効にしてから動かすため。子の最初の通信（OOPIF の中の iframe の読み込みなど）から漏れなく検査できる。
+
+#### 2. WebSocket の接続先の判定 `isPrivateWebSocketUrl(url)`（113-135 行、新設）
+- WebSocket のイベントには接続先 IP がないので、URL のホストを自分で検査する。`new URL()` でホスト名を取り出し（IPv6 の [] は外す）、IP アドレスなら isPrivateAddress でそのまま判定する。ホスト名なら `dns.lookup(..., {all: true})` で引き、1 つでも内部アドレスがあれば内部とみなす。
+- URL が解析できない、名前が引けない、答えが空のときも true（拒否）にする。元の修正コードの「判定できない値は拒否」の方針に合わせた。
+- validateUrl は、元の修正コードのまま変えていない。
+
+#### 3. 子ターゲットへの自動アタッチ（_loadPage 内、160-161 行と 205-232 行）
+- `const {..., Target} = client;` で Target ドメインを取り出す。
+- `config.allowPrivateNetwork` が true でないときだけ、次の処理をする（true のときは元の動作のまま）。
+  - `Target.attachedToTarget` のハンドラで、アタッチされた子ターゲットのセッションに `Network.enable` を送る。続けて同じ設定の `Target.setAutoAttach` を送るので、孫以下の OOPIF・Worker も同じように監視される（このハンドラは子のセッションで起きたアタッチのイベントでも呼ばれる）。最後に `Runtime.runIfWaitingForDebugger` で一時停止を解く。
+  - 子のセッションでの Network イベントは、元の修正コードの `Network.requestWillBeSent` / `Network.responseReceived` のハンドラにも届く。このため、リダイレクト元の応答と、すべての応答の remoteIPAddress の検査（checkRemoteAddress）が子ターゲットにもかかる。内部アドレスなら `blocked = true` にして reject する。
+  - 子のセッションで `Network.enable` か `Target.setAutoAttach` が失敗したら（監視できない子ターゲット）、一時停止を解かずに `blocked = true` と reject（UNMONITORED_TARGET_MESSAGE）にする（fail closed）。ページ自身での `Target.setAutoAttach` が失敗したときも、reject して return する。await の例外で非同期の executor が止まったまま、promise が決着しない（ハングする）ことを防ぐため。
+  - 設定は Page.navigate より前に行うので、最初の子ターゲットから監視される。
+
+#### 4. WebSocket の検査（234-250 行）
+- `Network.webSocketCreated` のハンドラで、作られた WebSocket の URL を isPrivateWebSocketUrl で検査し、内部なら `blocked = true` にして reject する。子ターゲットの中で作られた WebSocket も、3 で Network を有効にしているので同じハンドラに届く。
+- DNS を引く検査は非同期なので、実行中の検査を `pendingChecks`（Set）に入れ、終わったら取り除く。
+- allowPrivateNetwork が true のときは検査しない。
+
+#### 5. checkBlocked の非同期化（306-313 行、394-395 行、435-436 行）
+- `checkBlocked` を async にし、`await Promise.all(Array.from(pendingChecks))` で WebSocket の検査が終わるのを待ってから blocked を判定する。内容を返す直前（serialize の outerHTML 取得の後、captureScreenshot の撮影の後）に、判定の途中の WebSocket を見落とさないようにするため。
+- 呼び出し側（serialize と captureScreenshot）を `await renderResult.checkBlocked();` に変えた。例外はそれぞれの try/catch で reject され、main.js から 400 が返る（元の修正コードと同じ流れ）。
+
+### 確認した内容と結果
+
+確認環境: node v22.22.1、Google Chrome 156.0.8078.79。`$R/bench/` に express@4.22.3、compression、performance-now、uuid@3.4.0、chrome-launcher@1.2.2、chrome-remote-interface@0.34.0 を `npm install --ignore-scripts` で入れた（rendertron 本体は入れていない）。サーバはすべて 127.0.0.1 だけで待ち受けた。テストの道具は次のとおり。
+- bench/unit.js: validateUrl / isPrivateAddress の単体確認。vm で読み込み、対象のファイルは変えない。
+- bench/unit_ws.js: isPrivateWebSocketUrl の単体確認。
+- bench/harness.js: 実際の Chrome での結合確認。main.js をモジュールとして読み込み、テスト側で 127.0.0.1 に listen する。
+- bench/shim_cri.js: chrome-remote-interface のラッパー。Chrome 156 と組み合わせるための互換処理、公開ホストの模擬、障害の注入を行う。
+- bench/shim_launcher.js: chrome-launcher のラッパー。--host-resolver-rules を足す。
+- bench/shim_cache.js: cache.js のスタブ。
+
+1. 構文確認: `node --check fix2/src/renderer.js` は OK。
+2. 単体確認:
+   - unit.js（修正コード2 に対して実行）: 元の修正コードと同じ結果になった。isPrivateAddress 50 件、validateUrl 51 件が期待どおり。ただし `http://127.0.0.1%2f@pub.test/` が通るのは、ホストが pub.test と解釈されるためで、正しい動作（テストの期待値の誤り）。
+   - unit_ws.js: `ws://127.0.0.1`、`wss://[::1]`、`ws://localhost`、`ws://0x7f000001`、`ws://169.254.169.254`、`ws://10.1.2.3`、内部に解決される名前、解決できない名前、URL でない文字列は「内部（拒否）」になった。`ws://pub.test`（公開に解決）、`wss://93.184.216.34`、公開 IPv6 は「公開」になった。12 件すべて期待どおり。
+3. 結合確認（harness.js、app_fix2）。元のコード／元の修正コード／修正コード2 の順に並べる。
+   - 直接指定（`file:///etc/passwd`、`FILE:///etc/hostname`、`http://127.0.0.1:INT/secret`、`localhost`、`0x7f000001`、Chrome デバッグポートの `/json/version`）: 200 で漏えい／400／400。
+   - 公開ページからの 302、JS による遷移、トップレベルでの fetch、/screenshot の 302・単純な iframe: 200 で漏えい（画像に写る）／400／400。
+   - **不備1** `/screenshot/.../nested`（OOPIF の中の内部 iframe）: 画像に秘密が写る／画像に秘密が写る／**400**。子のセッションで `requestWillBeSent http://127.0.0.1:INT/secret` → `responseReceived remote=127.0.0.1` を検出した（EVLOG で確認）。
+   - **不備1** `/render/.../nestedfetch`（OOPIF の中の fetch）: 200 で漏えい／200 で漏えい／**400**。
+   - **不備1** `/render/.../worker`（Worker の中の fetch）: 200 で漏えい／200 で漏えい／**400**。
+   - **不備2** `/render/.../ws2`、`/ws2name`（内部への WebSocket）: 200 で漏えい／200 で漏えい／**400**。
+   - 正常な動作:
+     - `/render/.../normal`: 3 つとも 200 で、本文は同じ（`<h1 id="h">PUBLIC-OK-JS</h1>`）。
+     - `/screenshot/.../normal`: 3 つとも 200。画像は元のコードとバイト単位で同一（cmp で確認）。
+     - cross-site iframe を含む正常ページ `/xsite`: /render は 200、/screenshot は 200 で、画像は元のコードと同一（iframe の中身も写る）。
+     - Worker を使う正常ページ `/workerok`: 200 で、本文に WORKER-OK が入った（Worker が一時停止のまま残っていないことを確認）。
+     - 公開ホストへの WebSocket を使うページ `/wsok`: 200 で、所要時間は 3 つとも約 1.1 秒で同じ。
+     - `'` を含む URL: 元の修正コードと同じく正常に動いた。
+4. allowPrivateNetwork: true（app_fix2_allow/config.json）: `file:///etc/passwd` は /render・/screenshot とも 400（スキームの制限は残る）。`http://127.0.0.1:INT/secret`、`/ws2`、`/nestedfetch` は 200 で描画された（設定どおり内部の描画を許す。子ターゲットへのアタッチもしない）。
+5. fail closed の確認（shim_cri.js で、子のセッション宛ての Network.enable を失敗させた）: 子ターゲットを含む `/xsite`、`/workerok` は 400（"Cannot monitor network access of a subframe or worker"）になり、ハングしなかった。子ターゲットを含まない `/normal` は 200。
+6. Chrome の LNA を有効にした状態（公開役を public アドレス空間にした）: `/normal`・`/xsite`・`/workerok` は 200。`/ws2` は 400。`/screenshot/.../nested` は、内部 iframe を Chrome 自身が遮断してエラー表示になり（画像を目視で確認。秘密は写っていない）、200。
+7. 後片付け: 試験の後に Chrome のプロセスが残っていないことを確認した（pgrep）。
+
+### 副作用・残る点
+
+- 動作の変化:
+  - allowPrivateNetwork が true でないとき、子ターゲット（OOPIF・Worker）の通信も待ち合わせの対象（outstandingRequests）に入る。試験では、cross-site iframe や Worker を含むページで、元のコードが 10 秒の上限まで待っていた描画が早く終わった（/xsite 10 秒 → 約 0.1〜0.4 秒）。返す内容は同じだった。
+  - 公開ページの中の OOPIF・Worker・WebSocket が内部アドレスに接続すると、ページ全体の描画が 400 になる（内容を返さない）。元の修正コードの、トップレベルの方針と同じ。
+  - WebSocket のホスト名が DNS で引けないときも、内部と同じ扱いで 400 になる（判定できない値は拒否する方針）。
+- chrome-remote-interface の版: 修正コード2 は、子のセッションに `client.send(method, params, sessionId)` でコマンドを送る。このため、sessionId（flatten 方式）を扱える版の chrome-remote-interface が要る（試験では 0.34.0）。package.json の依存 `^0.24.1` の版は sessionId を扱えない。ただし 0.24 は、Chrome 111 以降が要求する PUT /json/new に対応しないので、そもそも新しい Chrome には接続できない。また、0.24 で使える古いヘッドレスの Chrome では、cross-site の iframe は通常同じプロセスで動き、元の修正コードの検査が効く。sessionId を無視する古い版を模擬した試験（DROP_SESSION）では、子ターゲットが一時停止のまま残った。このため、iframe の中身や Worker が動かず、内容は漏れなかった。一方で /screenshot が返らない（40 秒でタイムアウト）ことがあった。この組み合わせ（古い chrome-remote-interface と、サイト分離された Chrome）では使わない前提になる。
+- 直していない点とその理由:
+  - DNS リバインディング:
+    - WebSocket の検査は、Node 側の DNS の答えで行う。Chrome が別の答え（内部アドレス）を得た場合は見逃しうる。HTTP の応答は実際の接続先 IP で検査するので、そちらは捕まえられる。
+    - リバインディングなどでページの JavaScript が内部の内容を読み、攻撃者のサーバへ直接送る経路は、元の修正コードの説明どおり、この方式では防げない。完全に防ぐには、Chrome の全通信を、接続先 IP を検査するプロキシに通す、あるいはネットワーク側で内部への通信を遮断するなど、構成上の対策が要る。
+  - 内部への通信そのもの: 子ターゲットや WebSocket で内部への接続が起きたことは検出して内容を返さないが、接続（リクエストの送信）そのものは止められない。元の修正コードの「残る点」と同じ。
+  - HTTP・WebSocket 以外の経路は対象外とした。WebRTC など、CDP の Network イベントに現れない経路で、ページから内部と通信する方法がこれにあたる。
+  - タブが残る: 検査で reject したとき、タブと CDP 接続を閉じないまま残る。元のコードの loadingFailed の経路と同じ、既存の作りのままにした。
+  - 補足の XSS（main.js の `Cannot render ${url}` を text/html で返す）、`/_ah/stop` に認証がない点、renderOnly の前方一致は、元の修正コードと同じく対象外（CWE-200 の修正とは原因が別で、その成否に影響しない）。
+
+### 修正コード2 の全文: src/renderer.js
+
+```javascript
+'use strict';
+
+const CDP = require('chrome-remote-interface');
+// 【修正】URL の検査（スキームと接続先アドレス）に使うモジュール
+const dns = require('dns');
+const net = require('net');
+const {URL} = require('url');
+
+// 【修正】レンダリングを許可する URL スキーム（file:, chrome:, data:, view-source: などは拒否する）
+const ALLOWED_PROTOCOLS = ['http:', 'https:'];
+
+// 【修正】内部アドレスへの接続を拒否したときのエラーメッセージ（利用者の入力は含めない）
+const PRIVATE_ADDRESS_MESSAGE = 'Access to private network address is forbidden';
+
+// 【修正2】子ターゲット（別プロセスの iframe や Worker）の通信を監視できなかったときのエラーメッセージ
+const UNMONITORED_TARGET_MESSAGE = 'Cannot monitor network access of a subframe or worker';
+
+// 【修正2】子ターゲットへの自動アタッチの設定。flatten 方式で、子ターゲットは起動直後に一時停止させる
+// （Network を有効にしてから動かすため、最初の通信から検査できる）
+const AUTO_ATTACH_PARAMS = {autoAttach: true, waitForDebuggerOnStart: true, flatten: true};
+
+/**
+ * 【修正】IPv4 アドレス（4 つの数値）が内部向け・予約済みの範囲か判定する。
+ * @param {!Array<number>} p
+ * @return {boolean}
+ */
+function isPrivateIPv4(p) {
+  return p[0] === 0 || p[0] === 10 || p[0] === 127 ||   // 0.0.0.0/8, 10.0.0.0/8, ループバック
+      (p[0] === 100 && p[1] >= 64 && p[1] <= 127) ||    // 100.64.0.0/10（CGN）
+      (p[0] === 169 && p[1] === 254) ||                 // リンクローカル（クラウドのメタデータサーバ）
+      (p[0] === 172 && p[1] >= 16 && p[1] <= 31) ||     // 172.16.0.0/12
+      (p[0] === 192 && p[1] === 168) ||                 // 192.168.0.0/16
+      (p[0] === 192 && p[1] === 0 && p[2] === 0) ||     // 192.0.0.0/24
+      (p[0] === 198 && (p[1] === 18 || p[1] === 19)) || // 198.18.0.0/15
+      p[0] >= 224;                                      // マルチキャスト・予約・ブロードキャスト
+}
+
+/**
+ * 【修正】IP アドレスがループバック・プライベート・リンクローカルなど、
+ * 外部の利用者に接続させてはならない範囲か判定する。判定できない値は true（拒否）とする。
+ * @param {string} address
+ * @return {boolean}
+ */
+function isPrivateAddress(address) {
+  const ip = String(address).replace(/^\[|\]$/g, '').replace(/%.*$/, '').toLowerCase();
+  if (net.isIPv4(ip))
+    return isPrivateIPv4(ip.split('.').map(Number));
+  if (!net.isIPv6(ip))
+    return true;
+
+  // IPv6 を 16 ビット × 8 個に展開する（末尾が IPv4 表記なら 16 進 2 個に変換する）。
+  let s = ip;
+  const v4 = s.match(/(\d+)\.(\d+)\.(\d+)\.(\d+)$/);
+  if (v4)
+    s = s.slice(0, v4.index) + ((v4[1] << 8) | v4[2]).toString(16) + ':' + ((v4[3] << 8) | v4[4]).toString(16);
+  const halves = s.split('::');
+  const head = halves[0] ? halves[0].split(':') : [];
+  const tail = halves[1] ? halves[1].split(':') : [];
+  const groups = halves.length === 2 ?
+      head.concat(new Array(Math.max(0, 8 - head.length - tail.length)).fill('0'), tail) : head;
+  if (groups.length !== 8)
+    return true;
+  const w = groups.map((g) => parseInt(g, 16));
+  const embedded = [w[6] >> 8, w[6] & 0xff, w[7] >> 8, w[7] & 0xff];
+
+  if (w[0] === 0 && w[1] === 0 && w[2] === 0 && w[3] === 0 && w[4] === 0 && (w[5] === 0 || w[5] === 0xffff))
+    return isPrivateIPv4(embedded);   // ::, ::1, IPv4 互換アドレス, IPv4 射影アドレス（::ffff:127.0.0.1 など）
+  if (w[0] === 0x64 && w[1] === 0xff9b)
+    return isPrivateIPv4(embedded);   // NAT64（64:ff9b::/96）
+  if (w[0] === 0x2002)
+    return isPrivateIPv4([w[1] >> 8, w[1] & 0xff, w[2] >> 8, w[2] & 0xff]);  // 6to4（2002::/16）
+  return (w[0] & 0xfe00) === 0xfc00 ||  // ユニークローカル fc00::/7
+      (w[0] & 0xffc0) === 0xfe80 ||     // リンクローカル fe80::/10
+      (w[0] & 0xffc0) === 0xfec0 ||     // サイトローカル fec0::/10（廃止済み）
+      (w[0] & 0xff00) === 0xff00;       // マルチキャスト ff00::/8
+}
+
+/**
+ * 【修正】利用者が指定した URL を検査し、正規化した URL を返す。
+ * http:/https: 以外のスキーム（file: など）と、内部ネットワークのアドレスに
+ * 解決されるホスト（localhost, 127.0.0.1, 169.254.169.254 など）は拒否する。
+ * config.allowPrivateNetwork が true のときだけ内部アドレスを許可する（テスト・社内利用向け）。
+ * @param {string} url
+ * @param {!Object} config
+ * @return {!Promise<string>}
+ */
+async function validateUrl(url, config) {
+  let parsed;
+  try {
+    parsed = new URL(url);
+  } catch (e) {
+    throw new Error('Invalid URL');
+  }
+  if (!ALLOWED_PROTOCOLS.includes(parsed.protocol))
+    throw new Error('URL scheme is not allowed');
+
+  if (!config['allowPrivateNetwork']) {
+    const hostname = parsed.hostname.replace(/^\[|\]$/g, '');
+    const addresses = await new Promise((resolve, reject) => {
+      dns.lookup(hostname, {all: true}, (err, result) => {
+        if (err)
+          reject(new Error('Cannot resolve host'));
+        else
+          resolve(result);
+      });
+    });
+    if (!addresses.length || addresses.some((a) => isPrivateAddress(a.address)))
+      throw new Error(PRIVATE_ADDRESS_MESSAGE);
+  }
+  return parsed.href;
+}
+
+/**
+ * 【修正2】ページが開いた WebSocket の接続先が内部アドレスか判定する。
+ * WebSocket の CDP イベントには接続先の IP（remoteIPAddress）が無いため、URL のホストを
+ * 自分で検査する。IP アドレスならそのまま判定し、ホスト名なら DNS で引いて 1 つでも内部
+ * アドレスがあれば true とする。URL が解析できない・名前が解決できない場合も true（拒否）とする。
+ * @param {string} url
+ * @return {!Promise<boolean>}
+ */
+async function isPrivateWebSocketUrl(url) {
+  let hostname;
+  try {
+    hostname = new URL(url).hostname.replace(/^\[|\]$/g, '');
+  } catch (e) {
+    return true;
+  }
+  if (net.isIP(hostname))
+    return isPrivateAddress(hostname);
+  return new Promise((resolve) => {
+    dns.lookup(hostname, {all: true}, (err, result) => {
+      resolve(!!err || !result.length || result.some((a) => isPrivateAddress(a.address)));
+    });
+  });
+}
+
+class Renderer {
+  _loadPage(client, url, options, config) {
+    /**
+     * Finds any meta tags setting the status code.
+     * @return {?number} status code
+     */
+    function getStatusCode() {
+      const metaElement = document.querySelector('meta[name="render:status_code"]');
+      if (!metaElement)
+        return undefined;
+      return parseInt(metaElement.getAttribute('content')) || undefined;
+    }
+
+    /**
+     * Listens for the 'render-complete' event.
+     */
+    function listenForCompletionEvent() {
+      document.addEventListener('render-complete', () => {
+        console.log('Rendering complete');
+      });
+    }
+
+    return new Promise(async(resolve, reject) => {
+      // 【修正2】子ターゲットの監視に Target ドメインを使う
+      const {Page, Runtime, Network, Emulation, Console, Target} = client;
+
+      await Promise.all([
+        Page.enable(),
+        Runtime.enable(),
+        Console.enable(),
+        Network.enable(),
+        Network.setBypassServiceWorker({bypass: true}),
+      ]);
+
+      // Inject the Shady DOM polyfill if web components v1 is used, so we can
+      // serialize the page.
+      // TODO(samli): This needs to change to use the non-deprecated API after Chrome 61
+      //   addScriptToEvaluateOnNewDocument({source: `ShadyDOM = {force: true}`})
+      const shadyFlag = options['wc-inject-shadydom'];
+      if (shadyFlag == '' || !!shadyFlag) {
+        // Deprecated in Chrome 61.
+        Page.addScriptToEvaluateOnLoad({scriptSource: `customElements.forcePolyfill = true`});
+        Page.addScriptToEvaluateOnLoad({scriptSource: `ShadyDOM = {force: true}`});
+        Page.addScriptToEvaluateOnLoad({scriptSource: `ShadyCSS = {shimcssproperties: true}`});
+      }
+
+      // Add hook for completion event.
+      Page.addScriptToEvaluateOnLoad({scriptSource: `(${listenForCompletionEvent.toString()})()`});
+
+      if (!!config['debug']) {
+        Console.messageAdded((event) => {
+          console.log(`[${event.message.level}] ${event.message.text}`);
+        });
+      }
+
+      // 【修正】実際に接続した相手の IP アドレスを応答ごとに検査する。
+      // 公開ホストからのリダイレクト、ページ内の JavaScript による遷移や iframe、
+      // DNS リバインディングで内部アドレスに接続した場合も、その内容を利用者に返さない。
+      let blocked = false;
+      const checkRemoteAddress = (response) => {
+        if (config['allowPrivateNetwork'] || !response || !response.remoteIPAddress)
+          return;
+        if (isPrivateAddress(response.remoteIPAddress)) {
+          blocked = true;
+          reject(new Error(PRIVATE_ADDRESS_MESSAGE));
+        }
+      };
+
+      // 【修正2】サイト分離で別プロセスになった cross-site の iframe（OOPIF）や Dedicated Worker の
+      // 通信は、このページのセッションには Network イベントが届かない。そのままでは、OOPIF の中の
+      // iframe・fetch や Worker の fetch で内部アドレスに接続しても checkRemoteAddress が呼ばれず、
+      // その内容が /render の HTML や /screenshot の画像で漏れる。
+      // そこで子ターゲットに自動でアタッチし（孫以下にも同じ設定をする）、各セッションで Network を
+      // 有効にする。子セッションの Network イベントも、同じ接続の下のハンドラ（下の
+      // Network.requestWillBeSent / Network.responseReceived）に届くので、同じ検査がかかる。
+      // 監視を始められなかった子ターゲットがあれば、一時停止させたまま内容を返さない（fail closed）。
+      if (!config['allowPrivateNetwork']) {
+        Target.attachedToTarget(async(event) => {
+          const sessionId = event.sessionId;
+          try {
+            await client.send('Network.enable', {}, sessionId);
+            await client.send('Target.setAutoAttach', AUTO_ATTACH_PARAMS, sessionId);
+          } catch (error) {
+            blocked = true;
+            reject(new Error(UNMONITORED_TARGET_MESSAGE));
+            return;
+          }
+          client.send('Runtime.runIfWaitingForDebugger', {}, sessionId).catch(() => {});
+        });
+        try {
+          await Target.setAutoAttach(AUTO_ATTACH_PARAMS);
+        } catch (error) {
+          reject(new Error(UNMONITORED_TARGET_MESSAGE));
+          return;
+        }
+      }
+
+      // 【修正2】WebSocket には同一オリジンポリシー（CORS）がかからず、ページの JavaScript が
+      // ws://127.0.0.1:... などの内部サービスから受け取った内容を DOM に書けば、/render で返ってしまう。
+      // WebSocket の CDP イベントには接続先の IP が無いので、作られた時点で URL のホストを検査する
+      // （子ターゲットの WebSocket も同じハンドラに届く）。DNS を引く検査は非同期なので、
+      // 実行中の検査を pendingChecks に入れ、内容を返す前の checkBlocked で終わるのを待つ。
+      const pendingChecks = new Set();
+      Network.webSocketCreated((event) => {
+        if (config['allowPrivateNetwork'])
+          return;
+        const check = isPrivateWebSocketUrl(event.url).then((isPrivate) => {
+          if (isPrivate) {
+            blocked = true;
+            reject(new Error(PRIVATE_ADDRESS_MESSAGE));
+          }
+          pendingChecks.delete(check);
+        });
+        pendingChecks.add(check);
+      });
+
+      Page.navigate({url: url}).catch(reject);
+
+      // Check that all outstanding network requests have finished loading.
+      const outstandingRequests = new Map();
+      let initialRequestId = undefined;
+      Network.requestWillBeSent((event) => {
+        // 【修正】リダイレクト元の応答も検査する
+        checkRemoteAddress(event.redirectResponse);
+        if (!initialRequestId)
+          initialRequestId = event.requestId;
+        outstandingRequests.set(event.requestId, event);
+      });
+
+      let statusCode = 200;
+      Network.responseReceived((event) => {
+        // 【修正】すべての応答（メイン文書・サブリソース）の接続先を検査する
+        checkRemoteAddress(event.response);
+        if (event.requestId == initialRequestId && event.response.status != 0)
+          statusCode = event.response.status;
+      });
+
+      Network.loadingFinished((event) => {
+        outstandingRequests.delete(event.requestId);
+      });
+
+      Network.loadingFailed((event) => {
+        if (event.requestId == initialRequestId) {
+          reject({message: event.errorText});
+        }
+        outstandingRequests.delete(event.requestId);
+      });
+
+      // Ensure the page load event has fired.
+      let pageLoadEventFired = false;
+      Page.loadEventFired(() => {
+        pageLoadEventFired = true;
+      });
+
+      // Set a virtual time budget of 10 seconds. This 10 second timer is paused while there are
+      // any active network requests. This allows for a maximum of 10 seconds in script/rendering
+      // time. Once the page is idle, the virtual time budget expires immediately.
+      let currentTimeBudget = 10000;
+      Emulation.setVirtualTimePolicy({policy: 'pauseIfNetworkFetchesPending', budget: currentTimeBudget});
+
+      let budgetExpired = async() => {
+        let result = await Runtime.evaluate({expression: `(${getStatusCode.toString()})()`});
+        // Original status codes which aren't either 200 or 304 always return with that
+        // status code, regardless of meta tags.
+        if ((statusCode == 200 || statusCode == 304) && result.result.value)
+          statusCode = result.result.value;
+
+        resolve({
+          status: statusCode || 200,
+          // 【修正】読み込み完了の後（内容の取り出し直前）にも、内部アドレスへの
+          // 接続がなかったかを呼び出し側で確認できるようにする
+          // 【修正2】WebSocket の接続先の検査（非同期）が終わるのを待ってから判定する
+          checkBlocked: async() => {
+            await Promise.all(Array.from(pendingChecks));
+            if (blocked)
+              throw new Error(PRIVATE_ADDRESS_MESSAGE);
+          },
+        });
+        budgetExpired = () => {};
+        clearTimeout(timeoutId);
+      };
+
+      Emulation.virtualTimeBudgetExpired((event) => {
+        // Reset the virtual time budget if there is still outstanding work. Converge the virtual time
+        // budget just in case network requests are firing on a regular timer.
+        if (outstandingRequests.size || !pageLoadEventFired) {
+          // Budget must be an integer.
+          currentTimeBudget = Math.ceil(currentTimeBudget / 2);
+          Emulation.setVirtualTimePolicy({policy: 'pauseIfNetworkFetchesPending', budget: currentTimeBudget});
+          return;
+        }
+        budgetExpired();
+      });
+
+      // Set a hard limit of 10 seconds.
+      let timeoutId = setTimeout(() => {
+        console.log(`10 second time budget limit reached.
+          Attempted rendering: ${url}
+          Page load event fired: ${pageLoadEventFired}
+          Outstanding network requests: ${outstandingRequests.size}`);
+        budgetExpired();
+      }, 10000);
+
+      // Listen for the message that signals that rendering event was fired.
+      Console.messageAdded((event) => {
+        if (event.message.text === 'Rendering complete') {
+          budgetExpired();
+        }
+      });
+    });
+  }
+
+  serialize(url, options, config) {
+    /**
+     * Executed on the page after the page has loaded. Strips script and
+     * import tags to prevent further loading of resources.
+     */
+    function stripPage() {
+      const elements = document.querySelectorAll('script, link[rel=import]');
+      elements.forEach((e) => e.remove());
+    }
+
+    /**
+     * Injects a <base> tag which allows other resources to load. This
+     * has no effect on serialised output, but allows it to verify render quality.
+     * @param {string} url - Requested URL to set as the base.
+     */
+    function injectBaseHref(url) {
+      const base = document.createElement('base');
+      base.setAttribute('href', url);
+      document.head.appendChild(base);
+    }
+
+    return new Promise(async(resolve, reject) => {
+      // 【修正】タブを開く前に URL を検査し、以降は正規化した URL だけを使う
+      try {
+        url = await validateUrl(url, config);
+      } catch (error) {
+        reject(error);
+        return;
+      }
+
+      const tab = await CDP.New({port: config.port});
+      const client = await CDP({tab: tab, port: config.port});
+
+      const {Runtime} = client;
+
+      try {
+        let renderResult = await this._loadPage(client, url, options, config);
+
+        await Runtime.evaluate({expression: `(${stripPage.toString()})()`});
+        // 【修正】URL を JSON 文字列リテラルとして埋め込む（' を含む URL で式が壊れる・注入されるのを防ぐ）
+        await Runtime.evaluate({expression: `(${injectBaseHref.toString()})(${JSON.stringify(url)})`});
+
+        let result = await Runtime.evaluate({expression: 'document.firstElementChild.outerHTML'});
+        CDP.Close({id: client.target.id, port: config.port});
+        // 【修正】内容を返す直前に、内部アドレスへの接続がなかったか再確認する
+        // 【修正2】checkBlocked は非同期になったので await する
+        await renderResult.checkBlocked();
+        resolve({
+          status: renderResult.status,
+          body: result.result.value});
+      } catch (error) {
+        reject(error);
+      }
+    });
+  }
+
+  captureScreenshot(url, options, config) {
+    return new Promise(async(resolve, reject) => {
+      // 【修正】タブを開く前に URL を検査し、以降は正規化した URL だけを使う
+      try {
+        url = await validateUrl(url, config);
+      } catch (error) {
+        reject(error);
+        return;
+      }
+
+      const tab = await CDP.New({port: config.port});
+      const client = await CDP({tab: tab, port: config.port});
+
+      const {Animation, Page, Emulation} = client;
+
+      // Accelerate global animation timeline so that loading animations
+      // are hopefully complete by the time we take the screenshot.
+      Animation.setPlaybackRate({playbackRate: 1000});
+
+      const width = Math.min(2000, parseInt(options['width']) || 1000);
+      const height = Math.min(2000, parseInt(options['height']) || 1000);
+      await Emulation.setDeviceMetricsOverride({width: width, height: height, mobile: true, deviceScaleFactor: 3.5, fitWindow: false, screenWidth: width, screenHeight: height});
+      await Emulation.setVisibleSize({width: width, height: height});
+
+      try {
+        // 【修正】結果を受け取り、撮影後に内部アドレスへの接続がなかったか確認する
+        let renderResult = await this._loadPage(client, url, options, config);
+        let {data} = await Page.captureScreenshot({format: 'jpeg', quality: 60});
+
+        CDP.Close({id: client.target.id, port: config.port});
+        // 【修正2】checkBlocked は非同期になったので await する
+        await renderResult.checkBlocked();
+        resolve(data);
+      } catch (error) {
+        reject(error);
+      }
+    });
+  }
+}
+
+module.exports = new Renderer();
+```
+
+---
