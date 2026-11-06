@@ -1,0 +1,349 @@
+# No.40 soyuka/pidusage lib/stats.js (prePatch e3660d8)
+
+- 検証した修正コード: "xss以外の修正コード"
+- 検証結果: **不備あり** — ps() のコマンド注入と win() の wmic 引数注入は直った（実際の ps で注入 0 件）。ただし追加した invalidPid() の String(pid) が、{toString:1} や Object.create(null) の pid で nextTick の中で TypeError を投げ、呼び出し側で捕まえられずプロセスが落ちる新しい DoS が入った（修正前は同期の例外で捕まえられた）。修正コード2: describePid() でメッセージ作成を try/catch で包み、nextTick の前に作る
+- 修正コード2 のファイル: lib/stats.js
+- 親の確認: lib/stats.js: node --check で構文エラーなし。エージェントが読み取り専用の材料（orig・given）を変えていないこと、読まない範囲のファイルを読んでいないことを、記録で確認した。
+- 使用トークン量（検証）: 新規 54,599（入力 28 ／ キャッシュ作成 35,401 ／ 出力〔推定〕 19,170）、キャッシュ読込 519,590、総処理 574,189、リクエスト 14 回
+- 使用トークン量（再修正）: 新規 25,102（入力 16 ／ キャッシュ作成 15,966 ／ 出力〔推定〕 9,120）、キャッシュ読込 495,193、総処理 520,295、リクエスト 8 回
+
+### 元の修正コードの不備
+
+#### 不備 1: 不正な pid のエラーを作る invalidPid() が、特定のオブジェクトの pid で捕捉できない例外を投げ、プロセスが落ちる（修正で新しく入ったサービス不能。CWE-248 捕捉されない例外 / CWE-703）
+
+- ファイル: `lib/stats.js`（元の修正コード `$R/given/fix_nx/lib/stats.js`）
+- 場所: 26-30 行の `invalidPid()`、とくに 28 行
+
+  ```js
+  function invalidPid(pid, done) {
+    process.nextTick(function() {
+      done(new Error('[pidusage] Invalid pid: pid must be a positive integer, got ' + JSON.stringify(String(pid))), null)
+    })
+  }
+  ```
+
+  この関数は、`ps()`（124 行、darwin・sunos・freebsd・aix で使う）と `win()`（153 行、Windows で使う）で、`safePid()` が null を返したとき（pid が正の整数でないとき）に呼ばれる。
+- 問題: `safePid()` は `typeof` が number・string 以外の pid をすべて null にするので、オブジェクトの pid は必ず `invalidPid()` に来る。そこで `String(pid)` を呼ぶが、`String()` は次のようなオブジェクトに対して TypeError「Cannot convert object to primitive value」を投げる。
+  - `toString` と `valueOf` が関数でないオブジェクト（JSON の `{"toString":1}` や `{"toString":{},"valueOf":{}}` を `JSON.parse` した値）
+  - プロトタイプのないオブジェクト（`Object.create(null)`。qs の plainObjects などで作られる）
+  - そのようなオブジェクトを要素に持つ配列（`[{"toString":1}]`）、深くネストした配列（`[[[[…]]]]` で RangeError）、`toString` が例外を投げるオブジェクト
+  
+  この `String(pid)` は `process.nextTick` のコールバックの中で実行されるため、例外は `pidusage.stat()` の呼び出し側の try/catch では受け止められず、捕捉されない例外として Node のプロセスを終了させる。
+- 問題になる入力・条件: 判定の記録の前提（アプリが外部から受け取った値を数値か確かめずに `pidusage.stat()` に渡す）と同じ使い方で、たとえば JSON の本文 `{"pid":{"toString":1}}` の `pid` がそのまま渡る場合。darwin・sunos・freebsd・aix・Windows で起きる。1 回のリクエストでサーバのプロセスを落とせる。
+- 元のコード（修正前）との比較: 元のコードでは、同じ入力は `'ps -o pcpu,rss -p ' + pid`（98-103 行）や `'PROCESS ' + pid`（122 行）の連結で、`stat()` の中で同期的に TypeError になっていた。同期の例外は呼び出し側（Express などのフレームワークを含む）の try/catch で受け止められ、プロセスは落ちなかった。修正で、受け止められる例外が受け止められない例外に変わった。また、修正のねらい（不正な pid はコールバックのエラーで返す）も、この入力では成り立っていなかった。
+- 実際に確かめた: `$R/bench/t_crash.js`（index.js を通し、`os.platform()` を darwin・aix・win32 に見せかけ、`child_process` は差し替えて実際のコマンドは実行しない。同期の例外は呼び出し側の try/catch で受け止める形）で、元の修正コードは上の 6 種類の入力すべてでプロセスが exit=1 で終了した（stats.js:28 の `String(pid)` で TypeError・RangeError・Error）。修正前のコードは同じ入力で同期の例外になり、try/catch で受け止められてプロセスは生き残った（exit=0）。
+- 根拠の脆弱性（ps() の OS コマンドインジェクション）と win() の引数インジェクションは、元の修正コードで直っていることを確認した（下の「確認した内容と結果」）。不備はこの 1 件だけ。
+
+### 再修正の内容
+
+変更したファイルは `lib/stats.js` だけ（`$R/fix2/lib/stats.js`）。元の修正コードからの変更は次の 2 か所で、ほかの行（safePid()、ps()、win()、proc() など）は変えていない。
+
+#### 変更 1: describePid() を追加（25-36 行）
+
+```js
+// 【修正2】エラーメッセージに入れる pid の表示を、例外を出さずに作る関数を追加。
+// ...
+function describePid(pid) {
+  try {
+    return JSON.stringify(String(pid))
+  } catch(e) {
+    return '(' + typeof pid + ')'
+  }
+}
+```
+
+- 何をするか: エラーメッセージに入れる pid の表示を作る。まず元の修正コードと同じ `JSON.stringify(String(pid))` を試し、`String()` が例外を投げたときだけ、値の代わりに型の名前（`(object)` など）を返す。
+- なぜこの方法か:
+  - try/catch で包むことで、`String()` が投げる例外（TypeError、深いネストの RangeError、`toString` 自体が投げる例外など）をすべてここで止められる。どんな値でも、この関数は例外を出さずに文字列を返す。
+  - 元の修正コードで変換できていた値（数値、文字列、null、undefined、真偽値、Symbol、BigInt、文字列に変換できる配列やオブジェクト）の表示は、元の修正コードと同じまま変わらない。変更を必要な範囲にとどめるため、表示のしかたを全部作り直すことはしなかった。
+  - `JSON.stringify` は文字列に対しては例外を出さず、改行などの制御文字を `\n` のようにエスケープするので、エラーメッセージを使ったログの改ざんも起きない（元の修正コードと同じ）。
+
+#### 変更 2: invalidPid() のメッセージを、nextTick の前に describePid() で作る（37-46 行）
+
+```js
+// 【修正】不正な pid のときに返すエラー (他のエラーと同じく非同期で done を呼ぶ)
+// 【修正2】メッセージは describePid() で、nextTick の前に作る。...
+function invalidPid(pid, done) {
+  var message = '[pidusage] Invalid pid: pid must be a positive integer, got ' + describePid(pid)
+
+  process.nextTick(function() {
+    done(new Error(message), null)
+  })
+}
+```
+
+- 何を変えたか: メッセージを `process.nextTick` の外（invalidPid() が呼ばれた時点）で、`describePid()` を使って作る。nextTick のコールバックでは、できているメッセージから Error を作って `done` を呼ぶだけにした。
+- なぜか: nextTick のコールバックの中には、値の変換など例外を出しうる処理を置かないようにするため。describePid() は例外を出さないので、メッセージ作りを外に出しても `stat()` が同期で例外を投げることはなく、エラーは必ずコールバックで返る。
+- どう動くか: 不正な pid では、元の修正コードと同じく、コマンド（ps / wmic）を起動せずに、次のティックで `done(Error, null)` が 1 回だけ呼ばれる。メッセージは、変換できる値なら `got "1;id"` のように値を、変換できないオブジェクトなら `got (object)` を表示する。正しい pid の処理（execFile / spawn に配列で渡す）は元の修正コードと同じ。
+
+### 確認した内容と結果
+
+テストは `$R/bench/` に置き、対象のディレクトリやファイルのパスを引数で渡した。Node v22.22.1。修正前のコード（orig）、元の修正コード（fix）、修正コード2（fix2）を同じテストで比べた。index.js と lib/helpers.js は同じコミット（e3660d8）から取得したもの。
+
+1. 構文確認: `node --check` で fix2 の `lib/stats.js` に構文エラーなし。index.js から require して読み込めた。
+2. 落ちる入力での確認（`t_crash.js`。darwin・aix・win32 に見せかけ、child_process は差し替え）:
+   - 入力: `{"toString":1}`、`{"toString":{},"valueOf":{}}`（JSON.parse の結果）、`Object.create(null)`、`[{"toString":1}]`、20000 段にネストした配列、`toString` が例外を投げるオブジェクト
+   - fix: 3 つのプラットフォームすべてで、捕捉されない例外によりプロセスが exit=1 で終了。
+   - fix2: すべて `stat()` は例外を出さずに戻り、コールバックに `[pidusage] Invalid pid: ... got (object)` のエラーが返り、プロセスは生き残った（exit=0）。
+   - Symbol、BigInt、`['123']` は、fix と fix2 で同じメッセージ（`got "Symbol(x)"`、`got "123"`）のエラーが返った（表示が変わっていないことを確認）。
+3. 攻撃の入力での確認（`t_ps_real.js`。darwin に見せかけて index.js → stats.ps を通し、実際の ps を実行）:
+   - orig では `'1; touch 印'`、`'1$(touch 印)'`、``'1`touch 印`'``、`'1 | touch 印'` で印ファイルが 4 つ作られた（コマンド実行を再現）。
+   - fix2 では、これらと `'1 && touch'`、改行入り、末尾改行のみ、配列 `['1;touch …']`、toString が攻撃文字列を返すオブジェクト、境界値（0、-1、'-1'、1.5、'+1'、' 1'、'1 '、'0x1F'、1e21、NaN、Infinity、-0、null、undefined、true、全角数字、'00'、'1 -e'、'-e'）がすべてコマンドを起動せずにエラーで返り、印ファイルは 0 個。コールバックが 2 回呼ばれることもなかった。
+4. 引数の確認（`t_mock.js`。child_process を差し替えて渡る引数を記録）:
+   - fix2 の ps は darwin で `execFile('ps', ['-o','pcpu,rss','-p','123'])`、aix で `['-o','pcpu,rssize','-p','123']`。'1;id' では何も実行しない。
+   - fix2 の win は 123 / '123' で `spawn('wmic', ['PROCESS','123','get','workingsetsize,usermodetime,kernelmodetime'])`（orig と同じ argv）。`'1 /node:evil.example'`、`'1 call terminate'`、`'1&calc'`、0、null では wmic を起動しない（orig では `/node:evil.example` や `call terminate` が wmic の引数として増えていた）。
+   - 出力の解析結果（cpu・memory）は orig・fix と同じ。
+5. 正常な動作（`t_ps_real.js`）: 実際の ps で process.pid（数値・文字列）を取得し、orig と同じ形 `{cpu, memory}` が返った。存在しない pid 999999 は orig と同じく ps のエラー。
+
+### 副作用・残る点
+
+- 動作の変化: 変換できないオブジェクトの pid のエラーメッセージは、値の代わりに `got (object)` になる。元の修正コードではこの入力でプロセスが落ちていたので、エラーが返るようになったことだけが変化。ほかの値のメッセージと、正しい pid での動作は元の修正コードと同じ。
+- 元の修正コードの動作の変化（そのまま残す）: 0、負の数、小数、前後の空白、'+1'、カンマ区切り、配列 `['123']`、BigInt `123n` などはエラーになる（pid はドキュメント上 int なので問題にしない）。先頭 0 付きの '0123' は検証を通るが、Linux の procps の ps は修正前と同じくエラーにする（コマンドの引数 1 つとして渡るだけなので無害）。
+- 直していない点: Linux・NetBSD 用の `proc()` / `proc_calc()` は元の修正コードと同じく変えていない。
+  - 同じ「変換できないオブジェクト」の pid を渡すと、`proc_calc()` の `this.history[pid]`（非同期のコールバックの中）で TypeError になり、プロセスが落ちる。これは修正前のコードにもある元からの問題で（修正前・元の修正コードとも、linux に見せかけて確かめた）、修正で入ったものではない。
+  - pid に `'../'` を入れて /proc の外の `stat` という名前のファイルを読ませる余地も残る。
+  - どちらも、判定の根拠の脆弱性（ps() の exec による OS コマンドインジェクション）とは別の箇所・別の原因で、コマンドは実行されない。元の修正コードでも対象外としており、この再修正は、修正で新しく入った不備を直すことに範囲を絞ったため触れていない。直すなら、proc() の先頭でも safePid() で検証し、不正なら invalidPid() でエラーを返すのがよい。
+
+### 修正コード2 の全文: lib/stats.js
+
+```javascript
+var os = require('os')
+var fs = require('fs')
+var p = require('path')
+// 【修正】シェル (/bin/sh -c) を経由する exec をやめ、引数を配列で渡す execFile を使う
+var execFile = require('child_process').execFile
+var spawn = require('child_process').spawn
+var helpers = require('./helpers')
+var format = require('util').format
+
+// 【修正】pid を検証する関数を追加。数値または文字列で、10進の数字だけ (正の整数) のときだけ
+// 文字列にして返し、それ以外 (シェルのメタ文字、空白、符号、小数、オブジェクトなど) は null を返す。
+// 一度だけ String() で変換した値を返すので、検証後に値が変わることもない。
+function safePid(pid) {
+  if(typeof pid !== 'number' && typeof pid !== 'string')
+    return null
+
+  var s = String(pid)
+
+  if(!/^[0-9]+$/.test(s) || parseInt(s, 10) <= 0)
+    return null
+
+  return s
+}
+
+// 【修正2】エラーメッセージに入れる pid の表示を、例外を出さずに作る関数を追加。
+// String(pid) は、toString と valueOf が関数でないオブジェクト (JSON の {"toString":1} など) や
+// プロトタイプのないオブジェクト (Object.create(null)) に対して TypeError を投げる。
+// 投げた場合は値を表示せず、型の名前だけを返す。これまで変換できていた値の表示は変わらない。
+function describePid(pid) {
+  try {
+    return JSON.stringify(String(pid))
+  } catch(e) {
+    return '(' + typeof pid + ')'
+  }
+}
+
+// 【修正】不正な pid のときに返すエラー (他のエラーと同じく非同期で done を呼ぶ)
+// 【修正2】メッセージは describePid() で、nextTick の前に作る。元は nextTick の中で String(pid) を
+// 呼んでいたため、変換できないオブジェクトでは捕捉できない例外になり、プロセスが落ちていた。
+function invalidPid(pid, done) {
+  var message = '[pidusage] Invalid pid: pid must be a positive integer, got ' + describePid(pid)
+
+  process.nextTick(function() {
+    done(new Error(message), null)
+  })
+}
+
+var stats = {
+  history: {},
+  cpu: null, //used to store cpu informations
+  proc: function(pid, options, done) {
+    var self = this
+
+    if(this.cpu !== null) {
+      fs.readFile('/proc/uptime', 'utf8', function(err, uptime) {
+        if(err)
+          return done(err, null)
+
+        if(uptime === undefined) {
+          console.error("[pidusage] We couldn't find uptime from /proc/uptime")
+          self.cpu.uptime = os.uptime()
+        } else {
+          self.cpu.uptime = uptime.split(' ')[0]
+        }
+
+        return self.proc_calc(pid, options, done)
+      })
+    } else {
+      helpers.cpu(function(err, cpu) {
+        if(err)
+          return done(err, null)
+
+        self.cpu = cpu
+        return self.proc_calc(pid, options, done)
+      })
+    }
+  },
+  proc_calc: function(pid, options, done) {
+    var history = this.history[pid] ? this.history[pid] : {}
+    var cpu = this.cpu
+    var self = this
+
+    //Arguments to path.join must be strings
+    fs.readFile(p.join('/proc', ''+pid, 'stat'), 'utf8', function(err, infos) {
+
+      if(err)
+        return done(err, null)
+
+      //https://github.com/arunoda/node-usage/commit/a6ca74ecb8dd452c3c00ed2bde93294d7bb75aa8
+      //preventing process space in name by removing values before last ) (pid (name) ...)
+      var index = infos.lastIndexOf(')')
+      infos = infos.substr(index + 2).split(' ')
+
+      //according to http://man7.org/linux/man-pages/man5/proc.5.html (index 0 based - 2)
+      //In kernels before Linux 2.6, start was expressed in jiffies. Since Linux 2.6, the value is expressed in clock ticks
+      var stat = {
+          utime: parseFloat(infos[11]),
+          stime: parseFloat(infos[12]),
+          cutime: parseFloat(infos[13]),
+          cstime: parseFloat(infos[14]),
+          start: parseFloat(infos[19]) / cpu.clock_tick,
+          rss: parseFloat(infos[21])
+      }
+
+      //http://stackoverflow.com/questions/16726779/total-cpu-usage-of-an-application-from-proc-pid-stat/16736599#16736599
+
+      var childrens = options.childrens ? stat.cutime + stat.cstime : 0
+
+      var total = stat.stime - (history.stime || 0) + stat.utime - (history.utime || 0) + childrens
+
+      total = total / cpu.clock_tick
+
+      //time elapsed between calls
+      var seconds = history.uptime !== undefined ? cpu.uptime - history.uptime : stat.start - cpu.uptime
+      seconds = Math.abs(seconds)
+      seconds = seconds === 0 ? 1 : seconds //we sure can't divide through 0
+
+      self.history[pid] = stat
+      self.history[pid].uptime = cpu.uptime
+
+      return done(null, {
+        cpu: (total / seconds) * 100,
+        memory: stat.rss * cpu.pagesize
+      })
+    })
+  },
+  /**
+   * Get pid informations through ps command
+   * @param  {int}   pid
+   * @return  {Function} done (err, stat)
+   * on os x skip headers with pcpu=,rss=
+   * on linux it could be --no-header
+   * on solaris 11 can't figure out a way to do this properly so...
+   */
+  ps: function(pid, options, done) {
+
+    // 【修正】pid が正の整数でなければ、コマンドを実行せずにエラーを返す
+    var pidStr = safePid(pid)
+    if(pidStr === null)
+      return invalidPid(pid, done)
+
+    // 【修正】コマンド文字列の連結をやめ、引数を配列で組み立てる
+    var args = ['-o', 'pcpu,rss', '-p', pidStr]
+
+    if(os.platform() == 'aix')
+      args = ['-o', 'pcpu,rssize', '-p', pidStr] //this one could work on other platforms
+
+    // 【修正】exec(cmd + pid) をやめ、シェルを経由しない execFile で ps を直接実行する
+    execFile('ps', args, function(err, stdout, stderr) {
+      if(err)
+        return done(err, null)
+
+      stdout = stdout.split(os.EOL)[1]
+      stdout = stdout.replace(/^\s+/, '').replace(/\s\s+/g, ' ').split(' ')
+
+      return done(null, {
+        cpu: parseFloat(stdout[0].replace(',', '.')),
+        memory: parseFloat(stdout[1]) * 1024
+      })
+    })
+  },
+  /**
+   * This is really in a beta stage
+   */
+  win: function(pid, options, done) {
+    // 【修正】pid が正の整数でなければ、wmic を起動せずにエラーを返す
+    var pidStr = safePid(pid)
+    if(pidStr === null)
+      return invalidPid(pid, done)
+
+    var history = this.history[pid] ? this.history[pid] : {}
+		//  http://social.msdn.microsoft.com/Forums/en-US/469ec6b7-4727-4773-9dc7-6e3de40e87b8/cpu-usage-in-for-each-active-process-how-is-this-best-determined-and-implemented-in-an?forum=csharplanguage
+    // 【修正】文字列を空白で split して引数にするのをやめ、引数の配列を直接組み立てる
+    // (pid に空白が入っても wmic への引数が増えないようにする。args はエラーメッセージ用に残す)
+    var argv = ['PROCESS', pidStr, 'get', 'workingsetsize,usermodetime,kernelmodetime']
+    var args = argv.join(' ')
+
+    var wmic = spawn('wmic', argv, {detached: true})
+    var stdout = ''
+    var stderr = ''
+    var self = this
+    var uptime = os.uptime()
+
+    wmic.stdout.on('data', function(d) {
+     stdout += d.toString()
+    })
+
+    wmic.stderr.on('data', function(d) {
+      stderr += d.toString()
+    })
+
+    wmic.on('error', function(err) {
+      console.error('[pidusage] Command "wmic ' + args + '" failed with error %s', err)
+    })
+
+    wmic.on('close', function(code) {
+      stdout = stdout.trim()
+      stderr = stderr.trim()
+
+      if(!stdout || code !== 0) {
+        var error = format('%s Wmic errored, please open an issue on https://github.com/soyuka/pidusage with this message.%s', new Date().toString(), os.EOL)
+        error += format('Command was "wmic %s" %s System informations: %s - release: %s %s - type %s %s', args, os.EOL, os.EOL, os.release(), os.EOL, os.type(), os.EOL)
+        stderr = error + (stderr ? format('Wmic reported the following error: %s.', stderr) : 'Wmic reported no errors (stderr empty).')
+        stderr = format('%s%s%sWmic exited with code %d.', os.EOL, stderr, os.EOL, code)
+        stderr = format('%s%sStdout was %s', stderr, os.EOL, stdout ? stdout : 'empty')
+
+        return done(new Error(stderr, null))
+      }
+
+      stdout = stdout.split(os.EOL)[1].replace(/\s\s+/g, ' ').split(' ')
+
+      var stats = {
+        kernelmodetime: parseFloat(stdout[0]),
+        usermodetime: parseFloat(stdout[1]),
+      }
+
+      var workingsetsize = parseFloat(stdout[2])
+
+      //process usage since last call
+      var total = stats.kernelmodetime - (history.kernelmodetime || 0) + stats.usermodetime - (history.usermodetime || 0)
+      total = total / 10000000
+
+      //time elapsed between calls
+      var seconds = history.uptime !== undefined ? uptime - history.uptime : 0
+      seconds = Math.abs(seconds)
+      seconds = seconds === 0 ? 1 : seconds //we sure can't divide through 0
+
+      self.history[pid] = stats
+      self.history[pid].uptime = uptime
+
+      return done(null, {cpu: (total / seconds) * 100, memory: workingsetsize})
+    })
+    wmic.stdin.end()
+  }
+}
+
+module.exports = stats;
+```
+
+---
