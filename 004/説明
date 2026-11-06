@@ -1,0 +1,257 @@
+## No.4 OWASP BenchmarkJava BenchmarkTest00013.java
+
+- XSS の種別: 反射型（Referer ヘッダの値が保存されずに、同じリクエストのレスポンスにそのまま返される）
+- source（ユーザーの入力）: HTTP リクエストの Referer ヘッダ（L45 `request.getHeaders("Referer")`、L48 `headers.nextElement()`）
+- sink（出力先）: L56 `response.getWriter().format(java.util.Locale.US, param, obj)`（text/html のレスポンス本文）
+- 修正したファイル: src/main/java/org/owasp/benchmark/testcode/BenchmarkTest00013.java
+- 検証（プロンプトファイル2）の結果: 問題なし
+
+このファイルは、OWASP Benchmark（脆弱性検出ツールの評価用に、わざと脆弱に作ったテストケースの集まり）のサーブレットである。サーブレットは、Java で HTTP リクエストを受けてレスポンスを返すプログラムのこと。URL `/xss-00/BenchmarkTest00013` に来た GET と POST を、どちらも `doPost` で処理する。
+
+判定では XSS（CWE-79）のほかに、書式文字列の外部制御（CWE-134）も指摘している。修正コードは、同じ 1 行の置き換えで両方を直している。
+
+### 1. 元のコードの問題
+
+元のコードの関係する部分:
+
+```java
+ 42	        response.setContentType("text/html;charset=UTF-8");
+ 43	
+ 44	        String param = "";
+ 45	        java.util.Enumeration<String> headers = request.getHeaders("Referer");
+ 46	
+ 47	        if (headers != null && headers.hasMoreElements()) {
+ 48	            param = headers.nextElement(); // just grab first element
+ 49	        }
+ 50	
+ 51	        // URL Decode the header value since req.getHeaders() doesn't. Unlike req.getParameters().
+ 52	        param = java.net.URLDecoder.decode(param, "UTF-8");
+ 53	
+ 54	        response.setHeader("X-XSS-Protection", "0");
+ 55	        Object[] obj = {"a", "b"};
+ 56	        response.getWriter().format(java.util.Locale.US, param, obj);
+```
+
+値の流れ:
+
+1. L45・L48: Referer ヘッダの最初の値を `param` に入れる。Referer は、ブラウザが「どのページから来たか」を伝えるために送るヘッダで、前のページの URL が入る（source）。
+2. L52: `URLDecoder.decode` で URL デコードする。URL エンコードは、URL に直接書けない文字を `%` と 16 進数 2 桁で表したもの（`<` は `%3C`、`>` は `%3E`）。デコードで `%3C` が `<` に戻る。
+3. L42: レスポンスの Content-Type を text/html にしている。ブラウザは本文を HTML として解釈する。
+4. L54: `X-XSS-Protection: 0` を送る。古いブラウザが持っていた XSS フィルタを無効にするヘッダである。
+5. L56: `format(Locale.US, param, obj)` で出力する（sink）。`format` の 2 番目の引数は書式文字列（`%s` のような書式指定子を含むひな形）で、`%` で始まる部分以外はそのまま出力される。
+
+なぜ危ないのか:
+
+- `param` を HTML エスケープせずに出力している。HTML エスケープは、`<` や `"` など HTML で特別な意味を持つ文字を、別の書き方に置き換えること。
+- L52 の URL デコードで、`%3C` のようにエンコードされたタグも `<` に戻ってしまう（"xssの詳細" では「悪化している」としている）。
+- さらに `param` を書式文字列として使っている（CWE-134）。デコード後の `param` に `%s` があると、`obj` の値 `a` に置き換わる。型の合わない指定子や不正な指定子があると、例外（IllegalFormatException）になる。
+
+攻撃の入力の例と、元のコードで起きること:
+
+- 攻撃者は、URL にエンコードしたスクリプトを含むページを用意し、そこから被害者をこのサーブレットへ移動させる（"xssの詳細" の攻撃例）。
+- 例えば Referer が `http://evil.example/%3Cscript%3Ealert(1)%3C/script%3E` のとき、L52 で `http://evil.example/<script>alert(1)</script>` に戻る。
+- この文字列には `%` がないので、L56 はそのまま出力する。ブラウザは `<script>` をタグと解釈し、`alert(1)` を実行する。実際の攻撃では、Cookie を盗むスクリプトなどが入る。
+- "xssの詳細" によると、ブラウザの Referrer-Policy で送られる値が制限される場合もある。ただし、コードとしては無防備である。
+
+### 2. 修正の内容
+
+元の L56 の 1 行だけを、修正コードの L39〜45 に置き換えた（L39・L40 は【修正】コメント）。ほかの行（Referer の取得、URL デコード、Content-Type、X-XSS-Protection）は元のままである。ライセンスヘッダの省略は説明しない。
+
+#### 修正 1: 出力する値を ESAPI の encodeForHTML で HTML エンコードする（XSS 対策。元のコード L56 → 修正コード L39〜45）
+
+修正前:
+```java
+ 56	        response.getWriter().format(java.util.Locale.US, param, obj);
+```
+
+修正後:
+```java
+ 39	        // 【修正】外部入力 param を書式文字列として使わず（CWE-134 対策）、固定の書式 "%s" の引数として渡す。
+ 40	        // 【修正】出力前に ESAPI の encodeForHTML で HTML エンティティ化し、< > " ' & がタグや属性として解釈されないようにする（XSS 対策）。
+ 41	        response.getWriter()
+ 42	                .format(
+ 43	                        java.util.Locale.US,
+ 44	                        "%s",
+ 45	                        org.owasp.esapi.ESAPI.encoder().encodeForHTML(param));
+```
+
+L45 の式の意味:
+
+- `org.owasp.esapi.ESAPI`: OWASP の ESAPI（Enterprise Security API）というセキュリティ用ライブラリのクラス。パッケージ名から書く「完全修飾名」なので、import 文を足さなくてよい。
+- `.encoder()`: 文字列を安全な形に変換する Encoder オブジェクトを返す。どの実装を使うかは設定ファイル ESAPI.properties で決まる（このプロジェクトでは DefaultEncoder。検証で確認）。
+- `.encodeForHTML(param)`: `param` を、HTML の本文に入れても安全な形に変換した文字列を返す。規則は次のとおり（検証の記録による）。
+  - 英数字と `,` `.` `-` `_` 空白は、そのまま残す。
+  - それ以外の文字は、すべて文字参照にする。文字参照は、`&lt;` のように文字を別の書き方で表したもの。ブラウザは `<` という文字として表示するが、タグの始まりとは見なさない。
+  - `<` `>` `&` `"` は名前付きの `&lt;` `&gt;` `&amp;` `&quot;` になる。`'` は `&#x27;`、`/` は `&#x2f;`、`(` は `&#x28;` のように、16 進数の番号で表す。
+  - 制御文字（タブ・改行・復帰以外の見えない文字）は、`&#xfffd;`（置換文字 �）にする。
+
+なぜこれで XSS が防げるのか:
+
+- 出力先は HTML 本文のテキストで、属性の中やスクリプトの中ではない。この場所でタグを作るには、生の `<` が必要である。
+- encodeForHTML の後には、生の `<` `>` `"` `'` も、文字参照でない `&` も残らない。そのため、入力がどんな文字列でも、ブラウザは文字として表示するだけになる。
+- エンコードは L35 の URL デコードの後、出力の直前に行う。`%3C` でエンコードしたタグも、デコードされて `<` に戻ってからエンコードされる。
+- ESAPI は、同じコミットの pom.xml に依存（esapi 2.7.0.0）として入っている。新しいライブラリを持ち込む修正ではない（検証で確認）。
+
+#### 修正 2: 書式文字列を固定の "%s" にする（CWE-134 対策。元のコード L56 → 修正コード L42〜44）
+
+修正前:
+```java
+ 56	        response.getWriter().format(java.util.Locale.US, param, obj);
+```
+
+修正後（修正 1 と同じ文の、書式の部分）:
+```java
+ 42	                .format(
+ 43	                        java.util.Locale.US,
+ 44	                        "%s",
+```
+
+- `format(Locale, String 書式, Object... 引数)` は、書式の中の `%s` を、後ろの引数の文字列に置き換えて出力する。
+- 書式を定数の `"%s"` にしたので、出力は「encodeForHTML の結果そのもの」になる。入力の中の `%` は、ただの引数の文字として扱われ、書式指定子として解釈されない。
+- `obj` は引数に渡さなくなった。L38 の `Object[] obj = {"a", "b"};` は使われないまま残っている。
+
+### 3. 修正の結果
+
+攻撃の入力の出力（ESAPI の規則に従って求めたもの。実際の ESAPI を動かした結果ではない）:
+
+- Referer `http://evil.example/%3Cscript%3Ealert(1)%3C/script%3E` は、デコード後にエンコードされ、次のように出力される。
+  `http&#x3a;&#x2f;&#x2f;evil.example&#x2f;&lt;script&gt;alert&#x28;1&#x29;&lt;&#x2f;script&gt;`
+- ブラウザの画面には `http://evil.example/<script>alert(1)</script>` という文字が表示されるだけで、スクリプトは実行されない。
+- Referer に `%25s`（デコードすると `%s`）が入っても、`&#x25;s` と出力され、画面には `%s` と表示される。例外も起きない。
+
+正常な入力での動作:
+
+- 通常の Referer（`http://localhost:8443/...`）も、`:` や `/` が文字参照になるので、出力のバイト列は変わる。ただし、ブラウザでの表示は元と同じである。日本語も `&#x65e5;` のような文字参照になるが、表示は同じ。
+- Referer ヘッダがないときは、元と同じく空の本文になる。
+- 変わるのは、入力の `%` を書式として解釈しなくなった点である。これは CWE-134 の修正による意図した変化。
+
+検証（プロンプトファイル2）で確かめたこと:
+
+- 構文: javac がないため、コードを読んで確かめた。括弧の対応はスクリプトで確認した。`PrintWriter.format(Locale, String, Object...)` と `Encoder.encodeForHTML(String)` があること、import が要らないことも確認した。
+- 依存: 同じコミットの pom.xml と ESAPI.properties を取得し、ESAPI の依存と Encoder の設定があることを確かめた。
+- 攻撃の入力: URLDecoder.decode → encodeForHTML → `"%s"` の処理を Python で再現し、21 件の入力を試した。19 件の出力をチェックし、すべて OK だった。
+  - チェックしたのは、html.parser でタグ・コメント・宣言が出ないこと、`< > " '` が残らないこと、`&` がすべて正しい文字参照の始まりであること、表示される文字列が元と同じこと、の 4 点。
+  - 入力は、大文字・小文字の `%xx`、大文字小文字を混ぜたタグ、`"` や `'` で属性を抜けるもの、二重エンコード、実体参照に見える文字列、NUL・制御文字、overlong UTF-8、全角の＜＞、絵文字、約 2.8 万文字の入力、`%n %s %d %%` や不正な書式指定子など。
+  - 同じ入力で、元のコードでは `<script>`、`<img onerror>`、`<svg onload>` などが HTML として解釈されることも確かめた。
+  - Java と ESAPI を実際に動かしたのではなく、Python での再現による確認である。
+- 正常な入力: 通常の Referer、クエリ付き、日本語、ヘッダなしで試し、表示が元と同じことを確かめた。
+
+残った注意点（検証で「不備ではない」とされたもの）:
+
+- L38 の `Object[] obj` が未使用の変数として残っている（警告が出る程度）。
+- L37 の `X-XSS-Protection: 0` は残っているが、出力をエンコードしたので脆弱性にはならない。
+- L35 の URLDecoder.decode は、末尾の `%` や `%zz` のような不正な並びで例外を投げ、500 エラーになる。元のコードと同じ挙動で、修正とは関係ない。
+
+## No.5 OWASP BenchmarkJava BenchmarkTest00014.java
+
+- XSS の種別: 反射型（Referer ヘッダの値が保存されずに、同じリクエストのレスポンスにそのまま返される）
+- source（ユーザーの入力）: HTTP リクエストの Referer ヘッダ（L45 `request.getHeaders("Referer")`、L48 `headers.nextElement()`）
+- sink（出力先）: L56 `response.getWriter().format(param, obj)`（text/html のレスポンス本文）
+- 修正したファイル: src/main/java/org/owasp/benchmark/testcode/BenchmarkTest00014.java
+- 検証（プロンプトファイル2）の結果: 問題なし
+
+No.4（BenchmarkTest00013）とほぼ同じ構造のサーブレットである。違いは、L56 の `format` に Locale（地域の指定）を渡していない点だけで、危険性も修正の方法も No.4 と同じ。判定では XSS（CWE-79）とあわせて、書式文字列の外部制御（CWE-134）も指摘している。
+
+### 1. 元のコードの問題
+
+元のコードの関係する部分:
+
+```java
+ 42	        response.setContentType("text/html;charset=UTF-8");
+ …
+ 45	        java.util.Enumeration<String> headers = request.getHeaders("Referer");
+ …
+ 48	            param = headers.nextElement(); // just grab first element
+ …
+ 52	        param = java.net.URLDecoder.decode(param, "UTF-8");
+ 53	
+ 54	        response.setHeader("X-XSS-Protection", "0");
+ 55	        Object[] obj = {"a", "b"};
+ 56	        response.getWriter().format(param, obj);
+```
+
+値の流れ:
+
+1. L45・L48: Referer ヘッダ（ブラウザが送る、前のページの URL）の最初の値を `param` に入れる（source）。
+2. L52: URL デコードする。`%3C` のように `%` と 16 進数で書かれた文字が、`<` などの元の文字に戻る。
+3. L42 で Content-Type を text/html にし、L54 でブラウザの XSS フィルタを無効にする（`X-XSS-Protection: 0`）。
+4. L56: `format(param, obj)` で出力する（sink）。`param` は書式文字列（`%s` などの書式指定子を含むひな形）として使われ、`%` で始まる部分以外はそのまま出力される。
+
+なぜ危ないのか:
+
+- `param` を HTML エスケープ（`<` などを別の書き方に置き換えること）せずに出力している。
+- URL デコードで、エンコードされたタグも元に戻る。
+- 外部の入力を書式文字列にしている（CWE-134）。検証の再現では、`%s` は `obj` の値 `a` に置き換わり、`%s%s%s`、`100%`、`%d` などは Formatter の例外になった。
+
+攻撃の入力の例:
+
+- 攻撃者は、URL にエンコードしたスクリプトを含むページを用意し、そこから被害者をこのサーブレットへ移動させる。
+- Referer `http://evil.example/%3Cscript%3Ealert(1)%3C/script%3E` は、L52 で `http://evil.example/<script>alert(1)</script>` になる。`%` を含まないので、L56 はそのまま出力し、ブラウザは `alert(1)` を実行する。
+
+### 2. 修正の内容
+
+元の L56 の 1 行だけを、修正コードの L39〜41 に置き換えた（L39・L40 は【修正】コメント）。ほかの行は元のままである。
+
+#### 修正 1: 出力する値を ESAPI の encodeForHTML で HTML エンコードする（XSS 対策。元のコード L56 → 修正コード L39〜41）
+
+修正前:
+```java
+ 56	        response.getWriter().format(param, obj);
+```
+
+修正後:
+```java
+ 39	        // 【修正】外部入力 param を書式文字列として使わず（CWE-134 対策）、固定の書式 "%s" の引数として渡す。
+ 40	        // 【修正】出力前に ESAPI の encodeForHTML で HTML エンティティ化し、タグや属性として解釈されないようにする（XSS 対策）。
+ 41	        response.getWriter().format("%s", org.owasp.esapi.ESAPI.encoder().encodeForHTML(param));
+```
+
+- `org.owasp.esapi.ESAPI.encoder()`: OWASP のセキュリティ用ライブラリ ESAPI から、文字列を変換する Encoder を取り出す。完全修飾名（パッケージ名から書いた名前）なので import は要らない。
+- `.encodeForHTML(param)`: `param` を HTML 本文用に変換する。英数字と `, . - _ 空白` 以外を、すべて文字参照にする。文字参照は `&lt;` のように文字を別の書き方で表したもので、ブラウザは文字として表示するが、タグの始まりとは見なさない。`<` は `&lt;`、`'` は `&#x27;`、`/` は `&#x2f;` のようになる（詳しい規則は No.4 を参照）。
+- エンコードは URL デコード（L35）の後、出力の直前に行う。`%3C` で書いたタグも、デコード後にエンコードされる。
+- 出力先は HTML 本文のテキストなので、生の `<` `>` `"` `'` `&` が残らなければ、タグも属性も作れない。
+
+#### 修正 2: 書式文字列を固定の "%s" にする（CWE-134 対策。元のコード L56 → 修正コード L41）
+
+修正前:
+```java
+ 56	        response.getWriter().format(param, obj);
+```
+
+修正後（修正 1 と同じ行の、書式の部分）:
+```java
+ 41	        response.getWriter().format("%s", …);
+```
+
+- `format(書式, 引数…)` は、書式の `%s` を引数の文字列に置き換えて出力する。
+- 書式を定数の `"%s"` にしたので、出力は encodeForHTML の結果そのものになる。入力の `%` は書式指定子として解釈されない。
+- `obj` は渡さなくなり、L38 の `Object[] obj` は使われないまま残っている。
+
+### 3. 修正の結果
+
+攻撃の入力の出力（ESAPI の規則に従って求めたもの）:
+
+- Referer `http://evil.example/%3Cscript%3Ealert(1)%3C/script%3E` は、
+  `http&#x3a;&#x2f;&#x2f;evil.example&#x2f;&lt;script&gt;alert&#x28;1&#x29;&lt;&#x2f;script&gt;` と出力される。
+- 画面には `http://evil.example/<script>alert(1)</script>` という文字が表示され、スクリプトは実行されない。
+
+正常な入力での動作:
+
+- 通常の Referer は、出力のバイト列が `http&#x3a;&#x2f;&#x2f;...` のように変わるが、ブラウザでの表示は元と同じである。
+- 書式指定子を含む Referer は、元は置き換えや例外になったが、今は文字どおり表示される。CWE-134 の修正による意図した変化である。
+
+検証（プロンプトファイル2）で確かめたこと:
+
+- 依存: 同じコミットの pom.xml と ESAPI.properties を取得し、esapi 2.7.0.0 の依存と、`ESAPI.Encoder=DefaultEncoder` の設定があることを確かめた。
+- 構文: javac がないため、コードを読んで確かめた。括弧の数（`{ }` 各 5、`( )` 各 17）が対応していること、import が要らないことを確認した。
+- 攻撃の入力: URLDecoder.decode、ESAPI の HTMLEntityCodec（encodeForHTML の中身）、java.util.Formatter の簡易版を Python で再現し、25 種類の Referer を試した。出力を html.parser で解釈した。
+  - 元のコード: 12 件で XSS になった（script、大文字小文字の混在、img onerror、svg onload、`">` で閉じる形、`%1$s<script>` など）。書式指定子を含む入力は例外になった。
+  - 修正コード: XSS になったものは 0 件。二重エンコード（`%253Cscript%253E` は `%3Cscript%3E` のまま表示）、不正な UTF-8（U+FFFD になる）、全角の＜＞、既に実体参照の文字列（`&lt;` は `&amp;lt;` になり文字どおり表示）、NUL、サロゲートペアも安全に出力された。
+- 正常な入力: 表示されるテキストが、デコード後の `param` と全件一致することを確かめた。
+- ESAPI そのものは動かしておらず、Python での再現による確認である。
+
+残った注意点（検証で「不備ではない」とされたもの）:
+
+- `Object[] obj` が未使用で残っている（警告が出るだけ）。
+- `X-XSS-Protection: 0` は残っているが、エスケープで XSS は防げている。
+- `%` や `%zz` のような不正な Referer では、URLDecoder.decode が例外を投げて HTTP 500 になる。元のコードと同じ挙動で、修正の範囲外。
