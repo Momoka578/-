@@ -1,0 +1,589 @@
+## No.95 CVE-2020-15092 TimelineJS3 (NUKnightLab/TimelineJS3, source/js/media/TL.Media.js)
+
+- 検証した修正コード: "修正版コード"
+- 検証結果: **不備あり** — 判定の XSS（showMeta の credit・caption の innerHTML）は直った（攻撃 21 種×autolink の有無、Flickr・Instagram 経由 16 種、ランダム 10 万回で危険な DOM 0。元は 39 件・16 件）。ただし正常な表示が意図せず変わった: (1) Flickr・Instagram のクレジット credit_alternate は TL.Media.Flickr.js・Instagram.js が組み立てた <a> の HTML なのに丸ごとエスケープしたため、リンクにならずタグの文字列が表示される（credit を書かない普通の使い方で必ず起きる）、(2) エスケープしてから linkify するため、&quot; などが URL に取り込まれ、"http://example.com" のリンク先が壊れ余分な ; が出る（通常の文字列 2 万件中 322 件で表示が変化）。修正コード2: 記号を私用領域の文字に置き換えてから linkify し、後で文字参照に戻す _linkifyEscaped()、credit_alternate はテキストと安全な href の a だけを残す許可リスト方式の無害化（createHTMLDocument で解析して作り直す）。危険な DOM 0 のまま、通常の文字列 2 万件の表示が元と完全に同じ。指摘: loadErrorDisplay() が data.url 由来の media_id を innerHTML に入れる XSS が残る（別の source・sink で対象外とされたが理由は弱い）、利用者が credit・caption に書いた HTML は文字列で表示（設計上の選択）
+- 修正コード2 のファイル: source/js/media/TL.Media.js
+- 親の確認: source/js/media/TL.Media.js: node --check で構文エラーなし。エージェントが読み取り専用の材料（orig・given）を変えていないこと、読まない範囲のファイルを読んでいないことを、記録で確認した。
+- 使用トークン量（検証）: 新規 146,534（入力 50 ／ キャッシュ作成 88,336 ／ 出力〔推定〕 58,148）、キャッシュ読込 1,466,650、総処理 1,613,184、リクエスト 25 回
+- 使用トークン量（再修正）: 新規 85,952（入力 48 ／ キャッシュ作成 51,075 ／ 出力〔推定〕 34,829）、キャッシュ読込 3,167,004、総処理 3,252,956、リクエスト 24 回
+
+### 元の修正コードの不備
+
+対象: `$R/given/fix_xss/source/js/media/TL.Media.js`（"修正版コード" No.95）。判定の根拠とした XSS（showMeta の credit/caption を innerHTML へそのまま代入）は直っていて、攻撃の入力では危険な DOM は一度もできなかった。不備は、正常な入力での表示が元のコードから意図せず変わった点（検証の観点 3）にある。
+
+#### 不備1（主）: Flickr / Instagram のクレジットが、リンクにならずタグの文字列のまま表示される
+- 場所: 元の修正コード 291-292 行（updateMeta）
+  ```js
+  // 修正: 外部 API 応答から得た credit_alternate も HTML エスケープしてから出力する
+  this._el.credit.innerHTML		= this._escapeHTML(this.data.credit_alternate);
+  ```
+- 問題: コメントでは credit_alternate を「外部 API 応答から得た値」としているが、実際には、ライブラリ自身のサブクラスが組み立てた HTML である。
+  - TL.Media.Flickr.js 108 行: `self.data.credit_alternate = "<a href='" + self.data.url + "' target='_blank'>" + d.photo.owner.realname + "</a>";`
+  - TL.Media.Instagram.js 67 行: `self.data.credit_alternate = "<a href='" + d.author_url + "' target='_blank'>" + d.author_name + "</a>";`
+
+  この HTML を丸ごとエスケープしているので、ライブラリが作ったリンクのタグまで文字になる。
+- 起きる条件: Flickr か Instagram のメディアで、タイムラインデータに credit を書いていないとき（showMeta → getMeta → 各サブクラスの _getMeta → updateMeta）。特別な入力は要らず、普通の使い方で必ず起きる。
+- 実際に確かめた（`$R/bench/test_alt.js`。jsdom 上で TL.Media.Flickr / TL.Media.Instagram を動かし、TL.getJSON を正常な API 応答を返すスタブにした）:
+  - 元の修正コード: クレジットに `<a href='https://www.flickr.com/photos/someuser/12345/' target='_blank'>John Smith</a>` という文字列がそのまま出て、a 要素はない（Instagram も同じ）。
+  - 元のコード: "John Smith" がリンクとして表示される。
+- 補足: 元のコードでは、ここが XSS になっていた（data.url の引用符で属性を閉じる、realname/author_name に img onerror を入れる、author_url に javascript: を入れる）。元の修正コードのエスケープでこれは防げているので、再修正では XSS を防いだままリンクの表示を戻す必要がある。
+
+#### 不備2（軽微）: autolink のとき、URL の前後に引用符・山かっこ・& があると、リンク先が壊れ、余分な「;」が表示される
+- 場所: 元の修正コード 266 行（credit）と 274 行（caption）
+  ```js
+  this._el.credit.innerHTML		= this.options.autolink == true ? TL.Util.linkify(this._escapeHTML(this.data.credit)) : this._escapeHTML(this.data.credit);
+  ```
+- 問題: エスケープを先にしてから TL.Util.linkify に渡している。linkify の URL パターン `/\b(?:https?|ftp):\/\/([a-z0-9-+&@#\/%?=~_|!:,.;]*[a-z0-9-+&@#\/%=~_|])/` は文字クラスに `& # ;` を含むため、エスケープで生じた `&quot;` `&#39;` `&lt;` `&gt;` `&amp;` を URL の一部として取り込む。URL の最後の文字に「;」は使えないので、`&quot` までが href に入り、「;」がリンクの外に残る。www. で始まる URL のパターン（`[\S]+`）も同じように取り込む。さらに、リンク文字列を 30 文字で切り詰めるとき、文字参照の途中で切れることがある。autolink は TL.Slide.js 58 行で既定が true なので、既定の設定で起きる。
+- 実際に確かめた（`$R/bench/test_edge.js`、`$R/bench/diff_normal.js`）:
+  - `"http://example.com"` → 元の修正コードの表示は `"example.com";`、href は `http://example.com"`（ホスト名に " が付いた壊れたリンク）。元のコードではリンクにならず文字のまま。
+  - `<http://example.com>` → 表示は `<example.com>;`、href は `http://example.com>`。元のコードでは `http://example.com` への正しいリンク。
+  - `see http://example.com/Tom's page` → href が `http://example.com/Tom's` まで伸びる（元は `.../Tom`）。
+  - 30 文字で切り詰めたリンク文字列: `...?a=1&b=2` が `...?a=1&a…`、`...?a=1"b=2` が `...?a=1&qu…` と表示される（元は `...?a=1&b…`、`...?a=1"b=2`）。
+  - HTML の特殊文字を含まない通常の文字列（& は文字参照にならない形だけ）2 万個を元のコードと比べたところ、元の修正コードでは 322 個で表示が変わった（いずれも & のあとに「;」が余分に出たり、リンクの範囲が変わったりするもの）。
+
+#### 不備にしなかった点（参考）
+- loadErrorDisplay()（元の修正コード 227 行）の innerHTML への連結は、修正の説明で対象外とされている。Twitter / TwitterEmbed / Wikipedia のエラー処理が、data.url から切り出した media_id を message に連結して渡すので、data.url 由来の XSS として実際に成り立つ（loadErrorDisplay に img onerror を含む message を渡すと img 要素ができることを確認）。ただし、根拠の脆弱性（showMeta の credit/caption）とは source も sink も別で、これを直さなくても根拠の脆弱性の修正は成り立つため、規定どおり不備にはしない。対象外とした理由（説明では「XSS の問題なので XSS 以外の作業の対象外」「XSS の修正でもエージェントの判断で直していない」としか書かれていない）は弱いので、残っている XSS として記録する。
+- 利用者が credit/caption に書いた HTML（`<a>` や `<em>` など）がタグの文字列のまま表示されるようになった点は、判定時の修正案が「textContent での出力に切り替える」も挙げており、修正者もコメントで意図を書いているので、設計上の選択として扱い、不備にはしない。
+
+### 再修正の内容
+
+修正コード2: `$R/fix2/source/js/media/TL.Media.js`（元の修正コードをコピーし、次の箇所だけを変えた。直したところには `【修正2】` コメントを付けた）。ほかの箇所（_escapeHTML、caption_alternate のエスケープ、autolink でないときのエスケープ、_initLayout の data.link 検証）は元の修正コードのまま。
+
+#### 1. showMeta の autolink 分岐（修正コード2 268 行・277 行）: `TL.Util.linkify(this._escapeHTML(x))` → `this._linkifyEscaped(x)`
+- credit と caption の両方で、autolink のときだけ新しいヘルパー `_linkifyEscaped()` を使うようにした。autolink でないときは、元の修正コードと同じく `_escapeHTML()`。
+- 元の修正コードの【修正】コメントのうち「先にエスケープしてから linkify に渡す」の部分は内容が変わったので書き直し、【修正2】コメントで理由を書いた。
+
+#### 2. 新しいヘルパー `_linkifyEscaped(str)`（修正コード2 332-352 行）
+処理の順番を「仮の文字に置き換える → linkify → エスケープ」にした。
+1. 入力の `< > " '` を、Unicode の私用領域の文字 `\uE000`〜`\uE003` に置き換える。入力に元から `\uE000`〜`\uE003` があれば、先に `\uFFFD`（置換文字）にしておき、後の手順で引用符などに化けないようにする。
+2. `TL.Util.linkify()` を呼ぶ。仮の文字は linkify の URL の文字クラスに含まれず、単語文字でもない（`\b` の判定でも `< > " '` と同じ扱いになる）ので、URL の切れ目は元のコード（エスケープしないで linkify していたとき）と同じになる。`&` は URL に含まれてよい文字なので（クエリ文字列の区切り）、置き換えずにそのまま linkify に渡す。
+3. linkify が作るタグ `<a class='tl-makelink' href='...' onclick='void(0)'>...</a>` には `&` が含まれないので、linkify の後に残っている `&` はすべて入力に由来する。これを `&amp;` にし、仮の文字を `&lt;` `&gt;` `&quot;` `&#39;` に戻す。href 属性の中の `&amp;` などはブラウザが元の文字に戻すので、リンク先は入力どおりの URL になる。
+
+この方法にした理由と、安全性:
+- linkify を通している間、入力由来の `< > " '` は文字として存在しない。そのため、linkify が作る `href='...'` の引用符を入力で閉じることはできず、タグも作れない（元のコードの `www.a.com'onmouseover='alert(1)'` のような攻撃は成り立たない）。入力由来の文字は、最後にすべて文字参照になる。
+- linkify（TL.Util.js）そのものは他の場所（スライド本文など）でも使われているので変えず、TL.Media.js の中だけで直した。
+- 引用符で囲んだ URL（`"http://example.com"`）は、元のコードではリンクにならなかった（linkify が、HTML の href の中の URL を避けるために、直前が引用符の URL をリンクにしない）。修正コード2 では、直前の文字が仮の文字になるので、正しいリンクになる。入力の HTML はもう解釈しないので、この避け方は要らない。
+
+#### 3. updateMeta の credit_alternate（修正コード2 294-298 行）: `innerHTML = this._escapeHTML(...)` → `this._setSanitizedHTML(this._el.credit, ...)`
+credit_alternate は、ライブラリが組み立てたリンクの HTML に、信頼できない値（data.url、API 応答の名前や URL）が入ったもの。丸ごとエスケープするとリンクが出ず、エスケープしないと XSS になるので、許可リスト方式の無害化にした。
+
+- `_setSanitizedHTML(el, html)`（358-368 行）: `document.implementation.createHTMLDocument("")` で、表示しない文書を作り、その中の div の innerHTML に入れて解析する。この文書はブラウジングコンテキストを持たないので、スクリプトは動かず、画像も読み込まれない（img の onerror なども発火しない。jQuery の parseHTML なども同じ目的でこの方法を使っている）。解析した結果は `_appendSafeNodes()` で表示中の文書に作り直す。HTML 文字列に戻して innerHTML に入れ直すことはしないので、解析と再解析の違いを突く mXSS も起きない。`createHTMLDocument` がない環境では、無害化できないので、元の修正コードと同じくエスケープして文字として出す。
+- `_appendSafeNodes(from, to)`（370-396 行）: 子孫を順にたどる。
+  - テキストノード: `document.createTextNode()` で作り直して追加する。
+  - a 要素: `document.createElement("a")` で新しく作る。href は `_isSafeLink()` を通るものだけ、target は `"_blank"` のときだけ付け直す。on* 属性、style など、ほかの属性はすべて捨てる。中身は再帰で同じように処理する。
+  - script / style / template / noscript / noembed / noframes / iframe / object / embed / textarea / title / xmp / select / svg / math: 中身ごと捨てる。
+  - それ以外の要素（b、span、img など）: タグを外し、中身のテキストだけを残す（img などは中身がないので消える）。
+  - コメントなど、ほかの種類のノードは捨てる。
+- `_isSafeLink(url)`（398-403 行）: http / https / mailto と相対 URL だけを安全とする。判定方法は、元の修正コードの _initLayout の data.link の検証と同じ（ブラウザが除去する空白・タブ・改行・制御文字 U+0000〜U+0020 を取り除いてから、スキームがあるか、あれば http/https/mailto かを見る）。_initLayout 自体は不備がないので変えていない。
+- caption_alternate（Flickr はタイトル＋説明文、Instagram はタイトル）は、ライブラリがタグを組み立てていないので、元の修正コードのままエスケープする。
+
+#### 4. その他
+- 編集ツールが、コード中の `\uE000` などのエスケープ表記を生の私用領域の文字に変えて書き込んだので、Python で、コード行の生の文字（11 個）だけをエスケープ表記 `\uE000`〜`\uE003`、`\uFFFD` に機械的に戻した。動作は変わらない。最終版にこれらの生の文字が残っていないことは確認した。
+
+### 確認した内容と結果
+
+確認には `$R/bench/` のスクリプトを使った。harness.js は、jsdom 31（`npm install --ignore-scripts` で `$R/bench/` に入れた）の上に TL の最小環境を作る。同じコミットの TL.Util.js / TL.Class.js / TL.Dom.js と、Flickr / Instagram のサブクラスは本物を読み込み、TL.Events / TL.Message / TL.getJSON などはスタブにした。対象の TL.Media.js は、パスを引数で受け取って読み込む。
+
+- 構文確認: `node --check` で、修正コード2・元の修正コード・元のコードとも OK。jsdom 上で、new TL.Media / TL.Media.Flickr / TL.Media.Instagram、showMeta / updateMeta / _initLayout が例外なく動いた。
+- 不備1 の確認（test_alt.js）: 正常な API 応答で、Flickr のクレジットが `<a href="https://www.flickr.com/photos/someuser/12345/" target="_blank">John Smith</a>`、Instagram が `<a href="https://www.instagram.com/someone" target="_blank">someone</a>` の a 要素になり、元のコードと同じ表示に戻った。caption_alternate と、利用者が credit を指定したときの表示も OK。
+- credit_alternate への攻撃（test_alt.js）: data.url の引用符で属性を閉じる（`...12345/'onmouseover='alert(1)'x='`）、`'><a href='javascript:alert(1)'>`、realname に img onerror / script / `</a><svg onload>` / style と iframe / mXSS 風の入れ子 / noscript / form、author_url に javascript: / タブ入りの JaVa\tScRipt: / data: / 引用符、author_name に img、title に svg、の 16 種すべてで、危険な DOM（a 以外の危険な要素、onclick='void(0)' 以外の on* 属性、http/https/ftp/mailto 以外の href、src/style など）はできなかった（元のコードでは 16 種すべてでできた）。javascript: などの href は捨てられ、リンクのない a 要素とテキストになった。
+- _setSanitizedHTML の個別確認（test_fix2_extra.js）: 安全な href と target="_blank" は残り、target="_self" は捨てる。相対 URL と mailto は残る。`' javascript:'`・onclick・style は捨てる。b/i/span はタグを外してテキストを残す。script/style/コメントは中身ごと捨てる。`plain text & <3` は文字のまま出る。createHTMLDocument がない環境ではエスケープした文字になる。作り直した a 要素は表示中の文書のもの。すべて期待どおり。
+- 不備2 の確認（test_edge.js）: `"http://example.com"` → `"example.com"`（href `http://example.com`）、`<http://example.com>` → `<example.com>`（href `http://example.com`）、`...Tom's page` → href `http://example.com/Tom`。余分な「;」は出なくなり、リンク先は元のコードと同じになった（引用符で囲んだ URL は、元のコードではリンクにならなかったが、今は正しいリンクになる）。30 文字の切り詰めも `...?a=1&b…`、`...?a=1"b=2` と元のコードと同じ。
+- 通常の文字列での比較（diff_normal.js）: HTML の特殊文字を含まない通常の文字列 2 万個（autolink の有無を交互に）で、修正コード2 の credit の innerHTML は元のコードと 1 件も違わなかった（元の修正コードは 322 件違った）。
+- credit/caption への攻撃（test_media.js）: img onerror / svg onload / script / 大文字小文字の混在 / 属性の引用符を閉じる入力 / iframe srcdoc / 文字参照で書いた入力 / mXSS 風の入れ子 / linkify の href を割る入力（`http://a.com/'onmouseover='alert(1)`、`www.a.com'onmouseover='alert(1)'`、`http://x.com/?a=.www.foo'onmouseover='alert(1)`、`http://x.com/a@b.com/'onfocus='alert(1)'autofocus='` など）21 種を autolink あり・なしで試し、すべてで危険な DOM はできなかった。数値などの文字列でない値、updateMeta の攻撃 8 種、data.link の 20 種（javascript: の変形 9 種は弾き、http/https/mailto/相対など 11 種は通す）も、元の修正コードと同じ結果。test_media.js は 86 項目すべて OK。
+- 仮の文字を混ぜた入力（test_fix2_extra.js）: `www.a.com\uE003onmouseover=\uE003alert(1)\uE003` などの 4 種で、仮の文字が引用符や山かっこに化けることはなかった（\uFFFD として表示される）。文字参照の形の入力（`&lt;b&gt; &amp; &#39; &copy=1`）も、文字のまま表示された。
+- ランダム入力（fuzz2.js）: 記号・URL・タグの断片・制御文字を組み合わせた入力で、showMeta 10 万回（autolink の有無を交互に）、updateMeta 4 万回を試し、危険な DOM は 0 件だった。linkify の入れ子の置き換えで `a<` という名前の無害な要素ができる場合がある（属性は無害）が、元のコードの linkify にもある挙動で、修正コード2 で増えたものではない。
+- 確認の限界: jsdom は画像を読み込まず、SVG の onload なども発火しないので、createHTMLDocument で作った文書が表示しない文書として動くこと（ハンドラが発火しないこと）は、jsdom では確かめられない。仕様と、同じ方法を使う既存のライブラリの実績にもとづいている。どちらにしても、解析に使った要素は表示中の文書に移さず、許可した属性だけを付けて作り直している。
+
+### 副作用・残る点
+
+- 動作の変化（元のコードと比べて）:
+  - 利用者が credit/caption に書いた HTML（`<a>` `<em>` など）は、元の修正コードと同じく、タグの文字列のまま表示される（設計上の選択。判定時の修正案の「textContent での出力」と同じ扱い）。Flickr の説明文に含まれる HTML（caption_alternate）も同じ。
+  - Flickr / Instagram のクレジットのリンクは、元のコードと同じく表示される。ただし、名前に入っていたタグ（img など）はテキストだけが残る。リンク先が javascript: などのときは、リンク先のない a 要素（文字だけ）になる。
+  - autolink のとき、引用符で囲んだ URL（`"http://..."`）もリンクになる（元のコードでは、linkify が HTML の属性の中の URL を避ける判定のためにリンクにならなかった）。入力の `>` の直後の `www.` もリンクになる。どちらも、入力の HTML を解釈しなくなったことによるもので、リンク先は安全な http/https/ftp/mailto だけ。
+  - 入力に私用領域の文字 U+E000〜U+E003 があると、autolink のときは U+FFFD（置換文字）として表示される（通常の文章には現れない文字）。
+- 直していない点:
+  - loadErrorDisplay()（修正コード2 227 行）: Twitter / TwitterEmbed / Wikipedia のエラー表示で、data.url から切り出した media_id が innerHTML に入る XSS が残っている。根拠の脆弱性とは source・sink が別で、修正の説明でも対象外とされているので、変更は必要な範囲にとどめるという方針に従って直していない。直すなら、message をエスケープする（呼び出し元が `<br/>` を連結しているので、各呼び出し元で media_id などをエスケープするか、loadErrorDisplay で DOM を組み立てる）必要がある。
+  - TL.Util.linkify そのものの、入れ子の置き換えで生じる表示の乱れ（`a<` という要素や、リンクの中の `' onclick='void(0)'>` の文字列が見えるなど）は、元のコードからある問題で、攻撃にはならないので直していない。
+  - Flickr / Instagram のサブクラス自身（credit_alternate を文字列連結で組み立てていること）は変えていない。TL.Media.js 側の無害化で安全になるため。
+  - _isSafeLink は _initLayout の data.link の検証と同じ処理だが、_initLayout は不備がないので変えず、共通化はしていない。
+
+### 修正コード2 の全文: source/js/media/TL.Media.js
+
+```javascript
+/*	TL.Media
+	Main media template for media assets.
+	Takes a data object and populates a dom object
+================================================== */
+// TODO add link
+
+TL.Media = TL.Class.extend({
+
+	includes: [TL.Events, TL.I18NMixins],
+
+	_el: {},
+
+	/*	Constructor
+	================================================== */
+	initialize: function(data, options, add_to_container) {
+		// DOM ELEMENTS
+		this._el = {
+			container: {},
+			content_container: {},
+			content: {},
+			content_item: {},
+			content_link: {},
+			caption: null,
+			credit: null,
+			parent: {},
+			link: null
+		};
+
+		// Player (If Needed)
+		this.player = null;
+
+		// Timer (If Needed)
+		this.timer = null;
+		this.load_timer = null;
+
+		// Message
+		this.message = null;
+
+		// Media ID
+		this.media_id = null;
+
+		// State
+		this._state = {
+			loaded: false,
+			show_meta: false,
+			media_loaded: false
+		};
+
+		// Data
+		this.data = {
+			unique_id: 			null,
+			url: 				null,
+			credit:				null,
+			caption:			null,
+			credit_alternate: 	null,
+			caption_alternate: 	null,
+			link: 				null,
+			link_target: 		null
+		};
+
+		//Options
+		this.options = {
+			api_key_flickr: 		"bd3a7c45ddd52f3101825d41563a6125",
+			api_key_googlemaps: "AIzaSyB9dW8e_iRrATFa8g24qB6BDBGdkrLDZYI",
+			api_key_embedly: 		"", // ae2da610d1454b66abdf2e6a4c44026d
+			credit_height: 			0,
+			caption_height: 		0,
+			background:         0   // is background media (for slide)
+		};
+
+		this.animator = {};
+
+		// Merge Data and Options
+		TL.Util.mergeData(this.options, options);
+		TL.Util.mergeData(this.data, data);
+
+        // Don't create DOM elements if this is background media
+        if(!this.options.background) {
+            this._el.container = TL.Dom.create("div", "tl-media");
+
+            if (this.data.unique_id) {
+                this._el.container.id = this.data.unique_id;
+            }
+
+            this._initLayout();
+
+            if (add_to_container) {
+                add_to_container.appendChild(this._el.container);
+                this._el.parent = add_to_container;
+            }
+        }
+	},
+
+	loadMedia: function() {
+		var self = this;
+
+		if (!this._state.loaded) {
+			try {
+				this.load_timer = setTimeout(function() {
+		            self.loadingMessage();
+					self._loadMedia();
+					// self._state.loaded = true; handled in onLoaded()
+					self._updateDisplay();
+				}, 1200);
+			} catch (e) {
+				trace("Error loading media for ", this._media);
+				trace(e);
+			}
+		}
+	},
+
+  _updateMessage: function(msg) {
+      if(this.message) {
+          this.message.updateMessage(msg);
+      }
+  },
+
+	loadingMessage: function() {
+	    this._updateMessage(this._('loading') + " " + this.options.media_name);
+	},
+
+	errorMessage: function(msg) {
+		if (msg) {
+			msg = this._('error') + ": " + msg;
+		} else {
+			msg = this._('error');
+		}
+		this._updateMessage(msg);
+	},
+
+	updateMediaDisplay: function(layout) {
+		if (this._state.loaded && !this.options.background) {
+
+			if (TL.Browser.mobile) {
+				this._el.content_item.style.maxHeight = (this.options.height/2) + "px";
+			} else {
+				this._el.content_item.style.maxHeight = this.options.height - this.options.credit_height - this.options.caption_height - 30 + "px";
+			}
+
+			//this._el.content_item.style.maxWidth = this.options.width + "px";
+			this._el.container.style.maxWidth = this.options.width + "px";
+			// Fix for max-width issues in Firefox
+			if (TL.Browser.firefox) {
+				if (this._el.content_item.offsetWidth > this._el.content_item.offsetHeight) {
+					//this._el.content_item.style.width = "100%";
+				}
+			}
+
+			this._updateMediaDisplay(layout);
+
+			if (this._state.media_loaded) {
+				if (this._el.credit) {
+					this._el.credit.style.width		= this._el.content_item.offsetWidth + "px";
+				}
+				if (this._el.caption) {
+					this._el.caption.style.width		= this._el.content_item.offsetWidth + "px";
+				}
+			}
+
+		}
+	},
+
+	/*	Media Specific
+	================================================== */
+    _loadMedia: function() {
+        // All overrides must call this.onLoaded() to set state
+        this.onLoaded();
+    },
+
+    _updateMediaDisplay: function(l) {
+        //this._el.content_item.style.maxHeight = (this.options.height - this.options.credit_height - this.options.caption_height - 16) + "px";
+        if(TL.Browser.firefox) {
+            this._el.content_item.style.maxWidth = this.options.width + "px";
+            this._el.content_item.style.width = "auto";
+        }
+    },
+
+    _getMeta: function() {
+
+    },
+
+    _getImageURL: function(w, h) {
+        // Image-based media types should return <img>-compatible src url
+        return "";
+    },
+
+	/*	Public
+	================================================== */
+	show: function() {
+
+	},
+
+	hide: function() {
+
+	},
+
+	addTo: function(container) {
+		container.appendChild(this._el.container);
+		this.onAdd();
+	},
+
+	removeFrom: function(container) {
+		container.removeChild(this._el.container);
+		this.onRemove();
+	},
+
+  getImageURL: function(w, h) {
+      return this._getImageURL(w, h);
+  },
+
+	// Update Display
+	updateDisplay: function(w, h, l) {
+		this._updateDisplay(w, h, l);
+	},
+
+	stopMedia: function() {
+		this._stopMedia();
+	},
+
+	loadErrorDisplay: function(message) {
+		try {
+			this._el.content.removeChild(this._el.content_item);
+		} catch(e) {
+			// if this._el.content_item isn't a child of this._el then just keep truckin
+		}
+		this._el.content_item	= TL.Dom.create("div", "tl-media-item tl-media-loaderror", this._el.content);
+		this._el.content_item.innerHTML = "<div class='tl-icon-" + this.options.media_type + "'></div><p>" + message + "</p>";
+
+		// After Loaded
+		this.onLoaded(true);
+	},
+
+	/*	Events
+	================================================== */
+	onLoaded: function(error) {
+		this._state.loaded = true;
+		this.fire("loaded", this.data);
+		if (this.message) {
+			this.message.hide();
+		}
+		if (!(error || this.options.background)) {
+			this.showMeta();
+		}
+		this.updateDisplay();
+	},
+
+	onMediaLoaded: function(e) {
+		this._state.media_loaded = true;
+		this.fire("media_loaded", this.data);
+		if (this._el.credit) {
+			this._el.credit.style.width		= this._el.content_item.offsetWidth + "px";
+		}
+		if (this._el.caption) {
+			this._el.caption.style.width		= this._el.content_item.offsetWidth + "px";
+		}
+	},
+
+	showMeta: function(credit, caption) {
+		this._state.show_meta = true;
+		// Credit
+		if (this.data.credit && this.data.credit != "") {
+			this._el.credit					= TL.Dom.create("div", "tl-credit", this._el.content_container);
+			// 修正: credit はタイムラインデータ（スプレッドシート/JSON）由来の信頼できない値なので、
+			// HTML エスケープしてから innerHTML に入れる。
+			// 【修正2】autolink のとき、エスケープ済みの文字列を linkify に渡すと、linkify の URL パターン（文字クラスに & # ; を含む）が
+			// &quot; &#39; &lt; &gt; を URL の一部として取り込み、リンク先が壊れたり ; が余分に表示されたりしていた。
+			// _linkifyEscaped() で、入力の < > " ' を仮の文字に置き換えてから linkify し、その後でエスケープする。
+			this._el.credit.innerHTML		= this.options.autolink == true ? this._linkifyEscaped(this.data.credit) : this._escapeHTML(this.data.credit);
+			this.options.credit_height 		= this._el.credit.offsetHeight;
+		}
+
+		// Caption
+		if (this.data.caption && this.data.caption != "") {
+			this._el.caption				= TL.Dom.create("div", "tl-caption", this._el.content_container);
+			// 修正: caption も credit と同じく、HTML エスケープしてから出力する
+			// 【修正2】autolink のときは credit と同じく _linkifyEscaped() を使う
+			this._el.caption.innerHTML		= this.options.autolink == true ? this._linkifyEscaped(this.data.caption) : this._escapeHTML(this.data.caption);
+			this.options.caption_height 	= this._el.caption.offsetHeight;
+		}
+
+		if (!this.data.caption || !this.data.credit) {
+			this.getMeta();
+		}
+
+	},
+
+	getMeta: function() {
+		this._getMeta();
+	},
+
+	updateMeta: function() {
+		if (!this.data.credit && this.data.credit_alternate) {
+			this._el.credit					= TL.Dom.create("div", "tl-credit", this._el.content_container);
+			// 【修正2】credit_alternate は、Flickr/Instagram の _getMeta() がライブラリ自身で
+			// "<a href='URL' target='_blank'>名前</a>" と組み立てた HTML（URL と名前は信頼できない値）。
+			// 丸ごとエスケープするとタグが文字のまま表示されていたので、許可リスト方式で無害化して DOM を組み立てる
+			// （安全な href と target="_blank" だけを持つ a 要素と、テキストだけを残す）。
+			this._setSanitizedHTML(this._el.credit, this.data.credit_alternate);
+			this.options.credit_height 		= this._el.credit.offsetHeight;
+		}
+
+		if (!this.data.caption && this.data.caption_alternate) {
+			this._el.caption				= TL.Dom.create("div", "tl-caption", this._el.content_container);
+			// 修正: 外部 API 応答から得た caption_alternate も HTML エスケープしてから出力する
+			this._el.caption.innerHTML		= this._escapeHTML(this.data.caption_alternate);
+			this.options.caption_height 	= this._el.caption.offsetHeight;
+		}
+
+		this.updateDisplay();
+	},
+
+	onAdd: function() {
+		this.fire("added", this.data);
+	},
+
+	onRemove: function() {
+		this.fire("removed", this.data);
+	},
+
+	/*	Private Methods
+	================================================== */
+	// 追加: HTML の特殊文字をエスケープするヘルパー（credit/caption を innerHTML に入れる前に使う）
+	_escapeHTML: function(str) {
+		return String(str)
+			.replace(/&/g, "&amp;")
+			.replace(/</g, "&lt;")
+			.replace(/>/g, "&gt;")
+			.replace(/"/g, "&quot;")
+			.replace(/'/g, "&#39;");
+	},
+
+	// 【修正2】autolink 用: エスケープと linkify を、linkify の URL パターンが文字参照を取り込まない順で行う。
+	// 1) 入力の < > " ' を私用領域の文字 U+E000〜U+E003 に置き換える（入力に元から U+E000〜U+E003 があれば U+FFFD にする）。
+	//    これらは linkify の URL の文字クラスに含まれず、単語文字でもないので、元の < > " ' と同じ所で URL が切れる。
+	// 2) linkify する。linkify が作るタグ（<a class='tl-makelink' href='...' onclick='void(0)'>...</a>）には & が含まれない。
+	// 3) 残っている & はすべて入力由来なので &amp; にし、仮の文字を &lt; &gt; &quot; &#39; に戻す。
+	// 入力由来の < > " ' は linkify の処理中に文字として存在しないので、linkify が作る属性の引用符を閉じることはできない。
+	_linkifyEscaped: function(str) {
+		var s = String(str)
+			.replace(/[\uE000-\uE003]/g, "\uFFFD")
+			.replace(/</g, "\uE000")
+			.replace(/>/g, "\uE001")
+			.replace(/"/g, "\uE002")
+			.replace(/'/g, "\uE003");
+		s = TL.Util.linkify(s);
+		return s
+			.replace(/&/g, "&amp;")
+			.replace(/\uE000/g, "&lt;")
+			.replace(/\uE001/g, "&gt;")
+			.replace(/\uE002/g, "&quot;")
+			.replace(/\uE003/g, "&#39;");
+	},
+
+	// 【修正2】HTML 文字列を許可リスト方式で無害化して、el の中身にする（credit_alternate 用）。
+	// - document.implementation.createHTMLDocument で作った、表示しない文書（スクリプトが動かず、画像も読み込まれない）で解析する。
+	// - 解析した要素はそのまま移さず、表示中の文書で作り直す（_appendSafeNodes）。HTML 文字列に戻して innerHTML に入れ直すことはしない。
+	// - createHTMLDocument がない環境では、無害化できないので、これまでどおりエスケープして文字として出力する。
+	_setSanitizedHTML: function(el, html) {
+		if (!(document.implementation && document.implementation.createHTMLDocument)) {
+			el.innerHTML = this._escapeHTML(html);
+			return;
+		}
+		var doc = document.implementation.createHTMLDocument("");
+		var tmp = doc.createElement("div");
+		tmp.innerHTML = String(html);
+		el.innerHTML = "";
+		this._appendSafeNodes(tmp, el);
+	},
+
+	// 【修正2】from の子孫のうち、テキストと a 要素だけを to に作り直して追加する。
+	// - a 要素は新しく作り、href は _isSafeLink() を通るものだけ、target は "_blank" だけを付け直す。on* などほかの属性は捨てる。
+	// - script/style などの要素は中身ごと捨て、それ以外の要素はタグだけ外して中身を残す。コメントなどは捨てる。
+	_appendSafeNodes: function(from, to) {
+		var node, tag, a, href;
+		for (node = from.firstChild; node; node = node.nextSibling) {
+			if (node.nodeType === 3) {
+				to.appendChild(document.createTextNode(node.nodeValue));
+			} else if (node.nodeType === 1) {
+				tag = node.nodeName.toLowerCase();
+				if (tag === "a") {
+					a = document.createElement("a");
+					href = node.getAttribute("href");
+					if (href && this._isSafeLink(href)) {
+						a.setAttribute("href", href);
+						if (node.getAttribute("target") === "_blank") {
+							a.setAttribute("target", "_blank");
+						}
+					}
+					this._appendSafeNodes(node, a);
+					to.appendChild(a);
+				} else if (!/^(script|style|template|noscript|noembed|noframes|iframe|object|embed|textarea|title|xmp|select|svg|math)$/.test(tag)) {
+					this._appendSafeNodes(node, to);
+				}
+			}
+		}
+	},
+
+	// 【修正2】リンク先として安全か（http/https/mailto と相対 URL だけを許可）。判定方法は _initLayout の data.link の判定と同じ
+	// （ブラウザは URL 中の空白・タブ・改行・制御文字を除去して解釈するため、それらを取り除いてから判定する）。
+	_isSafeLink: function(url) {
+		var link_check = String(url).replace(/[\u0000- ]/g, "");
+		return !(/^[a-z][a-z0-9+.\-]*:/i.test(link_check) && !/^(https?|mailto):/i.test(link_check));
+	},
+
+	_initLayout: function () {
+
+		// Message
+		this.message = new TL.Message({}, this.options);
+		this.message.addTo(this._el.container);
+
+		// Create Layout
+		this._el.content_container = TL.Dom.create("div", "tl-media-content-container", this._el.container);
+
+		// Link
+		// 修正: javascript: などの危険なスキームのリンクを作らないよう、http/https/mailto と相対 URL だけを許可する
+		// （ブラウザは URL 中の空白・タブ・改行・制御文字を除去して解釈するため、それらを取り除いてから判定する）
+		if (this.data.link && this.data.link != "") {
+			var link_check = String(this.data.link).replace(/[\u0000- ]/g, "");
+			if (/^[a-z][a-z0-9+.\-]*:/i.test(link_check) && !/^(https?|mailto):/i.test(link_check)) {
+				trace("Ignoring media link with disallowed scheme: " + this.data.link);
+				this.data.link = null;
+			}
+		}
+		if (this.data.link && this.data.link != "") {
+
+			this._el.link = TL.Dom.create("a", "tl-media-link", this._el.content_container);
+			this._el.link.href = this.data.link;
+			if (this.data.link_target && this.data.link_target != "") {
+				this._el.link.target = this.data.link_target;
+			} else {
+				this._el.link.target = "_blank";
+			}
+
+			this._el.content = TL.Dom.create("div", "tl-media-content", this._el.link);
+
+		} else {
+			this._el.content = TL.Dom.create("div", "tl-media-content", this._el.content_container);
+		}
+
+
+	},
+
+	// Update Display
+	_updateDisplay: function(w, h, l) {
+		if (w) {
+			this.options.width = w;
+
+		}
+		//this._el.container.style.width = this.options.width + "px";
+		if (h) {
+			this.options.height = h;
+		}
+
+		if (l) {
+			this.options.layout = l;
+		}
+
+		if (this._el.credit) {
+			this.options.credit_height 		= this._el.credit.offsetHeight;
+		}
+		if (this._el.caption) {
+			this.options.caption_height 	= this._el.caption.offsetHeight + 5;
+		}
+
+		this.updateMediaDisplay(this.options.layout);
+
+	},
+
+	_stopMedia: function() {
+
+	}
+
+});
+```
+
+---
