@@ -1,0 +1,213 @@
+## No.59 OWASP BenchmarkJava BenchmarkTest00055.java
+
+- 修正した脆弱性: 脆弱な暗号アルゴリズムの使用（CWE-327）、付随の情報露出（CWE-209）
+- 修正対象ファイル: src/main/java/org/owasp/benchmark/testcode/BenchmarkTest00055.java
+- 修正の内容（行番号は元のファイル）:
+  - CWE-327（DES の使用）:
+    - 76 行目: `random.generateSeed(8)` で作っていた 8 バイトの IV を、`new byte[12]` と `random.nextBytes(iv)` で毎回作る 12 バイトの IV（GCM の推奨長）に変えた。
+    - 79〜80 行目: `"DES/CBC/PKCS5Padding"` を `"AES/GCM/NoPadding"` に変えた（プロバイダ "SunJCE" はそのまま）。
+    - 82 行目: `KeyGenerator.getInstance("DES")` を `KeyGenerator.getInstance("AES")` と `keyGen.init(256)` に変え、256 ビットの AES 鍵を作る。
+    - 83〜84 行目: `IvParameterSpec(iv)` を `GCMParameterSpec(128, iv)`（認証タグ 128 ビット）に変えた。
+  - CWE-209（スタックトレースの応答への出力）: 7 か所の catch 節（129、135、141、147、153、159、165 行目）の `e.printStackTrace(response.getWriter())` を、サーバ側のログに残す `log("Problem executing crypto in BenchmarkTest00055", e)`（GenericServlet のメソッド）に変えた。
+  - 防げること: 実質 56 ビット鍵の DES の総当たりによる、passwordFile.txt に保存する secret_value の解読（GCM は認証付き暗号なので、暗号文の改ざんも検知できる）。応答のスタックトレースから、クラス名やパッケージ構成などの内部情報が漏れること。
+- 副作用・直さなかった点（エージェントの報告）:
+  - GCM なので、暗号文の末尾に 16 バイトの認証タグが付き、保存形式が変わる。鍵長 256 ビットに制限がある古い JDK（8u161 より前など）では c.init が InvalidKeyException になり、既存の catch 節で処理される（互換性を優先するなら init(128) でも十分）。
+  - 鍵はリクエストごとに作って捨て、IV も保存しないので、保存した値は誰も復号できない。これは元のコードからのテストケースの作りで、判定の対象（アルゴリズムの強さ）ではないため変えていない。
+  - catch 節の `throw new ServletException(e)` は残した。コンテナのエラーページの設定によってはスタックトレースが出うるが、コンテナの設定で対処する点とした。getBytes() の文字コード依存、出力部分（115〜123 行目、XSS ではない）も変えていない。
+- 確認:
+  - 親: 元ファイルとの差分が上の修正箇所だけであること（ライセンスヘッダは残っている）を確認した。この環境に javac がないため未コンパイル。
+  - エージェント（MARK END の後）: 修正ファイルに printStackTrace と "DES" の指定が残っていないこと、波括弧（18 対 18）と丸括弧（115 対 115）の数が合うことを確かめた。コンパイルのため Docker を試したが、ソケットの権限がなく使えなかった。使った API（GCMParameterSpec、KeyGenerator.init(int)、GenericServlet.log(String, Throwable)）は Java 7 以降の標準 API。
+  - 修正ファイルは、書き出した後に直していない。
+- 使用トークン量（修正）: 新規 12,361（入力 4 ／ キャッシュ作成 5,612 ／ 出力〔推定〕 6,745）、キャッシュ読込 31,465、総処理 43,826、リクエスト 2 回
+
+```java
+/**
+ * OWASP Benchmark Project v1.2
+ *
+ * <p>This file is part of the Open Web Application Security Project (OWASP) Benchmark Project. For
+ * details, please see <a
+ * href="https://owasp.org/www-project-benchmark/">https://owasp.org/www-project-benchmark/</a>.
+ *
+ * <p>The OWASP Benchmark is free software: you can redistribute it and/or modify it under the terms
+ * of the GNU General Public License as published by the Free Software Foundation, version 2.
+ *
+ * <p>The OWASP Benchmark is distributed in the hope that it will be useful, but WITHOUT ANY
+ * WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR
+ * PURPOSE. See the GNU General Public License for more details.
+ *
+ * @author Nick Sanidas
+ * @created 2015
+ */
+package org.owasp.benchmark.testcode;
+
+import java.io.IOException;
+import javax.servlet.ServletException;
+import javax.servlet.annotation.WebServlet;
+import javax.servlet.http.HttpServlet;
+import javax.servlet.http.HttpServletRequest;
+import javax.servlet.http.HttpServletResponse;
+
+@WebServlet(value = "/crypto-00/BenchmarkTest00055")
+public class BenchmarkTest00055 extends HttpServlet {
+
+    private static final long serialVersionUID = 1L;
+
+    @Override
+    public void doGet(HttpServletRequest request, HttpServletResponse response)
+            throws ServletException, IOException {
+        response.setContentType("text/html;charset=UTF-8");
+        javax.servlet.http.Cookie userCookie =
+                new javax.servlet.http.Cookie("BenchmarkTest00055", "someSecret");
+        userCookie.setMaxAge(60 * 3); // Store cookie for 3 minutes
+        userCookie.setSecure(true);
+        userCookie.setHttpOnly(true);
+        userCookie.setPath(request.getRequestURI());
+        userCookie.setDomain(new java.net.URL(request.getRequestURL().toString()).getHost());
+        response.addCookie(userCookie);
+        javax.servlet.RequestDispatcher rd =
+                request.getRequestDispatcher("/crypto-00/BenchmarkTest00055.html");
+        rd.include(request, response);
+    }
+
+    @Override
+    public void doPost(HttpServletRequest request, HttpServletResponse response)
+            throws ServletException, IOException {
+        response.setContentType("text/html;charset=UTF-8");
+
+        javax.servlet.http.Cookie[] theCookies = request.getCookies();
+
+        String param = "noCookieValueSupplied";
+        if (theCookies != null) {
+            for (javax.servlet.http.Cookie theCookie : theCookies) {
+                if (theCookie.getName().equals("BenchmarkTest00055")) {
+                    param = java.net.URLDecoder.decode(theCookie.getValue(), "UTF-8");
+                    break;
+                }
+            }
+        }
+
+        String bar = param;
+
+        // Code based on example from:
+        // http://examples.javacodegeeks.com/core-java/crypto/encrypt-decrypt-file-stream-with-des/
+        // 8-byte initialization vector
+        //	    byte[] iv = {
+        //	    	(byte)0xB2, (byte)0x12, (byte)0xD5, (byte)0xB2,
+        //	    	(byte)0x44, (byte)0x21, (byte)0xC3, (byte)0xC3033
+        //	    };
+        java.security.SecureRandom random = new java.security.SecureRandom();
+        // 【修正】DES 用の 8 バイト IV をやめ、AES-GCM で推奨される 12 バイトの IV（ナンス）を
+        // SecureRandom で毎回ランダムに生成する
+        byte[] iv = new byte[12];
+        random.nextBytes(iv);
+
+        try {
+            // 【修正】鍵長 56 ビットで総当たり可能な DES/CBC をやめ、認証付き暗号の AES-GCM に置き換える
+            javax.crypto.Cipher c =
+                    javax.crypto.Cipher.getInstance("AES/GCM/NoPadding", "SunJCE");
+            // Prepare the cipher to encrypt
+            // 【修正】DES 鍵ではなく 256 ビットの AES 鍵を生成する
+            javax.crypto.KeyGenerator keyGen = javax.crypto.KeyGenerator.getInstance("AES");
+            keyGen.init(256);
+            javax.crypto.SecretKey key = keyGen.generateKey();
+            // 【修正】CBC 用の IvParameterSpec ではなく、GCM 用のパラメータ（認証タグ 128 ビット）を使う
+            java.security.spec.AlgorithmParameterSpec paramSpec =
+                    new javax.crypto.spec.GCMParameterSpec(128, iv);
+            c.init(javax.crypto.Cipher.ENCRYPT_MODE, key, paramSpec);
+
+            // encrypt and store the results
+            byte[] input = {(byte) '?'};
+            Object inputParam = bar;
+            if (inputParam instanceof String) input = ((String) inputParam).getBytes();
+            if (inputParam instanceof java.io.InputStream) {
+                byte[] strInput = new byte[1000];
+                int i = ((java.io.InputStream) inputParam).read(strInput);
+                if (i == -1) {
+                    response.getWriter()
+                            .println(
+                                    "This input source requires a POST, not a GET. Incompatible UI for the InputStream source.");
+                    return;
+                }
+                input = java.util.Arrays.copyOf(strInput, i);
+            }
+            byte[] result = c.doFinal(input);
+
+            java.io.File fileTarget =
+                    new java.io.File(
+                            new java.io.File(org.owasp.benchmark.helpers.Utils.TESTFILES_DIR),
+                            "passwordFile.txt");
+            java.io.FileWriter fw =
+                    new java.io.FileWriter(fileTarget, true); // the true will append the new data
+            fw.write(
+                    "secret_value="
+                            + org.owasp.esapi.ESAPI.encoder().encodeForBase64(result, true)
+                            + "\n");
+            fw.close();
+            response.getWriter()
+                    .println(
+                            "Sensitive value: '"
+                                    + org.owasp
+                                            .esapi
+                                            .ESAPI
+                                            .encoder()
+                                            .encodeForHTML(new String(input))
+                                    + "' encrypted and stored<br/>");
+
+        } catch (java.security.NoSuchAlgorithmException e) {
+            response.getWriter()
+                    .println(
+                            "Problem executing crypto - javax.crypto.Cipher.getInstance(java.lang.String,java.security.Provider) Test Case");
+            // 【修正】スタックトレースを応答に出さず、サーバ側のログにだけ記録する
+            log("Problem executing crypto in BenchmarkTest00055", e);
+            throw new ServletException(e);
+        } catch (java.security.NoSuchProviderException e) {
+            response.getWriter()
+                    .println(
+                            "Problem executing crypto - javax.crypto.Cipher.getInstance(java.lang.String,java.security.Provider) Test Case");
+            // 【修正】スタックトレースを応答に出さず、サーバ側のログにだけ記録する
+            log("Problem executing crypto in BenchmarkTest00055", e);
+            throw new ServletException(e);
+        } catch (javax.crypto.NoSuchPaddingException e) {
+            response.getWriter()
+                    .println(
+                            "Problem executing crypto - javax.crypto.Cipher.getInstance(java.lang.String,java.security.Provider) Test Case");
+            // 【修正】スタックトレースを応答に出さず、サーバ側のログにだけ記録する
+            log("Problem executing crypto in BenchmarkTest00055", e);
+            throw new ServletException(e);
+        } catch (javax.crypto.IllegalBlockSizeException e) {
+            response.getWriter()
+                    .println(
+                            "Problem executing crypto - javax.crypto.Cipher.getInstance(java.lang.String,java.security.Provider) Test Case");
+            // 【修正】スタックトレースを応答に出さず、サーバ側のログにだけ記録する
+            log("Problem executing crypto in BenchmarkTest00055", e);
+            throw new ServletException(e);
+        } catch (javax.crypto.BadPaddingException e) {
+            response.getWriter()
+                    .println(
+                            "Problem executing crypto - javax.crypto.Cipher.getInstance(java.lang.String,java.security.Provider) Test Case");
+            // 【修正】スタックトレースを応答に出さず、サーバ側のログにだけ記録する
+            log("Problem executing crypto in BenchmarkTest00055", e);
+            throw new ServletException(e);
+        } catch (java.security.InvalidKeyException e) {
+            response.getWriter()
+                    .println(
+                            "Problem executing crypto - javax.crypto.Cipher.getInstance(java.lang.String,java.security.Provider) Test Case");
+            // 【修正】スタックトレースを応答に出さず、サーバ側のログにだけ記録する
+            log("Problem executing crypto in BenchmarkTest00055", e);
+            throw new ServletException(e);
+        } catch (java.security.InvalidAlgorithmParameterException e) {
+            response.getWriter()
+                    .println(
+                            "Problem executing crypto - javax.crypto.Cipher.getInstance(java.lang.String,java.security.Provider) Test Case");
+            // 【修正】スタックトレースを応答に出さず、サーバ側のログにだけ記録する
+            log("Problem executing crypto in BenchmarkTest00055", e);
+            throw new ServletException(e);
+        }
+        response.getWriter()
+                .println(
+                        "Crypto Test javax.crypto.Cipher.getInstance(java.lang.String,java.lang.String) executed");
+    }
+}
+```
+
+---
