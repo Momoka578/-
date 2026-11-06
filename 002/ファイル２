@@ -1,1 +1,10 @@
-https://samate.nist.gov/SARD/test-cases/501353/versions/1.0.1
+テストケースのページ: https://samate.nist.gov/SARD/test-cases/501353/versions/1.0.1
+- zip（ソース一式）: https://samate.nist.gov/SARD/downloads/versions/501353-v1.0.1.zip
+- 判定したおもなファイル（zip の中のパス）:
+  - `dspace-jspui/src/main/java/org/dspace/app/webui/servlet/admin/NewsEditServlet.java`
+  - `dspace-api/src/main/java/org/dspace/core/NewsServiceImpl.java`
+  - `dspace-jspui/src/main/webapp/dspace-admin/news-edit.jsp`
+  - `dspace-jspui/src/main/webapp/home.jsp`
+- 対策されている箇所: home.jsp 77 行目の `<%= Utils.addEntities(topNews) %>` と、168 行目の `<%= Utils.addEntities(sideNews) %>`
+- 入力の URL（ファイル１）: https://samate.nist.gov/SARD/test-cases/501353/versions/1.0.1
+- 脆弱版（bad、判定していない）: https://samate.nist.gov/SARD/test-cases/501218/versions/1.0.0
