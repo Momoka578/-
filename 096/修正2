@@ -1,0 +1,252 @@
+# No.96 CVE-2020-15095 npm (npm/cli 6.14.5) lib/fetch-package-metadata.js
+
+- 検証した修正コード: "xss以外の修正コード"
+- 検証結果: **不備あり** — https://user:pass@host や git+https://TOKEN@github.com などの普通の書き方は、spec（文字列・npa の Result）と er.message の両方で伏せられた。ただし 26 行目の正規表現 /:\/\/[^\s/?#]*@/g が (1) 区切りの \ に一致せず、url.parse が \ を / と読み替えるため npm が受け付けて認証情報を実際に送る https:\\alice:pass@host/x.tgz などで spec 側のログに平文が残る、(2) userinfo に生の空白がある https://alice:pa ss99@host でも残る（どちらも 127.0.0.1 のサーバに Basic 認証が届くことと、ログの平文を確認）。修正コード2: 区切りに \ も受け付ける /:([/\\]+)[^\s/\\?#]*@/g（区切りは元の形のまま残す）にし、spec 用には空白で止まらない版を加えた（er.message は空白で止める）。27 種×2 通りでログに秘密が残る件数は元 38・元の修正 22・修正コード2 0、認証情報のない入力のログは元と同じ、約 100 万文字でも 8ms 以下
+- 修正コード2 のファイル: lib/fetch-package-metadata.js
+- 親の確認: lib/fetch-package-metadata.js: node --check で構文エラーなし。エージェントが読み取り専用の材料（orig・given）を変えていないこと、読まない範囲のファイルを読んでいないことを、記録で確認した。
+- 使用トークン量（検証）: 新規 114,976（入力 44 ／ キャッシュ作成 68,680 ／ 出力〔推定〕 46,252）、キャッシュ読込 1,113,112、総処理 1,228,088、リクエスト 22 回
+- 使用トークン量（再修正）: 新規 37,244（入力 14 ／ キャッシュ作成 21,865 ／ 出力〔推定〕 15,365）、キャッシュ読込 683,514、総処理 720,758、リクエスト 7 回
+
+対象: "xss以外の修正コード" の No.96（`lib/fetch-package-metadata.js`。元のコードは npm/cli 479e45c、npm 6.14.5）
+修正コード2: `lib/fetch-package-metadata.js`（元の修正コードをコピーし、不備の箇所だけを直した。直した箇所には `【修正2】` のコメントを付けた）
+
+### 元の修正コードの不備
+
+元の修正コードは、ログに出す前に `redactUrlCredentials` で URL の userinfo を `***` に置き換える。`https://user:pass@host/...` や `git+https://TOKEN@github.com/...` のような標準の形は正しく伏せられることを確認した。ただし、伏せる対象の見つけ方が、npm が実際に URL を解釈する方法より狭い。そのため、npm が受け付けて認証情報を実際に使う書き方の一部で、spec 側のログに認証情報が平文のまま残る。判定の脆弱性（認証情報の平文のログ出力、CWE-312・CWE-532）が一部の入力で残っているので、不備とした。
+
+#### 不備1: 区切りが「://」の文字どおりの並びでないと伏せられない（バックスラッシュ）
+
+- 場所: `lib/fetch-package-metadata.js` 26 行目（元の修正コード）
+  ```js
+  return str.replace(/:\/\/[^\s/?#]*@/g, '://***@')
+  ```
+  ここを、35 行目 `log.silly('fetchPackageMetaData', 'error for ' + redactUrlCredentials(String(spec)), redactUrlCredentials(er.message))` の spec 側から使っている。
+- 問題: 正規表現は、スキームの後の区切りが「`://`」という文字どおりの並びのときだけ一致する。一方、npm-package-arg 6.1.1 の `fromURL`（spec を remote・git 型として解釈する）と、HTTP の取得に使う node-fetch-npm 2.0.2 の `Request` は、どちらも Node の旧 API の `url.parse` を使う。`url.parse` は `?` `#` より前にある「`\`」を「`/`」に読み替える。そのため、次の書き方は npm に正しい URL として受け付けられ、userinfo が認証情報として実際に使われる。
+  - `https:\\alice:S3cretPass@host/x.tgz`（remote 型。HTTP の Basic 認証で送られる）
+  - `https:/\alice:...`、`https:\/alice:...`（同じ）
+  - `git+https:\\bob:Tok3nXYZ@git.example.com/org/repo.git`（git 型。npa が `url.format` で fetchSpec を `https://bob:Tok3nXYZ@git.example.com/org/repo.git` に正規化し、git に渡す）
+  
+  ところが、ログに出す `String(spec)` は、文字列の spec ならそのまま、npa の Result なら `toString()`（`name@saveSpec`。saveSpec は rawSpec そのもの）なので、バックスラッシュのまま残る。そのため正規表現に一致せず、パスワードやトークンが平文で `log.record` に残り、エラーで終了したときに npm-debug.log に書き出される。
+- 実際に確かめた: 127.0.0.1 の HTTP サーバ（常に 404 を返す）に対して、node-fetch-npm 2.0.2 で npa の fetchSpec を取得させた（`$R/bench/test_e2e.js`）。`http:\\alice:S3cretPass@127.0.0.1:PORT/x.tgz` では、サーバに `Authorization: Basic alice:S3cretPass` が届いた。同じ spec とエラーメッセージを元の修正コードに通すと、ログは次のようになった。
+  ```
+  error for http:\\alice:S3cretPass@127.0.0.1:PORT/x.tgz 404 Not Found - GET http://***@127.0.0.1:PORT/x.tgz
+  ```
+  er.message 側は、node-fetch が `url.format` した「`://`」の形なので伏せられる。しかし spec 側では、パスワードが平文で残っている。
+
+#### 不備2: userinfo の中に生の空白・タブがあると伏せられない
+
+- 場所: 同じ 26 行目の文字クラス `[^\s/?#]`
+- 問題: 文字クラスが空白（`\s`）で止まる。そのため `https://alice:pa ss99@host/x.tgz` では、「`://`」から「`@`」までに空白があって一致せず、何も伏せられない。`url.parse` は、userinfo の中の生の空白をそのまま auth（`alice:pa ss99`）として扱う。npa もこれを remote 型として受け付ける。タブは `url.parse` が取り除いて `alice:pass99` を送るが、ログには `alice:pa<TAB>ss99` が残る。git+https の場合も同じで、npa の fetchSpec は `https://bob:to%20ken@...` に正規化されて使われるのに、spec 側のログには生の形が残る。
+- 実際に確かめた: `test_e2e.js` で `http://alice:pa ss99@127.0.0.1:PORT/x.tgz` を取得させると、サーバに `Authorization: Basic alice:pa ss99` が届いた。元の修正コードのログは `error for http://alice:pa ss99@127.0.0.1:PORT/x.tgz 404 Not Found - GET http://***@...` で、spec 側にパスワードが平文で残った。タブの形は `test_log.js` で、ログに残ることを確かめた。
+
+#### 参考（不備の根拠にはしていない）
+
+- `https:/alice:S3cretPass@host/x.tgz`（スラッシュ 1 本）も、元の修正コードでは伏せられない。ただし `url.parse` では host がないと解釈され、node-fetch-npm が "Only absolute URLs are supported" で失敗するので、リクエストは出ない（`test_e2e.js` で確認）。このため不備の根拠にはしていない。修正コード2 では、結果としてこの形も伏せられる。
+- 元の修正の説明で対象外とした点（er 自体は書き換えないこと、pacote・npm-registry-fetch の内部のログ、scheme のない scp 形式）は、理由が妥当であることを確かめた。修正コード2 でも変えていない。
+
+### 再修正の内容
+
+変更したのは `lib/fetch-package-metadata.js` の 2 か所だけ（関数 `redactUrlCredentials` と、それを呼ぶ `log.silly` の行）。ほかの行は元の修正コードと同じ。
+
+#### 1. `redactUrlCredentials`（修正コード2 の 18〜42 行目）
+
+```js
+const URL_CREDENTIALS = /:([/\\]+)[^\s/\\?#]*@/g
+const URL_CREDENTIALS_IN_SPEC = /:([/\\]+)[^/\\?#]*@/g
+function redactUrlCredentials (str, inSpec) {
+  if (typeof str !== 'string') return str
+  return str.replace(inSpec ? URL_CREDENTIALS_IN_SPEC : URL_CREDENTIALS, ':$1***@')
+}
+```
+
+- **区切りを `[/\\]+` にした（不備1への対応）**: スキームの後の「`:`」に続く区切りとして、「`/`」と「`\`」が 1 個以上並んだもの（`//`、`\\`、`/\`、`\/` など）を受け付ける。`url.parse` が「`\`」を「`/`」に読み替えることに合わせた。区切りの部分は `([/\\]+)` で取り出し、置換文字列 `':$1***@'` で元の文字のまま戻す。そのため、ログの見た目は利用者が書いた形のままで、userinfo だけが `***` になる（例: `https:\\alice:pass@host/x.tgz` → `https:\\***@host/x.tgz`）。区切りを 1 個以上としたので、スラッシュ 1 本の `https:/alice:pass@host` も伏せられる（上の「参考」の形）。
+- **authority の区間を「`\`」でも止めるようにした**: 文字クラスを `[^\s/?#]` から `[^\s/\\?#]` にした。`url.parse` は「`\`」を「`/`」と読むので、host（authority）はそこで終わる。`url.parse` が userinfo の終わりとして使う「`@`」は、`/` `\` `?` `#` より前にある最後の「`@`」で、文字クラスを貪欲に `@` までつなげるこの正規表現が伏せる範囲と一致する（パスワードの中の生の `@` も、最後の `@` まで伏せる）。また、区切り `[/\\]+` と文字クラスで、使える文字が重ならない。そのため、どちらの部分に入るかの組合せが一通りに決まり、後戻りが増えない。authority の区間は次の `/` `\` で止まるので、長い文字列でも処理時間は線形に収まる（元の修正の性質を保った）。
+- **spec 用（`inSpec = true`）は空白でも止めない（不備2への対応）**: spec 用の正規表現 `URL_CREDENTIALS_IN_SPEC` は、文字クラスに `\s` を入れない（`[^/\\?#]`）。spec は依存指定 1 つ（`name@URL` など）で、文章を含まない。そのため空白を越えても、余計な部分を伏せることはない。`url.parse` が auth として送る `alice:pa ss99` も、タブ入りの `alice:pa<TAB>ss99` も、まとめて `***` になる。
+- **er.message 用（`inSpec` なし）は、元の修正どおり空白で止める**: er.message は文章なので、空白を越えると、パスのない URL の後に続く文章（例: `request to https://registry.example.com failed, reason: see admin@example.com`）まで伏せてしまい、ログが調査に使いにくくなる。npm の HTTP（node-fetch-npm）・git のエラーメッセージに入る URL は `url.format` 済みで、区切りは「`://`」、空白は `%20` にパーセント符号化されている。そのため、空白で止めても伏せ漏れは起きない（`test_e2e.js` で、er.message 側が `http://***@...` になることを確認）。区切り `[/\\]+` の拡張は、er.message 側にも効く。
+- 文字列でない値をそのまま返す点は、元の修正と同じ。
+
+#### 2. ログを出す行（修正コード2 の 50〜51 行目）
+
+```js
+// 【修正2】spec は利用者が書いたままの文字列（バックスラッシュや生の空白を含みうる）なので、spec 用（inSpec = true）で伏せる。
+log.silly('fetchPackageMetaData', 'error for ' + redactUrlCredentials(String(spec), true), redactUrlCredentials(er.message))
+```
+
+- spec 側だけ、第 2 引数に `true` を渡して spec 用の正規表現を使う。er.message 側は、これまでどおり er.message 用（空白で止める）。
+- er と pkg は変えずに `done(er, pkg)` に渡す。tracker の扱いも変えていない。
+
+### 確認した内容と結果
+
+確認に使った依存モジュールは、npm 6.14.5 と同じ版の実物（npmlog 4.1.2・aproba 2.0.0・npm-package-arg 6.1.1・hosted-git-info 2.8.8・call-limit 1.1.1・lru-cache 5.1.1・node-fetch-npm 2.0.2）を、`npm install --ignore-scripts` で `$R/bench/` に入れた。pacote・`./npm`・`./config/figgy-config.js` などはスタブにした。
+
+1. **構文確認**: `node --check` で、修正コード2 に構文エラーがないことを確認した（Node v22.22.1）。
+2. **読み込み・動作確認**（`$R/bench/harness.js`・`$R/bench/test_log.js`）: 対象を実際に require し、call-limit で包まれた `fetchPackageMetadata` を呼んだ。pacote.manifest を失敗させて `andLogAndFinish` の `log.silly` を通し、`npmlog.record` に残った行を、元のコード・元の修正コード・修正コード2 で比べた。spec は、文字列と npa の Result の両方で試した（27 種 × 2 = 54 通り）。
+   - 秘密が残った件数: 元のコード 38、元の修正コード 22、**修正コード2 は 0**。
+   - 修正コード2 で新たに伏せられるようになった入力: `https:\\`・`https:/\`・`https:\/`・`mypkg@https:\\...`・`git+https:\\...`・userinfo の中の生の空白（https・git+https）・タブ・改行・スラッシュ 1 本・er.message の中のバックスラッシュの URL。
+   - 元の修正コードで伏せられていた標準の形（https の user:pass、ユーザー名側のトークン、hosted の git+https、大文字の HTTPS、生の `@`、パーセント符号化、er.message の中の複数の URL）は、修正コード2 でも同じ結果になった。
+   - 認証情報を含まない通常の入力（`lodash@^4.17.0`、`https://registry.example.com/x.tgz`、er.message が undefined、Windows のパスの中の `@scope`、`file:../@scope/pkg`、alias `foo@npm:bar@1.0.0`、パスのない URL の後に `admin@example.com` が続く er.message）では、ログの文字列が元のコードと完全に同じだった。er は同じメッセージのまま `done` に返り、`tracker.finish` も呼ばれた。
+3. **攻撃の入力での確認**（`$R/bench/test_e2e.js`）: 127.0.0.1 だけで待ち受ける HTTP サーバ（常に 404。終わったら閉じる）を立てた。npa の fetchSpec を node-fetch-npm 2.0.2 で取得させ、サーバに届いた Authorization ヘッダと、そのときのログを比べた。
+   - `http:\\alice:S3cretPass@...`・`http:/\alice:...`: サーバに `Basic alice:S3cretPass` が届いた（認証情報が実際に使われる）。元の修正コードは spec 側が平文。修正コード2 は `error for http:\\***@127.0.0.1:PORT/x.tgz 404 Not Found - GET http://***@...` で伏せられた。
+   - `http://alice:pa ss99@...`: サーバに `Basic alice:pa ss99` が届いた。元の修正コードは spec 側が平文。修正コード2 は `error for http://***@...` で伏せられた。
+   - 標準の形 `http://alice:S3cretPass@...`: 元の修正コードと修正コード2 の両方で伏せられた。
+4. **処理時間の確認**（`$R/bench/timing.js`）: 長さ約 100 万文字の入力 9 種（`'https://'+'a'*N`、`'://a'` の繰り返し、`':'+'\\'*N`、`':\\a'` の繰り返し、`':'+'/'*N`、`':/'` の繰り返し、`'://'+'a:'` の繰り返し、`'://'+'@a'` の繰り返し、`'://'+'a '` の繰り返し）で、er.message 用・spec 用とも 1〜8 ms だった。ReDoS は起きない。
+
+### 副作用・残る点
+
+- **ログの見た目の変化**: 区切りを `[/\\]+`（1 個以上）にしたので、「`:` の直後に `/` か `\` があり、次の `/` `\` `?` `#` より前に `@` がある」文字列は、URL でなくても `***` が入る。例: `C:\@scope\pkg` → `C:\***@scope\pkg`、`file:/@scope/pkg` → `file:/***@scope/pkg`（確認済み）。ログの見た目が変わるだけで、取り除く文字はなく、動作には影響しない。通常の Windows パス（`C:\Users\...\@scope\...` のように `:` の直後の区間に `@` がないもの）は変わらないことを確認した。`git+ssh://git@...` のユーザー名 `git` が `***` になるのは、元の修正と同じ。
+- **er.message では空白を越えない**: er.message 側は、元の修正どおり空白で止めている。もし、どこかの依存モジュールが、生の空白を含む userinfo をそのまま（`url.format` せずに）エラーメッセージに入れると、その部分は伏せられない。npm 6.14.5 の HTTP 取得（node-fetch-npm）と git 取得（npa が正規化した fetchSpec）のメッセージは、`url.format` 済みの URL を使うので、この形にはならない（HTTP は実際に確認した）。文章を伏せすぎないことを優先した。
+- **直していない点（元の修正の説明と同じ。理由も妥当と判断）**: er 自体（er.message・er.stack）は書き換えずに呼び出し元へ返しているので、呼び出し元や `lib/utils/error-handler.js` が er を出す経路では URL が出る可能性が残る。pacote・npm-registry-fetch の内部のログもこのファイルの範囲外。scheme のない scp 形式（`user:pass@host:path`）は、npa が同期で例外を投げてこのログを通らず、git の scp 形式もパスワードを持たないので対象外。
+
+### 修正コード2 の全文: lib/fetch-package-metadata.js
+
+```javascript
+'use strict'
+
+const deprCheck = require('./utils/depr-check')
+const path = require('path')
+const log = require('npmlog')
+const readPackageTree = require('read-package-tree')
+const rimraf = require('rimraf')
+const validate = require('aproba')
+const npa = require('npm-package-arg')
+const npm = require('./npm')
+let npmConfig
+const npmlog = require('npmlog')
+const limit = require('call-limit')
+const tempFilename = require('./utils/temp-filename')
+const pacote = require('pacote')
+const isWindows = require('./utils/is-windows.js')
+
+// 【修正】ログに出す文字列の中の URL から認証情報（userinfo: user:password@ や token@）を伏せ字にする。
+// 【修正2】「:」の後の区切り（/ と \ が 1 個以上）の直後から、最初の / \ ? # （er.message では空白も）
+// までの区間（authority）にある最後の「@」までを *** に置き換える。区切りの文字は元のまま残す。
+//   例: https://user:pass@registry.example.com/pkg.tgz → https://***@registry.example.com/pkg.tgz
+//       git+https://TOKEN@github.com/org/repo.git     → git+https://***@github.com/org/repo.git
+//       https:\\user:pass@registry.example.com/pkg.tgz → https:\\***@registry.example.com/pkg.tgz（【修正2】）
+// トークンがユーザー名側に入る形式もあるため、パスワードだけでなく userinfo 全体を伏せる。
+// 【修正2】元の修正は区切りを「://」の文字どおりの並びでしか探さなかった。しかし npm-package-arg と
+// node-fetch-npm が URL の解釈に使う url.parse は、? # より前の「\」を「/」と読み替えるので、
+// https:\\user:pass@host/x.tgz や https:/\user:pass@host/x.tgz も受け付けて、認証情報を実際に送る。
+// そこで区切りを [/\\]+ にした。authority の区間も「\」で止める（url.parse では「\」で host が終わるため。
+// url.parse が使う「@」は、/ \ ? # より前の最後の「@」で、この正規表現が伏せる範囲と一致する）。
+// 【修正2】inSpec が true のとき（依存指定 spec 用）は、空白・タブでも止めない。url.parse は
+// https://user:pa ss@host/x.tgz のような userinfo の中の生の空白を auth として送る（タブは取り除いて送る）ため。
+// spec は 1 つの依存指定で文章を含まないので、空白を越えても余計な部分を伏せることはない。
+// er.message（文章）では元の修正どおり空白で止め、URL の後に続く文章まで伏せすぎないようにする
+// （npm の HTTP・git のエラーメッセージに入る URL は url.format 済みで、空白はパーセント符号化されている）。
+// 【修正2】区切り [/\\]+ と authority の文字クラスは重ならず、authority は次の / \ で止まるので、
+// 長い文字列でも処理時間は線形に収まる。
+const URL_CREDENTIALS = /:([/\\]+)[^\s/\\?#]*@/g
+const URL_CREDENTIALS_IN_SPEC = /:([/\\]+)[^/\\?#]*@/g
+function redactUrlCredentials (str, inSpec) {
+  if (typeof str !== 'string') return str
+  return str.replace(inSpec ? URL_CREDENTIALS_IN_SPEC : URL_CREDENTIALS, ':$1***@')
+}
+
+function andLogAndFinish (spec, tracker, done) {
+  validate('SOF|SZF|OOF|OZF', [spec, tracker, done])
+  return (er, pkg) => {
+    if (er) {
+      // 【修正】spec（npa の Result の toString を含む）と er.message を、認証情報を伏せてからログに出す。
+      // npmlog は silly レベルでも log.record に保持し、エラー終了時に npm-debug.log へ書き出すため。
+      // 【修正2】spec は利用者が書いたままの文字列（バックスラッシュや生の空白を含みうる）なので、spec 用（inSpec = true）で伏せる。
+      log.silly('fetchPackageMetaData', 'error for ' + redactUrlCredentials(String(spec), true), redactUrlCredentials(er.message))
+      if (tracker) tracker.finish()
+    }
+    return done(er, pkg)
+  }
+}
+
+const LRUCache = require('lru-cache')
+const CACHE = new LRUCache({
+  max: 300 * 1024 * 1024,
+  length: (p) => p._contentLength
+})
+
+module.exports = limit(fetchPackageMetadata, npm.limit.fetch)
+function fetchPackageMetadata (spec, where, opts, done) {
+  validate('SSOF|SSFZ|OSOF|OSFZ', [spec, where, opts, done])
+
+  if (!done) {
+    done = opts
+    opts = {}
+  }
+  var tracker = opts.tracker
+  const logAndFinish = andLogAndFinish(spec, tracker, done)
+
+  if (typeof spec === 'object') {
+    var dep = spec
+  } else {
+    dep = npa(spec)
+  }
+  if (!isWindows && dep.type === 'directory' && /^[a-zA-Z]:/.test(dep.fetchSpec)) {
+    var err = new Error(`Can't install from windows path on a non-windows system: ${dep.fetchSpec.replace(/[/]/g, '\\')}`)
+    err.code = 'EWINDOWSPATH'
+    return logAndFinish(err)
+  }
+  if (!npmConfig) {
+    npmConfig = require('./config/figgy-config.js')
+  }
+  pacote.manifest(dep, npmConfig({
+    annotate: true,
+    fullMetadata: opts.fullMetadata,
+    log: tracker || npmlog,
+    memoize: CACHE,
+    where: where
+  })).then(
+    (pkg) => logAndFinish(null, deprCheck(pkg)),
+    (err) => {
+      if (dep.type !== 'directory') return logAndFinish(err)
+      if (err.code === 'ENOTDIR') {
+        var enolocal = new Error(`Could not install "${path.relative(process.cwd(), dep.fetchSpec)}" as it is not a directory and is not a file with a name ending in .tgz, .tar.gz or .tar`)
+        enolocal.code = 'ENOLOCAL'
+        if (err.stack) enolocal.stack = err.stack
+        return logAndFinish(enolocal)
+      } else if (err.code === 'ENOPACKAGEJSON') {
+        var enopackage = new Error(`Could not install from "${path.relative(process.cwd(), dep.fetchSpec)}" as it does not contain a package.json file.`)
+        enopackage.code = 'ENOLOCAL'
+        if (err.stack) enopackage.stack = err.stack
+        return logAndFinish(enopackage)
+      } else {
+        return logAndFinish(err)
+      }
+    }
+  )
+}
+
+module.exports.addBundled = addBundled
+function addBundled (pkg, next) {
+  validate('OF', arguments)
+  if (pkg._bundled !== undefined) return next(null, pkg)
+
+  if (!pkg.bundleDependencies && pkg._requested.type !== 'directory') return next(null, pkg)
+  const requested = pkg._requested || npa(pkg._from)
+  if (requested.type === 'directory') {
+    pkg._bundled = null
+    return readPackageTree(pkg._requested.fetchSpec, function (er, tree) {
+      if (tree) pkg._bundled = tree.children
+      return next(null, pkg)
+    })
+  }
+  pkg._bundled = null
+  const target = tempFilename('unpack')
+  if (!npmConfig) {
+    npmConfig = require('./config/figgy-config.js')
+  }
+  const opts = npmConfig({integrity: pkg._integrity})
+  pacote.extract(pkg._resolved || pkg._requested || npa.resolve(pkg.name, pkg.version), target, opts).then(() => {
+    log.silly('addBundled', 'read tarball')
+    readPackageTree(target, (err, tree) => {
+      if (err) { return next(err) }
+      log.silly('cleanup', 'remove extracted module')
+      rimraf(target, function () {
+        if (tree) {
+          pkg._bundled = tree.children
+        }
+        next(null, pkg)
+      })
+    })
+  }, next)
+}
+```
+
