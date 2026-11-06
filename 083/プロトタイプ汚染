@@ -1,0 +1,70 @@
+## No.83 CVE-2019-10745 jonschlinkert/assign-deep index.js（prePatch edab79f）
+
+- 修正した脆弱性: プロトタイプ汚染（CWE-1321・CWE-915）
+- 修正対象ファイル: index.js
+- 修正の内容（行番号は元のファイル）:
+  - 11 行目の後: `const hasOwnProperty = Object.prototype.hasOwnProperty;` を加えた（後から書き換えられないよう、読み込み時に参照を保持する）。
+  - 18 行目のループの先頭: `if (!isValidKey(key)) continue;` を加え、キーが `__proto__`・`constructor`・`prototype` のときはコピーも再帰もしないようにした。再帰のたびに同じ検査を通るので、入れ子のどの深さでも防げる。
+  - 19 行目の再帰の条件: 先頭に `hasOwnProperty.call(target, key) &&` を加え、target 自身が持つプロパティのときだけ再帰するようにした。継承したプロパティ（Object.prototype.toString などの組み込みの関数）に再帰して、共有の関数にプロパティを書き込むことも防ぐ（判定の記録にない副次的な経路で、多層防御として入れた）。
+  - 末尾: `isValidKey(key)` 関数を加えた。
+- この修正で防げること: 経路 1（JSON の `__proto__` → target.__proto__ → Object.prototype）と経路 2（`constructor.prototype` → Object → Object.prototype）による、全オブジェクトのプロトタイプの書き換え。
+- 副作用（エージェントの最終報告による）: `constructor`・`prototype` という名前の通常のデータキーもコピーされなくなる（例: `assign({}, {constructor:'x'})` では constructor は Object のまま）。target が継承しているだけのオブジェクト型のプロパティは、深いマージをせずに source の値で target 自身のプロパティとして上書きする（元のコードでは継承元の共有オブジェクトを書き換えていた）。isObject が関数を再帰先にする仕様は、target が自分で持つ関数へのマージが元の機能なので残した。
+- 確認（MARK END の後）:
+  - 親とエージェント: node --check で問題なし。元ファイルとの差分は上の 4 か所（とコメント）だけ。
+  - エージェント: 依存の assign-symbols を自作のスタブで代用して、攻撃 7 種（JSON の `__proto__`、constructor.prototype、それぞれの入れ子、継承した toString、二重の `__proto__`、target 自身のプロトタイプの変更）を試した。元のコードでは 7 件のうち 6 件が失敗し（5 件で汚染が起き、1 件で target 自身のプロトタイプが変わった。二重の `__proto__` だけは例外になって汚染されなかった）、修正後は 7 件とも防げた。通常の機能 7 種（深いマージ、target を書き換えて返す、プリミティブの target、target なし、シンボルのコピー、自身が持つ関数へのマージ、配列の上書き）は、元と修正後で同じ結果になった。計算時間（20,000 キー × 20 回）は元が約 397ms、修正後が約 371ms。
+- 使用トークン量（修正）: 新規 6,827（入力 4 ／ キャッシュ作成 2,401 ／ 出力〔推定〕 4,422）、キャッシュ読込 31,857、総処理 38,684、リクエスト 2 回
+
+```javascript
+/*!
+ * assign-deep <https://github.com/jonschlinkert/assign-deep>
+ *
+ * Copyright (c) 2017-present, Jon Schlinkert.
+ * Released under the MIT License.
+ */
+
+'use strict';
+
+const assignSymbols = require('assign-symbols');
+const toString = Object.prototype.toString;
+// 【修正】hasOwnProperty は後から書き換えられないよう、読み込み時に参照を保持しておく
+const hasOwnProperty = Object.prototype.hasOwnProperty;
+const assign = module.exports = (target, ...args) => {
+  let i = 0;
+  if (isPrimitive(target)) target = args[i++];
+  if (!target) target = {};
+  for (; i < args.length; i++) {
+    if (isObject(args[i])) {
+      for (const key of Object.keys(args[i])) {
+        // 【修正】"__proto__"・"constructor"・"prototype" のキーはコピーも再帰もせずに読み飛ばす
+        //         （target.__proto__ → Object.prototype、target.constructor.prototype → Object.prototype
+        //           の経路でのプロトタイプ汚染を防ぐ）
+        if (!isValidKey(key)) continue;
+        // 【修正】再帰マージは target 自身が持つプロパティのときだけ行う。
+        //         継承したプロパティ（Object.prototype.toString などの組み込み関数）には再帰しない
+        if (hasOwnProperty.call(target, key) && isObject(target[key]) && isObject(args[i][key])) {
+          assign(target[key], args[i][key]);
+        } else {
+          target[key] = args[i][key];
+        }
+      }
+      assignSymbols(target, args[i]);
+    }
+  }
+  return target;
+};
+
+function isObject(val) {
+  return typeof val === 'function' || toString.call(val) === '[object Object]';
+}
+
+function isPrimitive(val) {
+  return typeof val === 'object' ? val === null : typeof val !== 'function';
+}
+
+// 【修正】プロトタイプ汚染につながるキーかどうかを判定する関数を追加
+function isValidKey(key) {
+  return key !== '__proto__' && key !== 'constructor' && key !== 'prototype';
+}
+```
+
+---
