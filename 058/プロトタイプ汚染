@@ -1,0 +1,336 @@
+## No.58 CVE-2018-16490 aheckmann/mpath lib/index.js（prePatch 77204d7）
+
+- 修正した脆弱性: プロトタイプ汚染（CWE-1321／CWE-915）
+- 修正対象ファイル: lib/index.js
+- 修正の内容（3 か所の追加だけで、既存の行は変えていない）:
+  - ファイル先頭: 拒否する名前のリスト `ignoreProperties = ['__proto__', 'constructor', 'prototype']` と、パスの要素を 1 つずつ調べる hasIgnoredProperty(parts) を加えた。要素は String() で文字列にしてから比べるので、`[['__proto__'], 'x']` のような配列パスも止められる。
+  - exports.set（元の 180 行目 `if (null == o) return;` の直後）: `if (hasIgnoredProperty(parts)) return;` を加え、危険な要素を含むパスでは何も代入せずに戻る。途中のたどり（224 行目）、配列要素への代入（249／261 行目）、最後の代入（272 行目）、配列の再帰呼び出しは、どれも parts から来るので、この 1 か所でまとめて止まる。
+  - exports.unset（元の 129 行目の後）: 同じ検査を加え、危険なパスなら false を返す。判定の記録には書かれていないが、元のコードでは `unset('__proto__.toString', {})` で Object.prototype.toString を消せるため、同じ種類のプロトタイプの改変としてあわせて直した（エージェントの判断）。
+  - 防げること: `set('__proto__.isAdmin', true, {})` や `set('constructor.prototype.x', …)` で Object.prototype に値を入れること、`set('__proto__', {...}, o)` でプロトタイプを差し替えること、unset で組み込みメソッドを消すこと。
+- 副作用・直さなかった点（エージェントの報告）:
+  - 自分自身のプロパティとして constructor や prototype を持つ正当なドキュメント（例: `set('constructor.name', …)`）への書き込みも無視される。hasOwnProperty でたどる方式は、Map・special・lookup の経路で動きが変わるため採らなかった。
+  - 拒否したときは例外を投げずに戻る（既存の `if (null == o) return;` と同じ流儀）。そのため、攻撃が無視されたことは呼び出し側には分からない。
+  - get と has は読むだけでプロトタイプを書き換えないため変えていない。special 引数と lookup 関数は開発者が渡す値として検査していない。
+- 確認:
+  - 親: 元ファイルとの差分が上の 3 か所の追加だけであること、node --check で構文エラーがないことを確認した。
+  - エージェント（MARK END の後）: 攻撃 7 件（`__proto__.x`、`constructor.prototype.x`、配列パス、配列要素の経路、`__proto__` の差し替え、`unset('__proto__.toString')` など）は、元のコードで 7 件とも汚染や削除が起き、修正版では 7 件とも防げた。正常系 10 件（通常の set、配列への振り分け、Map、special の _doc、get、has、unset など）は両方とも期待どおり。set 20 万回の時間は元 47.0 ms、修正版 61.2 ms だった。
+  - 修正ファイルは、書き出した後に直していない。
+- 使用トークン量（修正）: 新規 10,766（入力 6 ／ キャッシュ作成 5,619 ／ 出力〔推定〕 5,141）、キャッシュ読込 48,159、総処理 58,925、リクエスト 3 回
+
+```javascript
+// Make sure Map exists for old Node.js versions
+var Map = global.Map != null ? global.Map : function() {};
+
+// 【修正】プロトタイプ汚染（CWE-1321 / CWE-915）対策。
+// パスの各要素がこれらの名前のときは、書き込み・削除を行わない。
+// '__proto__' は Object.prototype へ、'constructor' と 'prototype' は
+// 'constructor.prototype.x' の形でコンストラクタの prototype へたどり着けるため。
+var ignoreProperties = ['__proto__', 'constructor', 'prototype'];
+
+// 【修正】parts の中に危険な要素が 1 つでもあれば true を返す。
+// 配列パスの要素が文字列以外（例: ['__proto__'] という配列）でも、
+// プロパティアクセス時には文字列に変換されるため、String() で変換してから比べる。
+function hasIgnoredProperty(parts) {
+  for (var i = 0; i < parts.length; ++i) {
+    if (ignoreProperties.indexOf(String(parts[i])) !== -1) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Returns the value of object `o` at the given `path`.
+ *
+ * ####Example:
+ *
+ *     var obj = {
+ *         comments: [
+ *             { title: 'exciting!', _doc: { title: 'great!' }}
+ *           , { title: 'number dos' }
+ *         ]
+ *     }
+ *
+ *     mpath.get('comments.0.title', o)         // 'exciting!'
+ *     mpath.get('comments.0.title', o, '_doc') // 'great!'
+ *     mpath.get('comments.title', o)           // ['exciting!', 'number dos']
+ *
+ *     // summary
+ *     mpath.get(path, o)
+ *     mpath.get(path, o, special)
+ *     mpath.get(path, o, map)
+ *     mpath.get(path, o, special, map)
+ *
+ * @param {String} path
+ * @param {Object} o
+ * @param {String} [special] When this property name is present on any object in the path, walking will continue on the value of this property.
+ * @param {Function} [map] Optional function which receives each individual found value. The value returned from `map` is used in the original values place.
+ */
+
+exports.get = function (path, o, special, map) {
+  var lookup;
+
+  if ('function' == typeof special) {
+    if (special.length < 2) {
+      map = special;
+      special = undefined;
+    } else {
+      lookup = special;
+      special = undefined;
+    }
+  }
+
+  map || (map = K);
+
+  var parts = 'string' == typeof path
+    ? path.split('.')
+    : path
+
+  if (!Array.isArray(parts)) {
+    throw new TypeError('Invalid `path`. Must be either string or array');
+  }
+
+  var obj = o
+    , part;
+
+  for (var i = 0; i < parts.length; ++i) {
+    part = parts[i];
+
+    if (Array.isArray(obj) && !/^\d+$/.test(part)) {
+      // reading a property from the array items
+      var paths = parts.slice(i);
+
+      return obj.map(function (item) {
+        return item
+          ? exports.get(paths, item, special || lookup, map)
+          : map(undefined);
+      });
+    }
+
+    if (lookup) {
+      obj = lookup(obj, part);
+    } else {
+      var _from = special && obj[special] ? obj[special] : obj;
+      obj = _from instanceof Map ?
+        _from.get(part) :
+        _from[part];
+    }
+
+    if (!obj) return map(obj);
+  }
+
+  return map(obj);
+};
+
+/**
+ * Returns true if `in` returns true for every piece of the path
+ *
+ * @param {String} path
+ * @param {Object} o
+ */
+
+exports.has = function (path, o) {
+  var parts = typeof path === 'string' ?
+    path.split('.') :
+    path;
+
+  if (!Array.isArray(parts)) {
+    throw new TypeError('Invalid `path`. Must be either string or array');
+  }
+
+  var len = parts.length;
+  var cur = o;
+  for (var i = 0; i < len; ++i) {
+    if (cur == null || typeof cur !== 'object' || !(parts[i] in cur)) {
+      return false;
+    }
+    cur = cur[parts[i]];
+  }
+
+  return true;
+};
+
+/**
+ * Deletes the last piece of `path`
+ *
+ * @param {String} path
+ * @param {Object} o
+ */
+
+exports.unset = function (path, o) {
+  var parts = typeof path === 'string' ?
+    path.split('.') :
+    path;
+
+  if (!Array.isArray(parts)) {
+    throw new TypeError('Invalid `path`. Must be either string or array');
+  }
+
+  // 【修正】'__proto__.toString' などで Object.prototype のプロパティを
+  // 削除できないよう、危険な要素を含むパスは何もせずに false を返す。
+  if (hasIgnoredProperty(parts)) {
+    return false;
+  }
+
+  var len = parts.length;
+  var cur = o;
+  for (var i = 0; i < len; ++i) {
+    if (cur == null || typeof cur !== 'object' || !(parts[i] in cur)) {
+      return false;
+    }
+    if (i === len - 1) {
+      delete cur[parts[i]];
+      return true;
+    }
+    cur = cur instanceof Map ? cur.get(parts[i]) : cur[parts[i]];
+  }
+
+  return true;
+};
+
+/**
+ * Sets the `val` at the given `path` of object `o`.
+ *
+ * @param {String} path
+ * @param {Anything} val
+ * @param {Object} o
+ * @param {String} [special] When this property name is present on any object in the path, walking will continue on the value of this property.
+ * @param {Function} [map] Optional function which is passed each individual value before setting it. The value returned from `map` is used in the original values place.
+ */
+
+exports.set = function (path, val, o, special, map, _copying) {
+  var lookup;
+
+  if ('function' == typeof special) {
+    if (special.length < 2) {
+      map = special;
+      special = undefined;
+    } else {
+      lookup = special;
+      special = undefined;
+    }
+  }
+
+  map || (map = K);
+
+  var parts = 'string' == typeof path
+    ? path.split('.')
+    : path
+
+  if (!Array.isArray(parts)) {
+    throw new TypeError('Invalid `path`. Must be either string or array');
+  }
+
+  if (null == o) return;
+
+  // 【修正】'__proto__.isAdmin' や 'constructor.prototype.isAdmin' のように
+  // プロトタイプへたどり着く要素を含むパスは、代入せずに何もしないで戻る。
+  // ループ途中（_to[part]）・配列要素への代入（item[part]）・最後の代入（obj[part]）の
+  // すべてが parts 由来なので、ここで一括して拒否する（配列の再帰呼び出しも同じ検査を通る）。
+  if (hasIgnoredProperty(parts)) return;
+
+  // the existance of $ in a path tells us if the user desires
+  // the copying of an array instead of setting each value of
+  // the array to the one by one to matching positions of the
+  // current array. Unless the user explicitly opted out by passing
+  // false, see Automattic/mongoose#6273
+  var copy = _copying || (/\$/.test(path) && _copying !== false)
+    , obj = o
+    , part
+
+  for (var i = 0, len = parts.length - 1; i < len; ++i) {
+    part = parts[i];
+
+    if ('$' == part) {
+      if (i == len - 1) {
+        break;
+      } else {
+        continue;
+      }
+    }
+
+    if (Array.isArray(obj) && !/^\d+$/.test(part)) {
+      var paths = parts.slice(i);
+      if (!copy && Array.isArray(val)) {
+        for (var j = 0; j < obj.length && j < val.length; ++j) {
+          // assignment of single values of array
+          exports.set(paths, val[j], obj[j], special || lookup, map, copy);
+        }
+      } else {
+        for (var j = 0; j < obj.length; ++j) {
+          // assignment of entire value
+          exports.set(paths, val, obj[j], special || lookup, map, copy);
+        }
+      }
+      return;
+    }
+
+    if (lookup) {
+      obj = lookup(obj, part);
+    } else {
+      var _to = special && obj[special] ? obj[special] : obj;
+      obj = _to instanceof Map ?
+        _to.get(part) :
+        _to[part];
+    }
+
+    if (!obj) return;
+  }
+
+  // process the last property of the path
+
+  part = parts[len];
+
+  // use the special property if exists
+  if (special && obj[special]) {
+    obj = obj[special];
+  }
+
+  // set the value on the last branch
+  if (Array.isArray(obj) && !/^\d+$/.test(part)) {
+    if (!copy && Array.isArray(val)) {
+      for (var item, j = 0; j < obj.length && j < val.length; ++j) {
+        item = obj[j];
+        if (item) {
+          if (lookup) {
+            lookup(item, part, map(val[j]));
+          } else {
+            if (item[special]) item = item[special];
+            item[part] = map(val[j]);
+          }
+        }
+      }
+    } else {
+      for (var j = 0; j < obj.length; ++j) {
+        item = obj[j];
+        if (item) {
+          if (lookup) {
+            lookup(item, part, map(val));
+          } else {
+            if (item[special]) item = item[special];
+            item[part] = map(val);
+          }
+        }
+      }
+    }
+  } else {
+    if (lookup) {
+      lookup(obj, part, map(val));
+    } else if (obj instanceof Map) {
+      obj.set(part, map(val));
+    } else {
+      obj[part] = map(val);
+    }
+  }
+}
+
+/*!
+ * Returns the value passed to it.
+ */
+
+function K (v) {
+  return v;
+}
+```
+
+---
