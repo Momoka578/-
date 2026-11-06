@@ -1,0 +1,181 @@
+## No.85 CVE-2019-10747 jonschlinkert/set-value index.js（prePatch 7bd5011）
+
+- 修正した脆弱性: プロトタイプ汚染（CWE-915・CWE-1321）と、set.memo の上限のないキャッシュ・キャッシュの汚染
+- 修正対象ファイル: index.js
+- 修正の内容（行番号は元のファイル）:
+  - 28 行目（キーの検査）: split の結果または配列 path の各要素を、実際に使うプロパティ名（文字列か Symbol）に一度だけ変換して新しい配列を作る。`__proto__`・`constructor`・`prototype` が 1 つでもあれば、何も書き込まずに target を返す。検査は書き込みの前に済ませるので、`a.b.__proto__.x` で `a.b` が途中まで作られることもない。
+  - 40 行目（たどり方）: `if (!isObject(target[prop]))` を `if (!hasOwn(target, prop) || !isObject(target[prop]))` にした。継承したプロパティはたどらず、target 自身に `{}` を作る（判定の記録にない派生として、`toString.x` や `hasOwnProperty.call` で全オブジェクトが共有する組み込みの関数を書き換えられる経路も塞ぐ）。
+  - 63〜65・84・88〜99・113 行目（set.memo）: `{}` を `Map` にした（外から `{}` に置き換えられた場合は作り直す）。1,000 件を超えると最も古いものから捨て、1,000 文字を超える path はキャッシュしない。キーを `JSON.stringify([区切り文字, path])` にし、独自の split 関数を使う場合と、区切り文字が文字列でない場合はキャッシュしない。
+- この修正で防げること: `__proto__.x`・`constructor.prototype.x`・配列 path・`[['__proto__'],'x']` のように配列を文字列化させる手口・separator や merge を指定した場合のプロトタイプ汚染。memo の上限のないメモリ増加と、`constructor`・`hasOwnProperty`・`toString` などの path で memo から Object や組み込みの関数が返る問題。キーの衝突によるキャッシュの汚染（判定の記録にない派生。元のコードでは、options なしで `"a/b;separator=/"` を渡した後に `set(o,'a/b',v,{separator:'/'})` を呼ぶと、結果が `{"a/b;separator=/":v}` に差し替わった）。
+- 副作用・直さなかった点（エージェントの最終報告による）:
+  - `constructor`・`prototype`・`__proto__` という名前のキーは、正当な用途でも設定できなくなる。拒否したときは例外を投げずに target を返す（既存の不正入力のときの動作に合わせ、捕捉されない例外による新たな DoS を避けるため）。
+  - 継承した値はたどらなくなる（例: `Foo.prototype.cfg` が共有オブジェクトのとき、`set(f,'cfg.x',1)` は自身の `cfg={x:1}` を作る）。
+  - 直さなかった点: merge の既定（Object.assign）で、value が自身のプロパティとして持つ `__proto__` が新しいオブジェクトのプロトタイプになる件（影響はそのオブジェクトだけで、全体の汚染は起きない）。split のエスケープ処理（79〜81 行目）の計算量は調べていない。
+- 確認（MARK END の後）:
+  - 親とエージェント: node --check で問題なし。元ファイルとの差分は上の修正箇所（とコメント）だけ。
+  - エージェント: 依存の is-plain-object を簡易な代替実装に差し替えて動かした。元のコードでは攻撃 11 パターンのうち 9 パターンで汚染または組み込みの関数の改変が起き、memo の衝突と上限なし（5,000 件の path で 5,009 件）も再現した。修正後は攻撃が全パターンで防がれ、memo は 1,000 件に収まり、衝突もなくなった。通常の機能（入れ子・既存の値の保持・エスケープ・separator・配列・数値や Symbol のキー・merge・独自の split・配列や null プロトタイプの target）は元と同じ結果になった。
+  - エージェント: 計算時間は、同じ path を 100 万回（キャッシュに当たる）で元が約 98ms、修正後が約 477ms（1 回あたり約 0.4µs 増える）。異なる path を 20 万件では元が 1,001ms、修正後が 713ms で、GC 後のヒープは 73MB から 4MB になった。
+- 使用トークン量（修正）: 新規 20,569（入力 4 ／ キャッシュ作成 3,192 ／ 出力〔推定〕 17,373）、キャッシュ読込 32,081、総処理 52,650、リクエスト 2 回
+
+```javascript
+/*!
+ * set-value <https://github.com/jonschlinkert/set-value>
+ *
+ * Copyright (c) 2014-2018, Jon Schlinkert.
+ * Released under the MIT License.
+ */
+
+'use strict';
+
+const isPlain = require('is-plain-object');
+
+// 【修正】キャッシュ（set.memo）の上限。件数と、キャッシュしてよい path の長さを制限する。
+const MEMO_MAX_ENTRIES = 1000;
+const MEMO_MAX_PATH_LENGTH = 1000;
+
+function set(target, path, value, options) {
+  if (!isObject(target)) {
+    return target;
+  }
+
+  let opts = options || {};
+  const isArray = Array.isArray(path);
+  if (!isArray && typeof path !== 'string') {
+    return target;
+  }
+
+  let merge = opts.merge;
+  if (merge && typeof merge !== 'function') {
+    merge = Object.assign;
+  }
+
+  const rawKeys = isArray ? path : split(path, opts);
+  // 【修正】各キーを実際に使うプロパティ名（文字列か Symbol）に一度だけ変換し、以後はその値だけを使う。
+  //   配列 path の要素が ['__proto__'] のような配列や数値でも、変換後の名前で検査される。
+  //   "__proto__"・"constructor"・"prototype" が 1 つでもあれば、何も書き込まずに target を返す
+  //   （途中までオブジェクトが作られることもない）。
+  const keys = [];
+  for (let i = 0; i < rawKeys.length; i++) {
+    const key = toPropertyKey(rawKeys[i]);
+    if (isUnsafeKey(key)) {
+      return target;
+    }
+    keys.push(key);
+  }
+  const len = keys.length;
+  const orig = target;
+
+  if (!options && keys.length === 1) {
+    result(target, keys[0], value, merge);
+    return target;
+  }
+
+  for (let i = 0; i < len; i++) {
+    let prop = keys[i];
+
+    // 【修正】target 自身のプロパティでない値（プロトタイプから継承した toString など）はたどらず、
+    //   新しいオブジェクトを target 自身に作る。共有の組み込みオブジェクトへの書き込みを防ぐ。
+    if (!hasOwn(target, prop) || !isObject(target[prop])) {
+      target[prop] = {};
+    }
+
+    if (i === len - 1) {
+      result(target, prop, value, merge);
+      break;
+    }
+
+    target = target[prop];
+  }
+
+  return orig;
+}
+
+function result(target, path, value, merge) {
+  if (merge && isPlain(target[path]) && isPlain(value)) {
+    target[path] = merge({}, target[path], value);
+  } else {
+    target[path] = value;
+  }
+}
+
+function split(path, options) {
+  const char = (options && options.separator) ? options.separator : '.';
+  // 【修正】キャッシュを使うのは、結果が path と区切り文字（文字列）だけで決まり、path が長すぎない場合に限る。
+  //   独自の split 関数は文字列にしても同じ関数か判定できないので、キャッシュしない。
+  const cacheable = !(options && typeof options.split === 'function')
+    && typeof char === 'string'
+    && path.length <= MEMO_MAX_PATH_LENGTH;
+  // 【修正】set.memo はプレーンオブジェクトではなく Map を使う（"__proto__" や "constructor" などの
+  //   キーで Object.prototype や Object が返ることがない）。外から {} に置き換えられていても作り直す。
+  if (!(set.memo instanceof Map)) {
+    set.memo = new Map();
+  }
+  const id = cacheable ? createKey(path, char) : null;
+  if (cacheable && set.memo.has(id)) return set.memo.get(id);
+
+  let keys = [];
+  let res = [];
+
+  if (options && typeof options.split === 'function') {
+    keys = options.split(path);
+  } else {
+    keys = path.split(char);
+  }
+
+  for (let i = 0; i < keys.length; i++) {
+    let prop = keys[i];
+    while (prop && prop.slice(-1) === '\\' && keys[i + 1]) {
+      prop = prop.slice(0, -1) + char + keys[++i];
+    }
+    res.push(prop);
+  }
+  if (cacheable) {
+    // 【修正】上限に達したら、最も古いエントリを捨ててから追加する
+    if (set.memo.size >= MEMO_MAX_ENTRIES) {
+      set.memo.delete(set.memo.keys().next().value);
+    }
+    set.memo.set(id, res);
+  }
+  return res;
+}
+
+// 【修正】分割結果に影響する区切り文字と path だけを JSON 配列で表す。
+//   以前は path + ';separator=/' のように連結していたため、"a/b;separator=/" という path（options なし）と
+//   path "a/b"・separator "/" の呼び出しが同じキーになり、別の呼び出しの分割結果を差し替えられた。
+function createKey(pattern, separator) {
+  return JSON.stringify([separator, pattern]);
+}
+
+// 【修正】プロトタイプへの到達に使われるキーを判定する
+function isUnsafeKey(key) {
+  return key === '__proto__' || key === 'constructor' || key === 'prototype';
+}
+
+// 【修正】プロパティ名への変換（Symbol 以外は文字列にする）
+function toPropertyKey(key) {
+  return typeof key === 'symbol' ? key : String(key);
+}
+
+// 【修正】自身のプロパティかどうか
+function hasOwn(obj, key) {
+  return Object.prototype.hasOwnProperty.call(obj, key);
+}
+
+function isObject(val) {
+  switch (typeof val) {
+    case 'object':
+      return val !== null;
+    case 'function':
+      return true;
+    default: {
+      return false;
+    }
+  }
+}
+
+// 【修正】{} ではなく Map にする
+set.memo = new Map();
+module.exports = set;
+```
+
+---
