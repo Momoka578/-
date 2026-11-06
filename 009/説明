@@ -1,0 +1,145 @@
+## No.9 OWASP BenchmarkPython BenchmarkTest00096.py
+
+- XSS の種別: 反射型（POST パラメータが保存されずに、そのレスポンスへ直接返される）
+- source（ユーザーの入力）: L31 `request.form.get("BenchmarkTest00096")`（フォームから POST された値）
+- sink（出力先）: L50〜54 の f 文字列への埋め込みと `return RESPONSE`（Flask の text/html のレスポンス本文）
+- 修正したファイル: testcode/BenchmarkTest00096.py
+- 検証（プロンプトファイル2）の結果: 問題なし
+
+OWASP Benchmark の Python 版のテストケースである。Flask（Python の Web アプリ用フレームワーク）の上で動く。`init(app)` が、URL `/benchmark/xss-00/BenchmarkTest00096` の GET と POST の処理を登録する。GET の処理は POST の関数を呼ぶだけである。XSS 以外の脆弱性はない（"xss以外の修正コード" で「なし・対象外」）。
+
+### 1. 元のコードの問題
+
+元のコードの関係する部分:
+
+```python
+ 19	from helpers.utils import escape_for_html
+ …
+ 27		@app.route('/benchmark/xss-00/BenchmarkTest00096', methods=['POST'])
+ 28		def BenchmarkTest00096_post():
+ 29			RESPONSE = ""
+ 30	
+ 31			param = request.form.get("BenchmarkTest00096")
+ 32			if not param:
+ 33				param = ""
+ 34	
+ 35			possible = "ABC"
+ 36			guess = possible[0]
+ …
+ 38			match guess:
+ 39				case 'A':
+ 40					bar = param
+ 41				case 'B':
+ 42					bar = 'bob'
+ …
+ 49			otherarg = "static text"
+ 50			RESPONSE += (
+ 51				f'bar is \'{bar}\' and otherarg is \'{otherarg}\''
+ 52			)
+ 53	
+ 54			return RESPONSE
+```
+
+値の流れ:
+
+1. L31: フォームの BenchmarkTest00096 の値を `param` に入れる（source）。L32〜33 で、値がなければ空文字にする。
+2. L35〜36: `guess` は `"ABC"` の 0 文字目なので、いつも `'A'` になる。
+3. L38〜40: `match` 文（値によって処理を分ける構文）は、いつも `case 'A'` に入り、`bar = param` になる。定数を入れる分岐（`'B'` や `_`）には入らない。
+4. L50〜52: f 文字列（`{ }` の中の式の値を埋め込む文字列）で、`bar` をそのまま埋め込む。
+5. L54: `RESPONSE` を返す（sink）。Flask は、関数が返した文字列を Content-Type: text/html のレスポンスとして送る。ブラウザは HTML として解釈する。
+
+なぜ危ないのか:
+
+- `bar` を HTML エスケープ（`<` などを別の書き方に置き換えること）せずに埋め込んでいる。
+- L19 でエスケープ用の関数 `escape_for_html` を import しているのに、使っていない（"脆弱性の詳細" の指摘）。
+
+攻撃の入力の例:
+
+- 攻撃者は、自分のサイトに、この URL へ POST する自動送信フォームを置く。BenchmarkTest00096 の欄にスクリプトを入れておく（"xssの詳細" の攻撃例）。
+- 値が `<script>alert(1)</script>` のとき、元のコードは `bar is '<script>alert(1)</script>' and otherarg is 'static text'` を返す。
+- ブラウザは `<script>` をタグと解釈し、対象サイトのオリジン（サイトを区別する単位。スキーム・ホスト・ポートの組）で `alert(1)` を実行する。
+
+### 2. 修正の内容
+
+f 文字列の 1 行（元の L51）を、修正コードの L34〜35 に置き換えた（L34 は【修正】コメント）。ほかの差分は、空白だけの行の行末の空白の削除（元 L37 → 修正 L20）、ファイル末尾の空行の削除、ライセンスヘッダの省略だけで、動作には関係しない。
+
+#### 修正 1: bar を escape_for_html で HTML エンティティ化してから埋め込む（元のコード L51 → 修正コード L34〜35）
+
+修正前:
+```python
+ 51				f'bar is \'{bar}\' and otherarg is \'{otherarg}\''
+```
+
+修正後:
+```python
+ 34				# 【修正】ユーザー入力由来の bar を、import 済みの escape_for_html で HTML エンティティ化してから埋め込む。
+ 35				f'bar is \'{escape_for_html(bar)}\' and otherarg is \'{otherarg}\''
+```
+
+- 変更点は、`{bar}` を `{escape_for_html(bar)}` にしたことだけである。f 文字列の中で関数を呼び、その戻り値を埋め込む。
+- `escape_for_html` は、元のファイルの L19（修正コードの L2）で import 済みの関数である。新しい import は増えていない。
+
+`escape_for_html` の中身（同じコミットの helpers/utils.py L42〜57。検証で取得して読んだもの）:
+
+```python
+ 33	html_entity_names = {
+ 34		34: 'quot',
+ 35		38: 'amp',
+ 36		60: 'lt',
+ 37		62: 'gt'
+ …
+ 42	def escape_for_html(s: str):
+ 43		immune = [',', '.', '-', '_', ' ']
+ 44		ret = ''
+ 45	
+ 46		for c in s:
+ 47			if c.isalnum() or c in immune:
+ 48				ret += c
+ 49			elif (ord(c) <= 0x1f and (c != '\t') and (c != '\n') and (c != '\r')) or (0x7f <= ord(c) and ord(c) <= 0x9f):
+ 50				# illegal character
+ 51				ret += '&#xfffd;'
+ 52			elif ord(c) in html_entity_names:
+ 53				ret += f'&{html_entity_names[ord(c)]};'
+ 54			else:
+ 55				ret += f'&#x{hex(ord(c))[2:]};'
+ 56	
+ 57		return ret
+```
+
+- L46: 入力を 1 文字ずつ調べる。
+- L47〜48: 英数字（`isalnum()` が真の文字。日本語の文字なども含む）と、`immune` の 5 文字（`, . - _` と空白）は、そのまま残す。
+- L49〜51: 制御文字（タブ・改行・復帰以外の 0x00〜0x1f と、0x7f〜0x9f）は、`&#xfffd;`（置換文字 �）にする。
+- L52〜53: `"` `&` `<` `>` は、`&quot;` `&amp;` `&lt;` `&gt;` という名前付きの文字参照にする。文字参照は、文字を別の書き方で表したもの。ブラウザは `<` という文字として表示するが、タグの始まりとは見なさない。
+- L54〜55: 残りの文字は、すべて `&#x` + 16 進数 + `;` の文字参照にする（`'` は `&#x27;`、`/` は `&#x2f;`、`=` は `&#x3d;`、`(` は `&#x28;`）。
+
+なぜこれで XSS が防げるのか:
+
+- 埋め込む場所は HTML 本文のテキストである。前後の `'` はただの文字で、属性の引用符ではない。
+- エスケープ後には、生の `<` `>` `"` `'` も、文字参照でない `&` も残らない。そのため、タグも属性も作れない。
+- `bar` が出力されるのはこの 1 か所だけで、GET の処理も同じ関数を通る。どの経路でもエスケープを通る。
+
+### 3. 修正の結果
+
+攻撃の入力の出力（escape_for_html の実装に従って求めたもの）:
+
+- 値 `<script>alert(1)</script>` のとき、修正コードは次の文字列を返す。
+  `bar is '&lt;script&gt;alert&#x28;1&#x29;&lt;&#x2f;script&gt;' and otherarg is 'static text'`
+- 画面には `bar is '<script>alert(1)</script>' and otherarg is 'static text'` という文字が表示されるだけで、スクリプトは実行されない。
+
+正常な入力での動作:
+
+- 英数字・空白・`, . - _`・日本語の入力は、出力の文字列が元と完全に同じである（`isalnum()` が日本語も英数字として扱うため）。
+- 記号や改行を含む入力は、その文字が文字参照になるが、ブラウザでの表示は元と同じである。
+- 制御文字は U+FFFD（�）として表示されるようになる。検証では「安全側への変化」としている。
+
+検証（プロンプトファイル2）で確かめたこと:
+
+- 構文と読み込み: 元のコードと修正コードの両方で `ast.parse`（Python の構文解析）が通った。Flask の代わりの最小のスタブ（まねをする部品）の上で読み込み、`init(app)` で GET と POST のルートが登録されることを確かめた。
+- 攻撃の入力 28 種: script・img・svg などのタグ、大文字や大小混在、`'>` や `">` で抜けるもの、`&lt;` や `&#60;` による二重解釈、`%3C`、NUL や制御文字、全角の＜＞、UTF-7、孤立サロゲート、10 万文字などを試した。
+  - 修正版の出力には、生の `<` `>` `"` `'` `=` とバッククォート（`` ` ``）も、文字参照でない `&` も出ず、html.parser で解析してもタグは 0 個だった。
+  - 元のコードでは、同じ入力でタグが最大 3 個解析された。
+- 全コードポイント（0〜0x10FFFF）: escape_for_html の出力が、どの文字でも「元の 1 文字そのまま」か「正しい形の文字参照 1 個」であることを確かめた。HTML の特殊文字がそのまま出るものはなかった。
+- HTTP 経由: 127.0.0.1 でスタブのサーバを起動し、curl で `%3C`、二重符号化の `%253C`、不正な UTF-8 の `%C0%BC`、同名パラメータ 2 つ、クエリ付きの GET を送った。元のコードはタグをそのまま返し、修正コードはすべて文字参照で返した。
+- 正常な入力 14 種と、パラメータなし・空文字・GET: 英数字・空白・日本語では出力が元と同じ、記号を含むものは文字参照を戻すと元と同じ、を確かめた。
+- 実際の Flask はこの環境になく、スタブでの確認である。Content-Type が text/html になる点も、Flask の既定の動作をまねたもので、実物では確かめていない。
+
