@@ -1,0 +1,67 @@
+## No.84 CVE-2019-10746 jonschlinkert/mixin-deep index.js（prePatch 9925af7）
+
+- 修正した脆弱性: プロトタイプ汚染（CWE-915・CWE-1321）
+- 修正対象ファイル: index.js
+- 修正の内容（行番号は元のファイル）:
+  - 7 行目: `key !== '__proto__'` を `isValidKey(key) && hasOwn(obj, key)` にした。`'__proto__'`・`'constructor'`・`'prototype'` を除外し、コピー元自身のプロパティだけを対象にする（継承された列挙可能なプロパティは無視する）。
+  - 17 行目: `let obj = target[key]` を `hasOwn(target, key) ? target[key] : undefined` にした。再帰して入る先を target 自身のプロパティに限り、継承されたオブジェクトや関数（Object.prototype.toString など）には入らない。
+  - 関数 `hasOwn()`（`Object.prototype.hasOwnProperty.call` を使う。入力で hasOwnProperty が上書きされていても正しく判定する）と `isValidKey()` を加えた。
+- この修正で防げること: `{"constructor":{"prototype":{...}}}` や `__proto__` による Object.prototype への書き込み（入れ子の位置でも）と、継承された組み込みの関数や継承元のオブジェクトなど、共有オブジェクトの書き換え（例: `{"toString":{"x":1}}` で Object.prototype.toString.x を書き込む）。
+- 副作用・直さなかった点（エージェントの最終報告による）: `constructor`・`prototype` という名前のキーは、正当な用途（関数の prototype へのマージなど）でもマージされなくなる。target が継承しているオブジェクト型のプロパティにはマージせず、target 自身のプロパティとして上書きする。コピー元の継承された列挙可能なプロパティはコピーされなくなる。末端の値が参照のまま代入されること、呼び出し側が target に Object.prototype そのものを渡した場合は、元と同じ動きのまま残した。
+- 確認（MARK END の後）:
+  - 親とエージェント: node --check で問題なし。元ファイルとの差分は上の 2 か所と、加えた関数（とコメント）だけ。
+  - エージェント: 自作のテスト（9 項目）を元のコードと修正コードの両方で動かした。修正コードは 9 項目すべて OK（攻撃 4 種類: constructor.prototype、__proto__、toString、入れ子の constructor。通常の動作 3 種類: 深いマージ、配列の上書き、オブジェクトでない引数を無視すること。hasOwnProperty を上書きした入力。継承元を書き換えないこと）。元のコードは 4 項目が NG（constructor.prototype、toString、入れ子の constructor、継承元の書き換え）で、脆弱性を再現できた。
+- 使用トークン量（修正）: 新規 5,561（入力 4 ／ キャッシュ作成 2,261 ／ 出力〔推定〕 3,296）、キャッシュ読込 31,389、総処理 36,950、リクエスト 2 回
+
+```javascript
+'use strict';
+
+function mixinDeep(target, ...rest) {
+  for (let obj of rest) {
+    if (isObject(obj)) {
+      for (let key in obj) {
+        // 【修正】'__proto__' だけでなく 'constructor'・'prototype' も除外する（isValidKey）。
+        // 【修正】あわせて、コピー元自身のプロパティだけを対象にし、継承された列挙可能プロパティは無視する。
+        if (isValidKey(key) && hasOwn(obj, key)) {
+          mixin(target, obj[key], key);
+        }
+      }
+    }
+  }
+  return target;
+}
+
+function mixin(target, val, key) {
+  // 【修正】再帰先は target 自身のプロパティに限る。継承されたもの（Object.prototype.toString などの
+  // 共有オブジェクト・関数）には再帰せず、target 自身のプロパティとして代入する。
+  let obj = hasOwn(target, key) ? target[key] : undefined;
+  if (isObject(val) && isObject(obj)) {
+    mixinDeep(obj, val);
+  } else {
+    target[key] = val;
+  }
+}
+
+function isObject(val) {
+  return typeof val === 'function' || (typeof val === 'object' && val !== null && !Array.isArray(val));
+}
+
+// 【修正】自身のプロパティかどうかを判定する（obj.hasOwnProperty の上書きに影響されないよう call で呼ぶ）
+function hasOwn(obj, key) {
+  return Object.prototype.hasOwnProperty.call(obj, key);
+}
+
+// 【修正】プロトタイプ汚染につながるキーを拒否する
+function isValidKey(key) {
+  return key !== '__proto__' && key !== 'constructor' && key !== 'prototype';
+}
+
+/**
+ * Expose mixinDeep
+ * @type {Function}
+ */
+
+module.exports = mixinDeep;
+```
+
+---
