@@ -1,0 +1,286 @@
+## No.22 CVE-2016-10735 twbs/bootstrap js/src/util.js（prePatch ba6a6f1, v4.0.0-beta）
+
+- 検証した修正コード: "修正版コード"
+- 検証結果: **不備あり** — XSS は直っている（27 種の攻撃入力で実行 0 回）が、存在確認を document.querySelector にしたため、数字で始まる id（#1col など）や jQuery 拡張セレクタが SyntaxError → null になり、collapse・tab などが動かなくなる不具合が入った（Chrome で再現）。修正コード2: 先頭が空白類＋< の文字列を先に null にし、存在確認は $(document).find(selector) に変更
+- 修正コード2 のファイル: js/src/util.js
+- 親の確認: js/src/util.js: node --check で構文エラーなし。エージェントが読み取り専用の材料（orig・given）を変えていないこと、読まない範囲のファイルを読んでいないことを、記録で確認した。
+- 親の注記: エージェントは、log の VERIFY_END の本文の件数（13 件 → 14 件）を sed で 1 か所直した（エージェントの最終報告による）。
+- 使用トークン量（検証）: 新規 103,693（入力 42 ／ キャッシュ作成 63,698 ／ 出力〔推定〕 39,953）、キャッシュ読込 1,130,704、総処理 1,234,397、リクエスト 21 回
+- 使用トークン量（再修正）: 新規 60,012（入力 32 ／ キャッシュ作成 38,803 ／ 出力〔推定〕 21,177）、キャッシュ読込 1,598,462、総処理 1,658,474、リクエスト 16 回
+
+- 修正コード2 のファイル: `$R/fix2/js/src/util.js`（元の修正コード `$R/given/fix_xss/js/src/util.js` をコピーし、`getSelectorFromElement` の中だけを直した）
+- 検証結果: **不備あり**。XSS は直っていた。ただし、元のコードで動いていた正常な入力で、collapse・tab・modal などが動かなくなる不具合が入っていた。
+
+### 元の修正コードの不備
+
+#### 不備1: `document.querySelector` で存在確認したため、元のコードで動いていた正常な入力が null になる（動作の不具合）
+
+- 場所: `given/fix_xss/js/src/util.js` の `getSelectorFromElement(element)`（L113-130）
+  - L125 `const target = document.querySelector(selector)`
+  - L126 `return target ? selector : null`
+  - L127-129 `} catch (error) { return null }`
+- 問題: 元のコード（`orig/js/src/util.js` L120-121）は、`$(selector)`（jQuery のセレクタ解釈）で対象の有無を確かめていた。元の修正は、これを CSS の文法だけで判定する `document.querySelector` に変えた。そのため、jQuery では解釈できて CSS では不正になる文字列が `SyntaxError` になり、catch で `null` が返るようになった。呼び出し元（collapse.js L83・L228・L321・L370、modal.js L539、tab.js L88、dropdown.js L350、alert.js L89、carousel.js L458、scrollspy.js L128）は、`null` を受け取ると対象がないものとして扱うため、部品が何もしなくなる。修正の説明にもコード内のコメントにも、この動作の変化は書かれておらず、意図しない変更である。
+- 問題になる入力・条件:
+  1. **数字で始まる id**（HTML5 では有効な id。例: `<div id="1col">`）を、`href="#1col"` や `data-target="#1abc"` で指す場合。CSS の文法では `#1abc` は不正な ID セレクタなので、querySelector が例外を投げる。元のコードの `$('#1abc')` は、jQuery の `#([\w-]+)` の高速経路（`getElementById`）で要素を見つけていた。
+  2. **先頭が結合子のセレクタ**（`> *` など）と、**jQuery の拡張セレクタ**（`.cls:first`、`.cls:eq(0)`、`div:contains(p)` など）。jQuery では動いていたが、querySelector では例外になる。
+- 実際に確かめた結果（ヘッドレス Chrome 156、jQuery 3.2.1 / 3.7.1 / 4.0.0）:
+  - `getSelectorFromElement` 単体: `data-target="#1abc"`・`href="#1abc"`・`.cls:first`・`.cls:eq(0)`・`div:contains(p)` で、元は値を返し（要素数 1）、元の修正は `null` を返した。
+  - 結合テスト（同じコミットの collapse.js / modal.js / tab.js と結合し、data-api のクリックを実行。jQuery 3.2.1 / 3.7.1）: `<a data-toggle="collapse" href="#1col">` をクリックしても `#1col` が開かない（class は `collapse` のまま。元は `collapse show`）。`<a data-toggle="tab" href="#3tp">` をクリックしても pane `#3tp` に `active` が付かず、前の pane が表示されたままになる（元は切り替わる）。
+  - ランダムに作った 30,000 個の data-target（元のコードが HTML として扱わなかった 26,202 個）のうち、2,421〜2,423 個で、元の修正の戻り値が元のコードと違っていた（例: `#1abc`、`:first`、`>\t*`）。
+
+#### 参考: 不備ではない点
+
+- XSS（判定の根拠）は元の修正で直っていた。攻撃の入力 27 種（`<img src=x onerror=...>` を data-target / href に入れたもの、先頭に空白・改行・NBSP・U+FEFF・U+2028 を付けたもの、大文字、`<svg onload>`、CSS の CDO を使った `<!-- -->[title="<img ...>"]` など）では、jQuery.parseHTML の呼び出しも、スクリプトの実行も 0 回だった。
+- `href` が URL・`#`・空文字の場合は、元のコードと同じく `null` が返る。
+
+### 再修正の内容
+
+変更したのは `fix2/js/src/util.js` の `getSelectorFromElement` だけ（L119-140 の try/catch の中）。ほかの行は元の修正コードと同じ。
+
+```js
+      try {
+        // 修正: $(selector) は '<' で始まる文字列を HTML として解釈し要素を生成してしまうため、
+        // HTML として解釈される文字列は対象として扱わない。
+        // 【修正2】（不備の説明。中略）
+        // 【修正2】jQuery が文字列を HTML とみなすのは、先頭が '<' のとき（空白類が前にあってもよい）だけ。（中略）
+        if (/^\s*</.test(selector)) {
+          return null
+        }
+        // 【修正2】存在確認は $(document).find() で行う。（中略）
+        const $target = $(document).find(selector)
+        return $target.length > 0 ? selector : null
+      } catch (error) {
+        return null
+      }
+```
+
+#### 変更1: jQuery が HTML とみなす形の文字列を、先に拒否する（L129-131）
+
+- 何をしたか: `selector` が正規表現 `/^\s*</` に一致する場合（先頭が `<`、または空白類の後が `<`）は、すぐに `null` を返すようにした。
+- なぜこの方法にしたか: jQuery 3.0〜4.0 の `jQuery()`（`init`）が文字列を HTML とみなすのは、次の 2 つの場合だけである（3.2.1 / 3.7.1 / 4.0.0 のソースで確認した）。
+  1. 先頭が `<` で、末尾が `>`、長さが 3 以上（4.0 では `isObviousHtml`）
+  2. `rquickExpr = /^(?:\s*(<[\w\W]+>)[^>]*|#([\w-]+))$/` の最初の選択肢に一致する（先頭が空白類 + `<`）
+
+  どちらの場合も、文字列は「先頭が（空白類の後に）`<`」になる。`/^\s*</` は、この 2 つを両方含む広い条件である。`\s` は jQuery と同じ JavaScript の `\s` なので、NBSP（U+00A0）、U+FEFF、U+2028、U+3000 などの空白類を先頭に付けても、すり抜けられない。
+  また、先頭が `<` の文字列は、CSS のセレクタとしても jQuery のセレクタとしても文法上不正である。Chrome の querySelector に 200,143 通りを与えて、受理されないことを確かめた。そのため、この拒否で失われる正常な入力はない。
+- どう動くか: `<img src=x onerror=...>`、`  <img ...>`、` <img ...>`、`<!-- -->[title="<img ...>"]` などは、ここで `null` になる。HTML を解釈する処理には一度も渡らない。
+
+#### 変更2: 存在確認を `$(document).find(selector)` で行う（L136-137）
+
+- 何をしたか: 元の修正の `document.querySelector(selector)` を `$(document).find(selector)` に変えた。要素が 1 つ以上あれば `selector` を、なければ `null` を返す（元のコードの `$selector.length > 0 ? selector : null` と同じ形）。
+- なぜこの方法にしたか:
+  - `jQuery.fn.find(文字列)` は、文字列を常に jQuery のセレクタエンジン（`jQuery.find`、3.x では Sizzle）に渡す。HTML として解釈して要素を作ることはない。そのため、この確認の中で HTML が解釈されることはない。
+  - 元のコードの `$(selector)` は、HTML でない文字列について、`#id` の形なら `getElementById`、それ以外なら `$(document).find(selector)` と同じ処理をする。セレクタエンジンの `#id` の高速経路も `getElementById` を使う。このため、変更1を通った文字列については、元のコードと同じ解釈になる。これで、数字で始まる id、jQuery の拡張セレクタ、先頭が結合子のセレクタは、元どおり動く。
+  - 呼び出し元は、返された文字列を `$(selector)` に渡す。変更1によって、`null` 以外が返る文字列は先頭が空白類 + `<` ではない。そのため、呼び出し元の `$(selector)` でも HTML としては解釈されない（判定の記録の副次的な sink である collapse.js L371、modal.js L542 なども守られる）。
+  - 不正なセレクタ（`#`、`http://example.com/x#target`、`#target<img ...>` など）では、jQuery が例外を投げる。これは既存の catch で `null` になり、元のコードと同じ動作になる。空文字は jQuery が空の結果を返すので、`null` になる。
+- 元の修正のコメントは、1 行目（`$(selector)` が HTML として解釈するという原因の説明）を残した。querySelector を使うという説明は内容が変わるため書き換え、追加した説明には `【修正2】` を付けた。
+
+### 確認した内容と結果
+
+テストのスクリプトとページは `$R/bench/` に置いた。テストでは、対象の util.js のパスを引数で渡した。
+
+1. 構文確認
+   - `node --check`（.mjs としてコピーしたもの）: 修正コード2 は OK。
+   - 同じコミットの `js/.eslintrc.json` と、package.json の devDependencies と同じ eslint 4.2.0 + babel-eslint 7.2.3 で lint した。エラーは 0 件（`curly` などのリポジトリの規則も満たす）。
+2. 単体テスト（`getSelectorFromElement` と、呼び出し元相当の `$(戻り値)`）。jsdom（jQuery.parseHTML の呼び出しを記録）と、ヘッドレス Chrome（onerror で実際にスクリプトが実行されたかを記録）で、jQuery 3.2.1 / 3.7.1 / 4.0.0 を使った。
+   - 正常な入力 15 種（`#target`、`.cls`、`div.box > p.item`、`[data-foo="bar"]`、`#target, .cls`、`#a\:b`、`data-target="#"` や `""` で href にフォールバック、前後に空白、`#missing`、`href="#"`、URL など）: Chrome で、戻り値と要素数は 3 つの版すべてで元のコードと同じだった。
+   - 元の修正で動かなくなっていた入力（`#1abc`、`href="#1abc"`、`.cls:first`、`.cls:eq(0)`、`div:contains(p)`）: Chrome で、元のコードと同じ値を返すように戻った（要素数 1）。
+   - 攻撃の入力 27 種: すべて `null` を返し、jQuery.parseHTML の呼び出しは 0 回、Chrome でのスクリプト実行も 0 回だった（元のコードでは 12 種で実際に onerror が実行された）。`#target, <img ...>`、`#target <img ...>`、`*:not(<img ...>)` のように、途中に HTML を入れたものも同じ結果だった。`[title="x<img>"]` のように属性値の中に `<` を含む正当なセレクタは、元のコードと同じく要素を返した。HTML は生成されなかった。
+3. ファズ（Chrome、jQuery 3.2.1 / 3.7.1 / 4.0.0）: HTML の断片、空白類、`#1abc`、`:first`、`<!--` などを組み合わせたランダムな data-target を 30,000 個与えた。どの版でも、修正コード2 によるスクリプト実行は 0 回、parseHTML の呼び出しは 0 回だった。元のコードが HTML として扱わなかった 26,202 個は、すべて元のコードと同じ戻り値だった（相違 0 件）。元の修正では、相違が 2,421〜2,423 件あった。
+4. 結合テスト（Chrome）: util.js と、同じコミットの collapse.js / modal.js / tab.js を、package.json の js-compile-bundle と同じく import/export 行を消して結合し、data-api のクリックを実行した。
+   - jQuery 3.2.1 / 3.7.1: collapse（`href="#col1"`、`href="#1col"`、`data-target=".grp"`）はすべて `collapse show` になった。modal（`data-target="#mod1"`）は `show` で `display:block` になった。tab（`href="#tp2"` → `href="#3tp"`）は pane が切り替わった。どれも元のコードと同じ結果で、元の修正で動かなかった `#1col`・`#3tp` も動くようになった。攻撃の値を持つ collapse / modal / tab をクリックしても、スクリプトの実行は 0 回、エラーも 0 件だった（元のコードでは collapse で 14 回、modal・tab で各 2 回実行された）。
+   - jQuery 4.0.0: collapse のクリックで `TypeError: Cannot convert object to primitive value` が出て開かない。ただし、これは元のコードと元の修正でも同じである。v4.0.0-beta の collapse.js と jQuery 4 の組み合わせの問題で、今回の修正によるものではない。modal・tab は動き、スクリプトの実行は 0 回だった。
+
+### 副作用・残る点
+
+- 動作の変化: HTML として解釈される形（先頭が空白類 + `<`）の data-target / href だけが、元のコードと違って `null` になる（脆弱性の修正そのもの）。それ以外の文字列では、戻り値は元のコードと同じ。元の修正で起きていた、数字で始まる id や jQuery の拡張セレクタが動かない問題はなくなった。
+- この方法は、jQuery の `jQuery()` が HTML とみなす条件（先頭が空白類 + `<`）に基づいている。peerDependencies の範囲（3.0.0〜4.0.0）では成り立つことを、ソースと実行で確かめた。jQuery 1.9 より前のように、先頭以外の `<` でも HTML とみなす古い版では成り立たないが、package.json の範囲外なので対象としない。
+- 直していない点（判定の記録の範囲外）: collapse.js L291 の `$(this._config.parent)`（data-parent）、scrollspy.js L175 の `$(config.target)`、tooltip.js L285 の `$(this.config.container)` も、data-* 属性の値を `$()` に渡す箇所である。これらは `getSelectorFromElement` を通らない別のファイルの処理で、No.22 の判定（util.js）の対象外なので、直していない。
+- jQuery 4.0.0 で collapse が動かない件は、元のコードでも起きる互換性の問題なので、直していない。
+
+### 修正コード2 の全文: js/src/util.js
+
+```javascript
+/**
+ * --------------------------------------------------------------------------
+ * Bootstrap (v4.0.0-beta): util.js
+ * Licensed under MIT (https://github.com/twbs/bootstrap/blob/master/LICENSE)
+ * --------------------------------------------------------------------------
+ */
+
+const Util = (($) => {
+
+
+  /**
+   * ------------------------------------------------------------------------
+   * Private TransitionEnd Helpers
+   * ------------------------------------------------------------------------
+   */
+
+  let transition = false
+
+  const MAX_UID = 1000000
+
+  const TransitionEndEvent = {
+    WebkitTransition : 'webkitTransitionEnd',
+    MozTransition    : 'transitionend',
+    OTransition      : 'oTransitionEnd otransitionend',
+    transition       : 'transitionend'
+  }
+
+  // shoutout AngusCroll (https://goo.gl/pxwQGp)
+  function toType(obj) {
+    return {}.toString.call(obj).match(/\s([a-zA-Z]+)/)[1].toLowerCase()
+  }
+
+  function isElement(obj) {
+    return (obj[0] || obj).nodeType
+  }
+
+  function getSpecialTransitionEndEvent() {
+    return {
+      bindType: transition.end,
+      delegateType: transition.end,
+      handle(event) {
+        if ($(event.target).is(this)) {
+          return event.handleObj.handler.apply(this, arguments) // eslint-disable-line prefer-rest-params
+        }
+        return undefined // eslint-disable-line no-undefined
+      }
+    }
+  }
+
+  function transitionEndTest() {
+    if (window.QUnit) {
+      return false
+    }
+
+    const el = document.createElement('bootstrap')
+
+    for (const name in TransitionEndEvent) {
+      if (typeof el.style[name] !== 'undefined') {
+        return {
+          end: TransitionEndEvent[name]
+        }
+      }
+    }
+
+    return false
+  }
+
+  function transitionEndEmulator(duration) {
+    let called = false
+
+    $(this).one(Util.TRANSITION_END, () => {
+      called = true
+    })
+
+    setTimeout(() => {
+      if (!called) {
+        Util.triggerTransitionEnd(this)
+      }
+    }, duration)
+
+    return this
+  }
+
+  function setTransitionEndSupport() {
+    transition = transitionEndTest()
+
+    $.fn.emulateTransitionEnd = transitionEndEmulator
+
+    if (Util.supportsTransitionEnd()) {
+      $.event.special[Util.TRANSITION_END] = getSpecialTransitionEndEvent()
+    }
+  }
+
+
+  /**
+   * --------------------------------------------------------------------------
+   * Public Util Api
+   * --------------------------------------------------------------------------
+   */
+
+  const Util = {
+
+    TRANSITION_END: 'bsTransitionEnd',
+
+    getUID(prefix) {
+      do {
+        // eslint-disable-next-line no-bitwise
+        prefix += ~~(Math.random() * MAX_UID) // "~~" acts like a faster Math.floor() here
+      } while (document.getElementById(prefix))
+      return prefix
+    },
+
+    getSelectorFromElement(element) {
+      let selector = element.getAttribute('data-target')
+      if (!selector || selector === '#') {
+        selector = element.getAttribute('href') || ''
+      }
+
+      try {
+        // 修正: $(selector) は '<' で始まる文字列を HTML として解釈し要素を生成してしまうため、
+        // HTML として解釈される文字列は対象として扱わない。
+        // 【修正2】元の修正は document.querySelector で存在確認していた。しかし CSS の文法だけで判定するため、
+        // 元の $(selector) で動いていた入力が例外になって null が返り、collapse・tab・modal などが動かなくなっていた。
+        // 該当するのは、数字で始まる id（href="#1col" など。HTML5 では有効な id）や、jQuery の拡張セレクタ（:first など）。
+        // 【修正2】jQuery が文字列を HTML とみなすのは、先頭が '<' のとき（空白類が前にあってもよい）だけ。
+        // 具体的には、'<' で始まり '>' で終わる文字列か、/^\s*(<[\w\W]+>)[^>]*$/ に一致する文字列。
+        // （jQuery 3.0〜4.0 の init。\s は同じ JavaScript の \s で、NBSP や U+FEFF も含む）
+        // そこで、先頭が空白類 + '<' の文字列は、ここで先に null を返す。
+        if (/^\s*</.test(selector)) {
+          return null
+        }
+        // 【修正2】存在確認は $(document).find() で行う。find() は文字列を常にセレクタとして解釈し、HTML から要素を作らない。
+        // こうすると、セレクタの解釈は元の $(selector) と同じになる（#id は getElementById、拡張セレクタは jQuery が処理）。
+        // また、ここで null 以外が返る文字列は、呼び出し元の $(selector) でも HTML として解釈されない。
+        // 不正なセレクタ（'#' や URL など）は jQuery が例外を投げ、catch で null を返す。
+        const $target = $(document).find(selector)
+        return $target.length > 0 ? selector : null
+      } catch (error) {
+        return null
+      }
+    },
+
+    reflow(element) {
+      return element.offsetHeight
+    },
+
+    triggerTransitionEnd(element) {
+      $(element).trigger(transition.end)
+    },
+
+    supportsTransitionEnd() {
+      return Boolean(transition)
+    },
+
+    typeCheckConfig(componentName, config, configTypes) {
+      for (const property in configTypes) {
+        if (Object.prototype.hasOwnProperty.call(configTypes, property)) {
+          const expectedTypes = configTypes[property]
+          const value         = config[property]
+          const valueType     = value && isElement(value) ?
+                                'element' : toType(value)
+
+          if (!new RegExp(expectedTypes).test(valueType)) {
+            throw new Error(
+              `${componentName.toUpperCase()}: ` +
+              `Option "${property}" provided type "${valueType}" ` +
+              `but expected type "${expectedTypes}".`)
+          }
+        }
+      }
+    }
+  }
+
+  setTransitionEndSupport()
+
+  return Util
+
+})(jQuery)
+
+export default Util
+```
+
+---
