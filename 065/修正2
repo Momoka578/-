@@ -1,0 +1,267 @@
+## No.65 SARD 501365 PasswordServlet.java / login/incorrect.jsp（+ components/login-form.jsp, WEB-INF/web.xml）
+
+- 検証した修正コード: "xss以外の修正コード"
+- 検証結果: **不備あり** — 修正した failed_login のログは 1 行になる。ただし同じリクエストで、未加工の email を authenticationService.authenticate に渡しており、上流 PasswordAuthentication.authenticate の 216 行目が "attempting password auth of user="+username を INFO でそのまま dspace.log に書く（既定の設定）ため、login_password を送れば偽の行を差し込める（エミュレータで 17 通り中 8 件）。修正コード2: 制御文字・U+2028/2029 を含む email は認証サービスに null を渡す（hasLogUnsafeChars で判定）。Java は未実行
+- 修正コード2 のファイル: dspace-jspui/src/main/java/org/dspace/app/webui/servlet/PasswordServlet.java
+- 親の確認: dspace-jspui/src/main/java/org/dspace/app/webui/servlet/PasswordServlet.java: 構文確認なし（この環境に Java の実行環境がないため。エージェントも Java は実行していない）。エージェントが読み取り専用の材料（orig・given）を変えていないこと、読まない範囲のファイルを読んでいないことを、記録で確認した。
+- 親の注記: 上流 DSpace 6.2 から取得した 9 ファイル（PasswordAuthentication.java、log4j.properties など）は、どれも SARD の zip に入っていないことを親が確かめた。
+- 親の注記: 修正コード2 に、Java の Unicode エスケープ（\u）として解釈されてしまう箇所がないことを親が確かめた。
+- 使用トークン量（検証）: 新規 74,783（入力 26 ／ キャッシュ作成 46,618 ／ 出力〔推定〕 28,139）、キャッシュ読込 495,225、総処理 570,008、リクエスト 13 回
+- 使用トークン量（再修正）: 新規 24,860（入力 14 ／ キャッシュ作成 14,038 ／ 出力〔推定〕 10,808）、キャッシュ読込 512,105、総処理 536,965、リクエスト 7 回
+
+- 検証した修正コード: "xss以外の修正コード" の `dspace-jspui/src/main/java/org/dspace/app/webui/servlet/PasswordServlet.java`（ログインジェクション／ログ偽造 CWE-117 の修正）
+- 修正コード2: `$R/fix2/dspace-jspui/src/main/java/org/dspace/app/webui/servlet/PasswordServlet.java`（直したのはこの 1 ファイルだけ）
+- 行番号は、とくに断らない限り「元の修正コード」はライセンスヘッダを省いた修正コードの行番号、「修正コード2」は修正コード2 の行番号。上流のファイルは DSpace 6.2（タグ dspace-6.2）の行番号。
+
+### 元の修正コードの不備
+
+#### 不備1: 認証サービスに未加工の email を渡しており、上流の PasswordAuthentication のログから、同じ偽の行を差し込める
+
+- 場所: 元の修正コード `PasswordServlet.java` 62〜63 行目
+  ```java
+  int status = authenticationService.authenticate(context, email, password,
+          null, request);
+  ```
+  元の修正コードは、95〜96 行目の失敗ログ（`failed_login`）の `email` だけを `sanitizeForLog(email)` に変えた。62〜63 行目では、改行などの制御文字を含んだままの `email` を認証サービスに渡している。
+- なぜ問題になるか:
+  - 上流 `AuthenticationServiceImpl.authenticateInternal`（dspace-api、97〜131 行目）は、認証方式のスタックの各方式に `username` をそのまま渡す。既定の方式は `PasswordAuthentication` だけ（`dspace/config/modules/authentication.cfg` 50 行目）。
+  - 上流 `PasswordAuthentication.authenticate`（dspace-api、213〜216 行目）は、
+    ```java
+    if (username != null && password != null)
+    {
+        ...
+        log.info(LogManager.getHeader(context, "authenticate", "attempting password auth of user="+username));
+    ```
+    として、受け取った email を **INFO** レベルでそのままログに書く。`LogManager.escapeLogField`（LogManager.java 74〜81 行目）は「\」と「:」しか変えないので、CR・LF などはそのまま残る。
+  - `dspace/config/log4j.properties` は、25 行目 `loglevel.dspace=INFO`、42 行目 `log4j.logger.org.dspace=${loglevel.dspace}, A1`、48 行目で A1 の出力先が `dspace.log`、55 行目 `%d %-5p %c @ %m%n`。ロガー名は `org.dspace.authenticate.PasswordAuthentication`（PasswordAuthentication.java 51 行目）なので、既定の設定でこのログは `dspace.log` に出る。
+  - このログは、失敗ログ（96 行目）より前、同じリクエストの中で書かれる。
+- 問題になる入力・条件:
+  - 未認証の誰でも、`POST /password-login` に `login_email=x%0A<偽のログ行>&login_password=<任意の値（空文字でもよい）>` を送ればよい。`login_password` のパラメータがあれば（null でなければ）、PasswordAuthentication の 216 行目のログが出る。
+  - LF のほか、CR・CRLF でも Java の `BufferedReader.readLine`（LogAnalyser などが使う）で行が分かれる。VT・FF・NEL（U+0085）・U+2028・U+2029 も、Unicode の行区切りとして扱うビューアやツールでは行が分かれる。
+  - 偽の行の「:」は escapeLogField で `\colon;` に変わるが、これは元の脆弱性でも同じ条件で、見た目の似た文字（U+2236 など）で人が読むログは偽造できる。修正の前後で攻撃の力は変わらない。
+- 確かめたこと（Java がないため、Python のエミュレータ `$R/bench/emu.py` で、上流の getHeader・escapeLogField・PasswordAuthentication.authenticate・PatternLayout を再現して確認した）:
+  - 元のコード: 17 通りの入力のうち 9 通りで `dspace.log` に偽の行が入る。
+  - 元の修正コード: 17 通りのうち 8 通りで、まだ偽の行が入る（LF・CR・CRLF・VT/FF・NEL・U+2028・U+2029・登録済みのメール+LF）。直ったのは「login_password を送らない」場合だけだった。
+  - 例（LF のとき、元の修正コードで出る dspace.log。2 行目が差し込まれた偽の行）:
+    ```
+    2026-11-05 12:00:00,000 INFO  org.dspace.authenticate.PasswordAuthentication @ anonymous:session_id=...:ip_addr=127.0.0.1:authenticate:attempting password auth of user=x
+    2026-11-05 12∶00∶01,000 INFO  org.dspace.app.webui.servlet.PasswordServlet @ admin@example.org
+    2026-11-05 12:00:00,000 INFO  org.dspace.app.webui.servlet.PasswordServlet @ anonymous:...:failed_login:email=x_2026-11-05 12∶00∶01,000 INFO  ..., result=4
+    ```
+  - よって、修正の説明の「login_email に改行を入れても…dspace.log に偽の行（他ユーザーの login 成功行など）を差し込めなくなり」は成り立たない。判定の根拠の脆弱性（login_email の改行で dspace.log に偽の行を差し込める）は、既定の設定のままで残っていた。
+  - PasswordAuthentication.java は dspace-api の部品で zip には入っていないが、修正対象の PasswordServlet.java の中で、認証サービスに渡す前に止めれば直せる。
+
+#### 参考（不備ではない点）
+
+- 失敗ログそのもの（元の修正コード 95〜96 行目、111 行目の `replaceAll("[\\p{Cc}\\u2028\\u2029]", "_")`）は正しく直っていた。Java の `\p{Cc}` は U+0000〜001F・U+007F〜009F で、CR・LF・NEL などをすべて含む。過長 UTF-8（`%C0%8A` は U+FFFD になる）や二重符号化（`%250A` は文字列 "%0A" のまま）では改行にならない。
+- 元の修正コードに、新しい脆弱性や構文の誤り、正常な入力での動きの変化はなかった。
+- 修正の説明で対象外とした点（LogManager.escapeLogField を変えない、getHeader の session_id・ip_addr、JSP・web.xml を変えない）は、いずれも妥当と判断した。session_id はサーバが作る値で、ip_addr は getRemoteAddr か、useProxies が有効なときだけ X-Forwarded-For（UIUtil.java 170〜185 行目）。どちらも login_email とは別の入力・別の原因で、HTTP ヘッダの値には生の CR/LF を入れられない。
+
+### 再修正の内容
+
+元の修正コードをもとに、`PasswordServlet.java` の 2 か所だけを変えた（元の【修正】の部分はそのまま残した）。
+
+#### 変更1: 制御文字を含む email は認証サービスに渡さない（修正コード2 61〜74 行目）
+
+```java
+        // 【修正2】改行などの制御文字を含む email は、認証サービスに渡さない（null を渡す）。
+        // ...（説明のコメント）...
+        String authEmail = hasLogUnsafeChars(email) ? null : email;
+
+        // Locate the eperson
+        // 【修正2】email ではなく、上で確かめた authEmail を渡す。
+        int status = authenticationService.authenticate(context, authEmail, password,
+                null, request);
+```
+
+- 何をどう変えたか: `request.getParameter("login_email")` で受け取った `email` に、制御文字（Unicode の Cc 全体）・U+2028・U+2029 が 1 文字でもあれば、認証サービスには `null` を渡す。なければ、これまでどおり `email` をそのまま渡す。
+- どう動くか:
+  - 正常なメールアドレス（制御文字を含まない）: `authEmail` は `email` と同じなので、認証・ログ・遷移先は元のコードとまったく同じ。
+  - 制御文字を含む email: 認証サービスには `null` が渡る。`PasswordAuthentication.authenticate` は `username != null` の条件を満たさないので、216 行目の「attempting password auth of user=…」のログを書かずに `BAD_ARGS`（5）を返す。ほかの認証方式にも、制御文字入りの値は届かない。結果は失敗になり、これまでどおり `/login/incorrect.jsp` を表示する。失敗ログ（107 行目）には、`sanitizeForLog(email)` で制御文字を "_" に置き換えた値が 1 行で出るので、管理者は不正な入力があったことをログで確かめられる。
+- なぜこの方法にしたか:
+  - ログを書いているのは上流の dspace-api（PasswordAuthentication）で、zip に入っていない共通部品なので、呼び出し側の PasswordServlet で止めるのが最小の変更になる。
+  - 制御文字を "_" に置き換えた値を認証に渡す方法も考えたが、`a\nb` が登録済みの `a_b` として認証されるなど、送った値と違う利用者で認証が進むおかしな動きになるので採らなかった。
+  - 認証サービスを呼ばずに失敗にする方法も考えたが、X.509 証明書や IP など、email を使わない認証方式（スタックに入れた場合）の動きまで変わってしまうので採らなかった。`null` を渡す方法なら、それらの方式は「login_email を送らなかった」ときと同じに動く。
+  - `null` は、もともと `login_email` を送らなかったときに `request.getParameter` が返す値で、元のコードでもそのまま認証サービスに渡っていた。各認証方式は null の email に対応済みなので、新しい例外などは起きない。
+  - 正しいメールアドレスは制御文字を含まないので、正常な利用者には影響しない。
+
+#### 変更2: 判定用のメソッド hasLogUnsafeChars を追加（修正コード2 125〜132 行目）
+
+```java
+    private static boolean hasLogUnsafeChars(String value)
+    {
+        return value != null && !value.equals(sanitizeForLog(value));
+    }
+```
+
+- 何をするか: 元の修正コードの `sanitizeForLog` で置き換えられる文字（制御文字・U+2028・U+2029）を、1 文字でも含むときに `true` を返す。`null` のときは `false`。
+- なぜこの書き方にしたか: 対象の文字の範囲を `sanitizeForLog` の正規表現 1 か所だけで決めるため。`sanitizeForLog` は対象の文字を、対象外の文字 "_" に置き換えるので、「置き換えた結果が元と違う」ことと「対象の文字を含む」ことは同じになる（全符号位置で確認した）。正規表現を 2 か所に書かないので、将来どちらか片方だけ直してずれる心配がない。新しい import も要らない。
+
+### 確認した内容と結果
+
+Java（javac・java）がこの環境にないため、構文はコードを読んで確かめ、動きは Python のエミュレータで再現して確かめた。
+
+- 構文・読み込み（読んで確認）:
+  - 括弧の対応: 文字列・コメントを除いて数えるスクリプト `$R/bench/braces.py` で OK。
+  - `String authEmail = hasLogUnsafeChars(email) ? null : email;` は String 型の条件演算子で、型の問題はない。`hasLogUnsafeChars` は `private static boolean` で、引数・戻り値の型は呼び出し側と合う。`String.equals` は標準 API。新しい import は要らない。
+  - 上流 `DSpaceServlet.java` に `hasLogUnsafeChars`・`sanitizeForLog` という名前のメソッドはなく、`private static` の追加で衝突しない。
+  - 追加した部分に `\u` の表記はない（javac の Unicode エスケープの前処理に関係しない）。ファイルは UTF-8（CR なし、行末の空白なし）で、上流 `pom.xml` 24 行目 `project.build.sourceEncoding=UTF-8` なので、日本語コメントでコンパイルに問題はない。
+- 攻撃の入力での確認（`python3 -I $R/bench/emu.py <修正コード2 のパス> fix2`）:
+  - 17 通りの入力（正常 5 通り、LF・CR・CRLF・VT/FF・NEL・U+2028・U+2029、login_password なし+LF、過長 UTF-8、二重符号化、登録済みメール+LF、TAB）すべてで、`dspace.log` は「ログを書いた回数」と同じ行数になり、偽の行は 0 件（元のコード 9 件、元の修正コード 8 件）。
+  - 制御文字を含む入力では、PasswordAuthentication の「attempting password auth」のログが出ず、失敗ログ 1 行（`email=x_…, result=5`）だけになった。
+- 正常な入力での動き:
+  - 存在しない利用者（result=4）、パスワード違い（result=2）、成功、メールの大文字小文字違いで成功、login_email なし（email=null, result=5）で、ログの内容・認証結果・遷移先が元のコードと同じだった。
+- 判定用メソッドの確認（`python3 -I $R/bench/equiv.py`）:
+  - サロゲートを除く全符号位置で、「`v != sanitizeForLog(v)`」と「対象の文字を含む」が一致した（不一致 0 件、対象の文字は 67 個 = U+0000〜001F の 32 個 + U+007F〜009F の 33 個 + U+2028・U+2029）。
+
+### 副作用・残る点
+
+- 動作の変化:
+  - 制御文字（タブを含む）・U+2028・U+2029 を含む login_email は、どの認証方式にも渡らず、必ずログイン失敗になる。元のコードでも、そのような email と一致する利用者はふつう存在しないので失敗していたが、失敗ログの `result=` の値が `4`（NO_SUCH_USER）から `5`（BAD_ARGS）に変わる。表示する画面（`/login/incorrect.jsp`）は同じ。
+  - 万一、登録済みの利用者のメールアドレスに制御文字が入っていた場合、その利用者はパスワードでログインできなくなる（ブラウザの入力欄では改行は入らず、登録時もメールの確認があるので、実際にはまず起きない）。
+  - 制御文字を含む email では、PasswordAuthentication の「attempting password auth of user=…」のログが出なくなる。不正な入力があったことは、PasswordServlet の失敗ログ（制御文字を "_" に置き換えた値）で確かめられる。
+- 直していない点とその理由:
+  - 上流 `LogManager.escapeLogField` と `PasswordAuthentication`（dspace-api）は変えていない。zip に入っていない共通部品で、変えると DSpace 全体のログに影響するため。呼び出し側の PasswordServlet で、制御文字入りの値が届かないようにした。
+  - LDAP など、ほかの認証方式を独自に追加した場合も、制御文字入りの email は届かない（null を渡すため）。ただし、PasswordServlet 以外の画面（Shibboleth・LDAP 用の別のサーブレットなど）は、判定の対象外なので調べていない。
+  - getHeader の session_id・ip_addr は、元の修正コードと同じく対象外とした（理由は「元の修正コードの不備」の参考を参照）。
+  - Java の実行環境がないため、実際のコンパイルと Tomcat での動作確認はしていない。動きの確認は、上流のコードを Python で再現したエミュレータによるもの。
+
+### 修正コード2 の全文: dspace-jspui/src/main/java/org/dspace/app/webui/servlet/PasswordServlet.java
+
+```java
+package org.dspace.app.webui.servlet;
+
+import java.io.IOException;
+import java.sql.SQLException;
+import java.util.Locale;
+
+import javax.servlet.ServletException;
+import javax.servlet.http.HttpServletRequest;
+import javax.servlet.http.HttpServletResponse;
+import javax.servlet.jsp.jstl.core.Config;
+
+import org.apache.log4j.Logger;
+import org.dspace.app.webui.util.Authenticate;
+import org.dspace.app.webui.util.JSPManager;
+import org.dspace.authenticate.AuthenticationMethod;
+import org.dspace.authenticate.factory.AuthenticateServiceFactory;
+import org.dspace.authenticate.service.AuthenticationService;
+import org.dspace.authorize.AuthorizeException;
+import org.dspace.core.Context;
+import org.dspace.core.I18nUtil;
+import org.dspace.core.LogManager;
+
+/**
+ * Simple username and password authentication servlet. Displays the login form
+ * <code>/login/password.jsp</code> on a GET, otherwise process the parameters
+ * as an email and password.
+ *
+ * Calls stackable authentication to give credentials to all
+ * authentication methods that can make use of them, not just DSpace-internal.
+ *
+ * @author Robert Tansley
+ * @version $Revision$
+ */
+public class PasswordServlet extends DSpaceServlet
+{
+    /** log4j logger */
+    private static final Logger log = Logger.getLogger(PasswordServlet.class);
+
+    private final transient AuthenticationService authenticationService
+             = AuthenticateServiceFactory.getInstance().getAuthenticationService();
+
+    @Override
+    protected void doDSGet(Context context, HttpServletRequest request,
+            HttpServletResponse response) throws ServletException, IOException,
+            SQLException, AuthorizeException
+    {
+        // Simply forward to the plain form
+        JSPManager.showJSP(request, response, "/login/password.jsp");
+    }
+
+    @Override
+    protected void doDSPost(Context context, HttpServletRequest request,
+            HttpServletResponse response) throws ServletException, IOException,
+            SQLException, AuthorizeException
+    {
+        // Process the POSTed email and password
+        String email = request.getParameter("login_email");
+        String password = request.getParameter("login_password");
+        String jsp = null;
+
+        // 【修正2】改行などの制御文字を含む email は、認証サービスに渡さない（null を渡す）。
+        // 上流の PasswordAuthentication.authenticate は、受け取った email を
+        // "attempting password auth of user=" + email として INFO レベルでそのまま
+        // dspace.log に書く。そのため、下の失敗ログだけを直しても、改行入りの email で
+        // ログに偽の行を差し込めてしまう。正しいメールアドレスは制御文字を含まないので、
+        // そのような値は「email を送らなかった」ときと同じ null として扱い、
+        // どの認証方式にも渡さない（各認証方式は、もともと null の email に対応している）。
+        // 制御文字を含まない email は、これまでどおりそのまま渡す。
+        String authEmail = hasLogUnsafeChars(email) ? null : email;
+
+        // Locate the eperson
+        // 【修正2】email ではなく、上で確かめた authEmail を渡す。
+        int status = authenticationService.authenticate(context, authEmail, password,
+                null, request);
+
+
+        if (status == AuthenticationMethod.SUCCESS)
+        {
+            // Logged in OK.
+            Authenticate.loggedIn(context, request, context.getCurrentUser());
+
+            // Set the Locale according to user preferences
+            Locale epersonLocale = I18nUtil.getEPersonLocale(context.getCurrentUser());
+            context.setCurrentLocale(epersonLocale);
+            Config.set(request.getSession(), Config.FMT_LOCALE, epersonLocale);
+
+            log.info(LogManager.getHeader(context, "login", "type=explicit"));
+
+                // resume previous request
+                Authenticate.resumeInterruptedRequest(request, response);
+
+                return;
+        }
+        else if (status == AuthenticationMethod.CERT_REQUIRED)
+        {
+            jsp = "/error/require-certificate.jsp";
+        }
+        else
+        {
+            jsp = "/login/incorrect.jsp";
+        }
+
+        // If we reach here, supplied email/password was duff.
+        // 【修正】利用者が送った email をそのままログに書かず、改行などの制御文字を
+        // 置き換えてから書く（ログインジェクション／ログ偽造 CWE-117 の対策）。
+        log.info(LogManager.getHeader(context, "failed_login",
+                "email=" + sanitizeForLog(email) + ", result=" + String.valueOf(status)));
+        JSPManager.showJSP(request, response, jsp);
+    }
+
+    // 【修正】ログ出力用に、制御文字（CR・LF・タブなど Unicode の Cc 全体）と
+    // Unicode の行区切り（U+2028）・段落区切り（U+2029）を "_" に置き換える。
+    // LogManager.escapeLogField は「\」と「:」しかエスケープしないため、ここで
+    // 改行を消して、1 回の失敗ログが必ず 1 行に収まるようにする。
+    // null はこれまでどおり "null" として出力されるよう、そのまま返す。
+    private static String sanitizeForLog(String value)
+    {
+        if (value == null)
+        {
+            return null;
+        }
+        return value.replaceAll("[\\p{Cc}\\u2028\\u2029]", "_");
+    }
+
+    // 【修正2】sanitizeForLog で置き換えられる文字（制御文字・U+2028・U+2029）を
+    // 1 文字でも含むときに true を返す。null のときは false を返す。
+    // sanitizeForLog は該当する文字を "_"（該当しない文字）に置き換えるので、
+    // 置き換えた結果が元の値と違えば、該当する文字を含んでいる。
+    private static boolean hasLogUnsafeChars(String value)
+    {
+        return value != null && !value.equals(sanitizeForLog(value));
+    }
+}
+```
+
+---
