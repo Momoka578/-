@@ -1,0 +1,134 @@
+## No.79 CVE-2019-1010266 lodash/lodash lodash.js 4.17.10（prePatch 90e6199）
+
+- 修正した脆弱性: 正規表現による DoS／ReDoS（CWE-400・CWE-1333）
+- 修正対象ファイル: lodash.js（パッチ形式）
+- 形式: lodash.js は約 17,000 行・約 540KB あるので、元のファイルに対する unified diff 形式のパッチ（7 ハンク）を載せる。`patch -F0`（fuzz なし）で、prePatch の lodash.js にずれなく当たることを親が確認した。
+- 修正の内容（行番号は元のファイル）:
+  - 279 行目 reHasUnicodeWord: `[A-Z]{2,}[a-z]` を `[A-Z]{2}[a-z]` にした。「大文字 2 文字以上の直後に小文字」があることと「大文字 2 文字の直後に小文字」があることは同じ意味なので、test の結果は変わらない。各開始位置で調べるのが固定長 3 文字になり、線形時間になる。
+  - 156〜158 行目: `reTrim = /^\s+|\s+$/g` と `reTrimEnd = /\s+$/` を削除し、1 文字ずつ空白かを調べる `reWhitespace = /\s/` を加えた。先頭に固定されて線形時間の `reTrimStart = /^\s+/` は残した。
+  - ヘルパー関数を 2 つ加えた: `trimmedEndIndex(string)`（末尾から 1 文字ずつ空白を数え、最後の非空白文字の位置を返す。O(n)）と、`baseTrim(string)`（`string.slice(0, trimmedEndIndex(string) + 1).replace(reTrimStart, '')`）。
+  - 呼び出し箇所: 12479 行目 toNumber と 14961 行目 trim の `replace(reTrim, '')` を `baseTrim(...)` に、14996 行目 trimEnd の `replace(reTrimEnd, '')` を `string.slice(0, trimmedEndIndex(string) + 1)` にした。
+- この修正で防げること: 大文字を長く並べた入力による _.words・camelCase・kebabCase・snakeCase・startCase・lowerCase・upperCase などの停止と、「非空白 + 長い空白列 + 非空白」の入力による _.trim・_.trimEnd・_.toNumber（toFinite・toInteger など）の二乗時間の処理。
+- 副作用・直さなかった点（エージェントの最終報告による）: reTrim・reTrimEnd の変数はなくなった（外に公開されていない内部変数で、ファイル内の使用箇所 3 つはすべて置き換えた）。trimStart と parseInt が使う reTrimStart は先頭固定で線形時間なので変えていない。入力長の上限は、API の仕様が変わるので設けていない。
+- MARK END の後の手直し（エージェントが行った。トークン量の区間には含めていない）: パッチを当てたところ、ハンク 1 だけが fuzz 1 でしか当たらなかった（前側の文脈が 4 行で、後ろ側の 3 行とそろっていなかった）。エージェントが Edit で、ハンク 1 のヘッダを `@@ -152,10 +152,15 @@` から `@@ -153,9 +153,14 @@` に変え、先頭の文脈行（152 行目）を 1 行削った。親が、Write の内容との差がこの 2 行だけで、追加・削除の行は変わっていないことを確認した。
+- 確認（MARK END の後）:
+  - 親とエージェント: パッチを当てたファイルで node --check に問題なし。
+  - エージェント: 修正前と修正後の出力を、固定の入力と乱数で作った 20,000 個の文字列（\t \n \r・NBSP・U+2028・BOM・全角空白・絵文字・0x/0b/0o の数値表記などを含む）で比べた。trim・trimEnd・trimStart・toNumber・words・camelCase など 14 通りの呼び出しで、280,238 件の不一致は 0 件。reHasUnicodeWord の新旧の正規表現だけでも、50,000 件で不一致は 0 件。
+  - エージェント: 計算時間（修正前 → 修正後）は、n=40,000 で camelCase('A'×n) 1,594ms → 0ms、trim('a'+空白×n+'a') 1,703ms → 0ms、trimEnd 1,456ms → 0ms、toNumber 1,656ms → 0ms。修正後は n=1,000,000 でも camelCase 12ms・trim 1ms で、線形時間になった。
+- 使用トークン量（修正）: 新規 26,099（入力 16 ／ キャッシュ作成 15,287 ／ 出力〔推定〕 10,796）、キャッシュ読込 161,491、総処理 187,590、リクエスト 8 回
+
+```diff
+--- lodash.js
++++ lodash.js
+@@ -153,9 +153,14 @@
+       reHasRegExpChar = RegExp(reRegExpChar.source);
+
+   /** Used to match leading and trailing whitespace. */
+-  var reTrim = /^\s+|\s+$/g,
+-      reTrimStart = /^\s+/,
+-      reTrimEnd = /\s+$/;
++  // 【修正】reTrim（/^\s+|\s+$/g）と reTrimEnd（/\s+$/）を削除した。アンカーなしの
++  // \s+$ は「非空白 + 長い空白列 + 非空白」の入力で各開始位置からバックトラックし、
++  // O(n^2) 時間になる（ReDoS）。末尾の空白は trimmedEndIndex のループで数える。
++  var reTrimStart = /^\s+/;
++
++  /** Used to match a single whitespace character. */
++  // 【修正】1 文字ずつ空白かどうかを判定するための正規表現を追加（\s と同じ文字集合）。
++  var reWhitespace = /\s/;
+
+   /** Used to match wrap detail comments. */
+   var reWrapComment = /\{(?:\n\/\* \[wrapped with .+\] \*\/)?\n?/,
+@@ -276,7 +281,11 @@
+   var reHasUnicode = RegExp('[' + rsZWJ + rsAstralRange  + rsComboRange + rsVarRange + ']');
+
+   /** Used to detect strings that need a more robust regexp to match words. */
+-  var reHasUnicodeWord = /[a-z][A-Z]|[A-Z]{2,}[a-z]|[0-9][a-zA-Z]|[a-zA-Z][0-9]|[^a-zA-Z0-9 ]/;
++  // 【修正】[A-Z]{2,}[a-z] を [A-Z]{2}[a-z] にした。アンカーなしの test では、大文字が
++  // 長く続く入力に対して各開始位置で {2,} が残りの大文字を貪欲に食べてからバックトラック
++  // するため O(n^2) になっていた（ReDoS）。「大文字 2 文字以上の直後に小文字」があることと
++  // 「大文字 2 文字の直後に小文字」があることは同値なので、判定結果は変わらない。
++  var reHasUnicodeWord = /[a-z][A-Z]|[A-Z]{2}[a-z]|[0-9][a-zA-Z]|[a-zA-Z][0-9]|[^a-zA-Z0-9 ]/;
+
+   /** Used to assign default `context` object properties. */
+   var contextProps = [
+@@ -993,6 +1002,22 @@
+     });
+   }
+
++  /**
++   * The base implementation of `_.trim`.
++   *
++   * @private
++   * @param {string} string The string to trim.
++   * @returns {string} Returns the trimmed string.
++   */
++  // 【修正】reTrim（/^\s+|\s+$/g）の代わりに使う。末尾の空白は trimmedEndIndex の
++  // ループ（O(n)）で取り除き、先頭の空白は先頭に固定された reTrimStart（O(n)）で
++  // 取り除くので、どんな入力でも線形時間で終わる。
++  function baseTrim(string) {
++    return string
++      ? string.slice(0, trimmedEndIndex(string) + 1).replace(reTrimStart, '')
++      : string;
++  }
++
+   /**
+    * The base implementation of `_.unary` without support for storing metadata.
+    *
+@@ -1326,6 +1351,23 @@
+       : asciiToArray(string);
+   }
+
++  /**
++   * Used by `_.trim` and `_.trimEnd` to get the index of the last non-whitespace
++   * character of `string`.
++   *
++   * @private
++   * @param {string} string The string to inspect.
++   * @returns {number} Returns the index of the last non-whitespace character.
++   */
++  // 【修正】reTrimEnd（/\s+$/）の代わりに使う。末尾から 1 文字ずつ空白かどうかを
++  // 調べるだけなので、O(n) 時間で終わる（バックトラックが起きない）。
++  function trimmedEndIndex(string) {
++    var index = string.length;
++
++    while (index-- && reWhitespace.test(string.charAt(index))) {}
++    return index;
++  }
++
+   /**
+    * Used by `_.unescape` to convert HTML entities to characters.
+    *
+@@ -12476,7 +12518,8 @@
+       if (typeof value != 'string') {
+         return value === 0 ? value : +value;
+       }
+-      value = value.replace(reTrim, '');
++      // 【修正】reTrim による置換（O(n^2) になりうる）をやめ、線形時間の baseTrim を使う。
++      value = baseTrim(value);
+       var isBinary = reIsBinary.test(value);
+       return (isBinary || reIsOctal.test(value))
+         ? freeParseInt(value.slice(2), isBinary ? 2 : 8)
+@@ -14958,7 +15001,8 @@
+     function trim(string, chars, guard) {
+       string = toString(string);
+       if (string && (guard || chars === undefined)) {
+-        return string.replace(reTrim, '');
++        // 【修正】reTrim による置換（O(n^2) になりうる）をやめ、線形時間の baseTrim を使う。
++        return baseTrim(string);
+       }
+       if (!string || !(chars = baseToString(chars))) {
+         return string;
+@@ -14993,7 +15037,9 @@
+     function trimEnd(string, chars, guard) {
+       string = toString(string);
+       if (string && (guard || chars === undefined)) {
+-        return string.replace(reTrimEnd, '');
++        // 【修正】reTrimEnd（/\s+$/）による置換（O(n^2) になりうる）をやめ、
++        // 末尾から空白を数える trimmedEndIndex（O(n)）で切り出す。
++        return string.slice(0, trimmedEndIndex(string) + 1);
+       }
+       if (!string || !(chars = baseToString(chars))) {
+         return string;
+```
+
+---
