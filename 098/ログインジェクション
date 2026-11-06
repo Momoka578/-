@@ -1,0 +1,77 @@
+## No.98 SARD 1580 Target98.java（v1.0.0。手がかりを消したコピー）
+
+- 修正した脆弱性: ログインジェクション／ログ偽造（CWE-117）と、文字列の == 比較（CWE-597）
+- 修正対象ファイル: Target98.java
+- 修正の内容（行番号は渡したコピー。変えたのは 2 か所だけ）:
+  - 42 行目（CWE-117）: `cmd.replaceAll("\n", "_")` を `cmd.replaceAll("[\\p{Cc}\\p{Zl}\\p{Zp}]", "_")` にした。`\p{Cc}`（U+0000〜001F・U+007F〜009F。CR・LF・VT・FF・U+001C〜001E・NEL（U+0085）を含む）、`\p{Zl}`（U+2028）、`\p{Zp}`（U+2029）をすべて "_" に置き換える。
+  - 39 行目（CWE-597）: `cmd == "valid"` を `"valid".equals(cmd)` にした。
+- この修正で防げること: CR を行の終わりとみなす読み手（BufferedReader.readLine、Python の splitlines、ログ解析ツールなど）での偽のログ行の作成と、端末で CR によって行頭に戻して既存の表示を上書きする見せかけ。NEL・U+2028・U+2029 を使った同じ手口。
+- 副作用・直さなかった点（エージェントの最終報告による）:
+  - "valid" は、これまではログに出ていたが、修正後は「good」を返してログには出ない（本来の意図どおりの動作）。
+  - 制御文字は "_" に置き換えるので、元の文字はログから分からない（元の方針の "_" への置換を広げた）。
+  - U+202E などの書式文字（`\p{Cf}`）は、表示の並び順を変えるだけで行を分けないので、最小限の修正にするため対象から外した。
+  - 元のファイルの末尾にあった余分な空行がなくなっている（処理への影響はない）。
+- 確認（MARK END の後。修正ファイルは直していない）:
+  - java・javac がないため未コンパイル。
+  - エージェント: 元のファイルとの diff で、変わったのが 39・42 行目とそのコメントだけであることを確認した。Java はコメントの中でも `\u` の並びを文字に変換するので、修正ファイルに `\u` が含まれていないことを grep で確認した（親も確認した）。
+  - エージェント: Python で、splitlines が行区切りとみなす 10 文字（0x0A・0x0B・0x0C・0x0D・0x1C・0x1D・0x1E・0x85・0x2028・0x2029）がすべて Cc・Zl・Zp に入ることを確かめた。CR・U+2028・NEL を含む文字列では、元の置換だと 4 行に分かれて偽の「INFO: admin logged in」行ができ、修正後の置換だと 1 行のままだった。
+  - 親: エージェントが外部からの取得をしていないこと（curl も SARD のサイトへのアクセスもない）と、渡したコピーが変更されていないことを確認した。
+- 使用トークン量（修正）: 新規 5,456（入力 4 ／ キャッシュ作成 2,702 ／ 出力〔推定〕 2,750）、キャッシュ読込 31,484、総処理 36,940、リクエスト 2 回
+
+```java
+/*
+Copyright 2005 Fortify Software.
+
+Permission is hereby granted, without written agreement or royalty fee, to
+use, copy, modify, and distribute this software and its documentation for
+any purpose, provided that the above copyright notice and the following
+three paragraphs appear in all copies of this software.
+
+IN NO EVENT SHALL FORTIFY SOFTWARE BE LIABLE TO ANY PARTY FOR DIRECT,
+INDIRECT, SPECIAL, INCIDENTAL, OR CONSEQUENTIAL DAMAGES ARISING OUT OF THE
+USE OF THIS SOFTWARE AND ITS DOCUMENTATION, EVEN IF FORTIFY SOFTWARE HAS
+BEEN ADVISED OF THE POSSIBILITY OF SUCH DAMANGE.
+
+FORTIFY SOFTWARE SPECIFICALLY DISCLAIMS ANY WARRANTIES INCLUDING, BUT NOT
+LIMITED TO THE IMPLIED WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE, AND NON-INFRINGEMENT.
+
+THE SOFTWARE IS PROVIDED ON AN "AS-IS" BASIS AND FORTIFY SOFTWARE HAS NO
+OBLIGATION TO PROVIDE MAINTENANCE, SUPPORT, UPDATES, ENHANCEMENTS, OR
+MODIFICATIONS.
+*/
+import java.io.*;
+import java.util.logging.Logger;
+import javax.servlet.*;
+import javax.servlet.http.*;
+
+public class Target98 extends HttpServlet
+{
+    public void doGet(HttpServletRequest req, HttpServletResponse res)
+    	throws ServletException, IOException
+    {
+        res.setContentType("text/html");
+        ServletOutputStream out = res.getOutputStream();
+		Logger log = Logger.getLogger("Logforge");
+        out.println("<HTML><HEAD><TITLE>Test</TITLE></HEAD><BODY><blockquote><pre>");
+
+		String cmd = req.getParameter("cmd");
+		if(cmd != null) {
+			// 【修正】文字列を == で参照比較していたのを equals による内容比較に変更（CWE-597）
+			if("valid".equals(cmd))
+				out.println("good");
+			else
+				// 【修正】LF だけでなく、CR を含むすべての制御文字（\p{Cc}: U+0000-001F, U+007F-009F。U+0085 NEL を含む）と
+				// 行区切り文字 U+2028（\p{Zl}）・段落区切り文字 U+2029（\p{Zp}）を "_" に置換し、偽のログ行を作れないようにする（CWE-117）
+				log.info("invalid command: " + cmd.replaceAll("[\\p{Cc}\\p{Zl}\\p{Zp}]", "_"));
+		} else {
+			out.println("specify a command");
+		}
+
+        out.println("</pre></blockquote></BODY></HTML>");
+        out.close();
+    }
+}
+```
+
+---
