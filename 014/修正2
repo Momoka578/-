@@ -1,0 +1,332 @@
+## No.14 ossf-cve-benchmark CVE-2016-1000229.json → swagger-ui（prePatch commit 14fad2b4, src/main/javascript/helpers/handlebars.js）
+
+- 検証した修正コード: "修正版コード"
+- 検証結果: **不備あり** — renderTextParam の 3 か所は直っていたが、判定の根拠の弱いブラックリスト _sanitize と sanitize ヘルパーが元のままで、default 値（textarea）・description・enum 値の経路で XSS が残る（jsdom で 7 経路を確認）。修正コード2: _sanitize をホワイトリスト型（a・img の限られた属性、http/https/mailto/相対 URL、引用符なしで符号化）に置き換え、オブジェクトは文字列化してからサニタイズ。handlebars.js の外のテンプレートの生出力などは対象外として残る
+- 修正コード2 のファイル: src/main/javascript/helpers/handlebars.js
+- 親の確認: src/main/javascript/helpers/handlebars.js: node --check で構文エラーなし。エージェントが読み取り専用の材料（orig・given）を変えていないこと、読まない範囲のファイルを読んでいないことを、記録で確認した。
+- 使用トークン量（検証）: 新規 137,858（入力 42 ／ キャッシュ作成 85,396 ／ 出力〔推定〕 52,420）、キャッシュ読込 1,248,875、総処理 1,386,733、リクエスト 21 回
+- 使用トークン量（再修正）: 新規 98,760（入力 36 ／ キャッシュ作成 55,418 ／ 出力〔推定〕 43,306）、キャッシュ読込 2,411,612、総処理 2,510,372、リクエスト 18 回
+
+### 元の修正コードの不備
+
+対象: No.14 swagger-ui（prePatch 14fad2b4）`src/main/javascript/helpers/handlebars.js`
+元の修正コード: `given/fix_xss/src/main/javascript/helpers/handlebars.js`
+
+元の修正コードは `renderTextParam` ヘルパーの 3 か所（x-data-* のプロパティ名の制限、x-data-* の値の `escapeExpression`、default 値を `sanitize()` から `escapeExpression` に変更）だけを直していた。この部分は正しく直っている（元のコードで XSS になる入力が、修正後はすべて無害になることを確認した）。
+
+#### 不備1: sanitize ヘルパー（弱い正規表現ブラックリスト）がそのまま残り、同じ default 値・description から XSS が起きる
+
+- 場所: 元の修正コード L7-13 の `_sanitize` と L15-29 の `sanitize` ヘルパー（元のコードと同じ）
+  ```js
+  var _sanitize = function(html) {
+      // Strip the script tags from the html and inline evenhandlers
+      html = html.replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, '');
+      html = html.replace(/(on\w+="[^"]*")*(on\w+='[^']*')*(on\w+=\w*\(\w*\))*/gi, '');
+      return html;
+  };
+  ...
+  return new Handlebars.SafeString(_sanitize(html));
+  ```
+  L4-6 に「この正規表現ブラックリストは不十分」「本来 DOMPurify などに置き換えるべき」とコメントを付けただけで、コードは直していない。修正の説明にも、対象外とする理由は書かれていない。
+- 判定の記録では、この `_sanitize`（元のコード L4-10）が不十分であることを根拠の 1 つ目にあげ、`{{{sanitize description}}}` も根拠の 3 つ目・XSS の詳細の sink（「param.handlebars L32 の description も同様」）にあげている。
+- 問題: `_sanitize` は `<script>…</script>` と、`on属性="…"`・`on属性='…'`・`on属性=単語(単語)` の形しか消さない。次のようなものはすべて残る。
+  - 引用符なしで記号を含むイベント属性（`onerror=alert(document.domain)`）、`=` の前後の空白（`onerror = "…"`）、`` ` `` で囲んだ値、`alert&#40;1&#41;` のような文字参照
+  - script 以外の危険なタグ（`<svg/onload=…>`、`<iframe srcdoc=…>`、`<math>…<style>`、`<form><button formaction=javascript:…>`）
+  - `javascript:`・`data:` の URL（`<a href="javascript:alert(1)">`、`&#106;avascript:` など）
+  - 引用符（`'` `"`）や `</textarea>`・`</select>` による、属性値・textarea・select からの脱出（そもそも `<` `'` `"` をエスケープしない）
+- この `sanitize` は同じコミットのテンプレートで、判定の根拠と同じ source（API 仕様の parameters[].default、description）や enum 値の出力に使われている。`renderTextParam` を直しても、次の経路で XSS が残る（修正コードで実際に描画して jsdom で確認した）。
+  | 経路 | 入力 | 修正コードでの結果 |
+  |---|---|---|
+  | required の body param の default（param_required.handlebars L9 `<textarea>{{{sanitize default}}}</textarea>`） | `</textarea><img src=x onerror=alert(document.domain)>` | img に onerror ができる |
+  | 同上で default が配列（sanitize のオブジェクト経路 L21-24） | `["</textarea><img src=x onerror=alert(document.domain)>","b"]` | img に onerror ができる |
+  | readOnly の param の default（param_readonly.handlebars L4 textarea・L8 本文、param_readonly_required も同じ） | `<img src=x onerror=alert(document.domain)>` など | img に onerror ができる |
+  | param の description（param.handlebars L32、param_required.handlebars L29） | `<img src=x onerror=alert(document.domain)>`、`<svg/onload=alert(document.domain)>` | onerror / onload ができる |
+  | enum 値（param_list.handlebars L11 `value='{{{sanitize value}}}'`） | `x' autofocus onfocus=alert(document.domain) y='` | option に onfocus ができる |
+- `sanitize` を、テンプレートで使われている文脈（本文、textarea、`value='…'`、`value="…"`、`href='#!/…'`、`name='…'`）で直接呼んだテスト（36 入力 × 7 文脈）でも、修正コードは元のコードと同じ 46 件で危険な要素・属性・URL ができた。
+- 根拠の脆弱性（API 仕様の default 値・description が、文脈に合ったエスケープなしで HTML に入る）と同じ source・同じ原因（同じファイルの弱い `_sanitize`）が、`renderTextParam` 以外の経路で残っているので、「一部の経路で残る」不備とした。修正の説明で「XSS の修正で直っている」とした CWE-116（不適切なエンコード）も、この部分は直っていない。
+
+### 再修正の内容
+
+修正コード2: `fix2/src/main/javascript/helpers/handlebars.js`（元の修正コードをコピーして、`_sanitize` と `sanitize` の部分だけを変更。`renderTextParam` の元の【修正】はそのまま。直した箇所には `【修正2】` のコメントを付けた）
+
+#### 1. `_sanitize` をホワイトリスト型のサニタイザに置き換えた（L4-123）
+
+元の修正コードの L4-13（注意コメントと正規表現ブラックリスト）を、次の小さな関数の組み合わせに置き換えた。外部ライブラリ（DOMPurify など）は、このコミットの lib/ にもテンプレートの読み込み順（index.html）にも無く、追加すると他のファイルの変更が必要になるため使わず、このファイルの中だけで完結させた。ES5 の書き方で、プロジェクトの .jshintrc（bitwise 禁止、シングルクォートなど）にも合わせた。
+
+- `_sanitize`（L112-123）: 入力をまず `String()` で文字列にする（元のコードでは真偽値で `html.replace is not a function` の TypeError になっていた）。HTML コメント `<!--…-->` を取り除いた後、正規表現 `/<(\/?)([a-zA-Z][a-zA-Z0-9]*)((?:[\s\/][^<>]*)?)>|[^<]+|</g` で、先頭から「タグ」「`<` を含まない文字列」「単独の `<`」のどれかとして読み進める。3 つの選択肢で全部の文字が必ずどれかに当たるので、処理されずに素通りする部分はない。タグは `_sanitizeTag` に、それ以外は `_escapeText` に渡す。コメントを先に消しても、消した後の文字列は必ずこの読み取りとホワイトリストを通るので、`<im<!-- -->g …>` のように消した結果できたタグも検査される。
+- `_escapeText`（L41-47）: タグ以外の文字列の `<` `>` `"` `'` `` ` `` `=` を実体参照にし、`&` は「正しい形の文字参照（`&amp;` `&lt;` `&#60;` `&#x3C;` など）の先頭」以外を `&amp;` にする。正しい形の文字参照を残すのは、元のコードで description に `&amp;` などを書いたときの表示を変えないため。文字参照はブラウザの解析で「文字」に戻るだけで、タグや属性の区切りにはならないので、本文・textarea・属性値のどこに入っても安全。
+- `_sanitizeTag`（L89-110）: タグ名を小文字にして、`_allowedTags`（L25-31。a, b, blockquote, br, code, dd, del, div, dl, dt, em, h1〜h6, hr, i, img, kbd, li, ol, p, pre, s, small, span, strike, strong, sub, sup, table, tbody, td, tfoot, th, thead, tr, u, ul）にあるときだけタグとして組み立て直す。無いタグ（script, svg, math, iframe, style, textarea, select, option, form, button, noscript など）は、タグ全体を `_escapeText` で文字列として表示する（消すのではなく表示するので、説明文中の `<pet>` のような XML の例もそのまま見える）。終了タグは `</タグ名>` だけを出す（属性は付けない。br/hr/img の終了タグは捨てる）。開始タグの属性は、属性ごとに読み取り、`_allowedAttrs`（L33-36。a の href/title、img の src/alt/title だけ）にあるものだけを残す。on* や style、class、id などは捨てる。タグ名・属性名の照合は `Object.prototype.hasOwnProperty`（`_has`、L21-23）で行い、`<constructor>` や `__proto__=` のようなプロトタイプのプロパティ名が「許可」と誤判定されないようにした。
+- `_decodeEntities`（L51-67）: 属性値の文字参照（数値参照と amp/lt/gt/quot/apos）を戻してから検査する。戻した値は、出力するときに `&` も含めて符号化し直すので、ブラウザが受け取る属性値は「ここで検査した値」と必ず同じになる（戻さなかった参照、例えば `&colon;` は、出力では `&#x26;colon;` になり、ブラウザでも文字どおり `&colon;` のまま。検査とブラウザの解釈がずれない）。
+- `_isSafeUrl`（L79-86）: href/src の値から制御文字と空白（U+0000〜U+0020）をすべて除いてから scheme を調べ、http・https・（a だけ）mailto・scheme のない相対 URL（`#…`、`/…`、`//host/…`）だけを許可する。ブラウザの URL 解析は先頭・末尾の制御文字と空白、途中のタブ・改行を無視するので、`java\tscript:`、` javascript:`、`&#x6A;avascript:` も javascript: として拒否される。許可しない URL の属性は捨てる（タグは残る）。
+- `_encodeAttr`（L71-75）: 残す属性値は引用符を使わずに出力し、英数字・URL で使う記号（`_ . - : / ? # % ~ + , ; @ ! $ ( ) * [ ]`）・非 ASCII 文字以外はすべて `&#x..;` にする。空白・`'` `"` `` ` `` `=` `<` `>` `&` はすべて符号化されるので、属性値の外に出られない。
+
+この結果、`sanitize` の出力には `'` `"` `` ` `` が一切含まれず（文字列中のものは実体参照、属性値は引用符なし）、タグは許可したタグ名と許可した属性だけになる。テンプレートが `value='{{{sanitize value}}}'`・`value="{{{sanitize this}}}"`・`name='{{{sanitize name}}}'`・`href='#!/{{sanitize id}}'` のように引用符付きの属性の中でこのヘルパーを使っていても属性から抜け出せず、textarea の中で使っていても `</textarea>` は作れない（textarea は許可していないので `&lt;/textarea&gt;` になる）。本文（description）では、許可したタグ（太字・リンク・リスト・表など）はこれまでどおり HTML として表示される。
+
+#### 2. `sanitize` のオブジェクト経路を直した（L131-138）
+
+元は `JSON.parse(_sanitize(JSON.stringify(html)))` で、JSON の文字列に正規表現をかけてから戻していた。新しい `_sanitize` は `"` をエスケープするので、この形のままだと JSON.parse できなくなる。元のコードは戻したオブジェクトを SafeString に入れて、文字列連結（`'' + オブジェクト`）で出力していた（配列なら要素をカンマでつないだ文字列、オブジェクトなら `[object Object]`）。そこで、先に同じ文字列 `'' + JSON.parse(JSON.stringify(html))` にしてから `_sanitize` に通すようにした。表示される文字列の形は元と同じで、配列の要素に入れた攻撃の文字列も無害になる。undefined・null・数値の扱い（L127-129）は変えていない。
+
+#### 3. renderTextParam のコメントを補足した（L174-175）
+
+`renderTextParam` の default 値は、元の修正コードのとおり `escapeExpression` のままにした（コードは変更なし）。`sanitize` は HTML として表示するためのもので、許可したタグや文字参照を残すため、値を入力どおりに表示すべき input の value や textarea の default 値には `escapeExpression` が正しい。その理由を `【修正2】` のコメントで補足した。
+
+### 確認した内容と結果
+
+使ったもの: 同じコミット 14fad2b4 の `lib/handlebars-4.0.5.js`・`lib/lodash.min.js`・`lib/marked.js`、`src/main/template/*.handlebars`、`.jshintrc`（$R/dl/ に取得）。jsdom・jshint・acorn を $R/bench/ に `npm install --ignore-scripts` で入れた。テストスクリプトは `$R/bench/harness.js`・`compare.js`・`extra.js`（対象のファイルのパスは引数で渡す）。
+
+1. 構文・静的検査
+   - `node --check`: 構文エラーなし。
+   - acorn で ecmaVersion 5 として解析: OK（ES5 の範囲で書けている）。
+   - jshint（このコミットの .jshintrc。bitwise・quotmark single・undef・unused・strict など）: 警告なし（元のコード・元の修正コードも警告なし）。
+2. 読み込み・描画（harness.js）: Node の vm に Handlebars 4.0.5・lodash・marked と修正コード2を読み込み、同じコミットの全テンプレートを `Handlebars.compile` して描画できた。描画結果を jsdom で innerHTML として解析し、on* 属性、script/svg/iframe/style などの要素、javascript:/data: の URL を調べた（description は SwaggerUi.renderGFM と同じく marked を通した後も調べた）。
+   - renderTextParam の攻撃 7 件（default の `'` による脱出、`</textarea>`・`</TEXTAREA >` による脱出、x-data-* の値・プロパティ名による注入、required の text param）: 元の修正コードと同じく危険なし。値は入力どおり。
+   - 不備1 の経路（required body param の default、配列の default、readOnly の default 2 件、description 2 件、enum 値）: 元の修正コードではすべて危険あり → 修正コード2 ではすべて危険なし。例: required body param の default `</textarea><img src=x onerror=alert(document.domain)>` は textarea の中の文字列 `</textarea><img src=x>` になり、タグはできない。enum 値 `x' autofocus onfocus=… y='` は option の value に入力どおり入る。
+   - sanitize × 文脈（36 入力 × 7 文脈 = 252 件）: 元のコード・元の修正コードは 46 件で危険あり → 修正コード2 は 0 件。
+3. 境界値・特殊な値（extra.js、43 件すべて OK）: undefined→"undefined"、null→"null"、数値、true/false→"true"/"false"（元は TypeError）、オブジェクト→"[object Object]"、配列→要素をカンマでつないだ文字列（元と同じ形）。`<constructor>`・`<__proto__>`・`constructor=`・`__proto__=` は許可されない。`HTTP://`・mailto:・`//host`・`#frag`・`/path` は許可、vbscript:・`&#x6A;avascript:`・`\u0001javascript:`・` javascript:`・`jav&#x0A;ascript:` は拒否、img の mailto: は拒否。`javascript&colon;…`・`&#0000106avascript:…`（セミコロンなし）は、ブラウザでも文字どおりの相対 URL になることを jsdom で確認。`<!--><img …>-->`・`<im<!-- -->g …>`・`<a onclick=…>`・`\f` 区切りの属性なども危険なし。
+4. ランダム入力（ファズ）: HTML の区切り文字・タグ名・属性名・文字参照・制御文字などの断片をランダムに 1〜25 個つないだ入力 20,000 件 × 5 文脈（本文＋renderGFM、`value='…'`、`value="…"`、textarea、`href='#!/…'`）で、危険な要素・属性・URL ができないこと、属性や textarea から抜け出さないこと、出力に引用符や許可外のタグ・属性が含まれないことを確認した: 0 件。
+5. 処理時間: 20 万文字前後の悪意のある入力（閉じない `<a ` に続く空白・引用符・属性の連続、`<` の連続、`&` の連続など 8 種）で、いずれも 230 ms 以内（入力の長さにほぼ比例。正規表現の極端なバックトラック（ReDoS）は起きない）。
+6. 正常な入力での表示（compare.js、元の修正コードと比較）: petstore の説明文・パラメータ名・content type・enum 値、markdown（太字・リスト・リンク・コード）、`<br>`・`<p>`・`<ul>`・`<a href>`・`<img>`・`<b>` などの HTML、文字参照（`&amp;` `&lt;` `&#169;` `&nbsp;`）、日本語、JSON の 31 件で比べ、本文（renderGFM 後）の HTML は 28 件で同じ。残り 3 件のうち HTML コメントの 1 件は見え方が同じ（コメントが無くなるだけ）で、見え方が変わるのは 2 件（XML の例、div の class/style/id）。textarea・属性値の文脈では、属性付きの許可タグ・`<br/>`・コメント・`'` を含む入力の 7 件で値が変わる（`'` を含む 1 件は、元は属性が `'` で切れていたのが入力どおりになったもの）。違いはいずれも下の「副作用」のとおり。renderTextParam の正常な入力（default の文字列・数値・配列、x-data-*、password）の結果は元の修正コードと同じ。
+
+### 副作用・残る点
+
+動作の変化:
+- 許可しないタグは、消すのではなく文字列として表示する。description に `XML: <pet><name>doggie</name></pet>` と書くと、元は `<pet>` などが見えない要素になっていたが、修正コード2 ではタグも文字として表示される（API の説明としてはむしろ正しい表示）。`<script>alert(1)</script>` も、元は消えていたが、文字列として表示される。
+- 許可したタグでも、許可しない属性（class・style・id・target など）は捨てる。description の `<div class="x" style="color:red">` は `<div>` になり、色などの装飾は無くなる。
+- HTML コメント `<!--…-->` は取り除く（本文での見え方は元と同じ）。ただし textarea の default 値（required/readOnly の body param）や属性値に入る場合も取り除くので、XML の default にコメントがあると、textarea からコメントが消える。
+- textarea の default 値に、許可したタグ名と同じ名前の要素（XML の `<a href="…">`、`<table name="…">` など）が属性付きで入っていると、属性が整形・削除される（例: `<a href="x" foo="y">` → `<a href=x>`、`<br/>` → `<br>`）。元のコードも on 属性や script を消してデータを変えていた。textarea の default は本来、エスケープだけで表示するのが正しい（param.handlebars L11 は `{{{escape default}}}`）が、テンプレートの変更になるので今回は行っていない。
+- enum 値や名前に `'` を含む場合、元は属性がそこで切れていたが、入力どおりの値になる。真偽値の default は、元は TypeError で描画が止まっていたが、"true"/"false" と表示される。
+
+直していない点（handlebars.js の外。判定の根拠ではないため、修正コード2の対象外とした）:
+- `param_list.handlebars` L17 の `{{{description}}}` は、ヘルパーを通さずに生の HTML を出力している（enum のある param の description）。テンプレート側の問題なので、このファイルの修正では直せない。`{{{sanitize description}}}` に変えれば、今回のサニタイザで守られる。
+- SwaggerUi の `renderGFM` は、`.markdown` 要素の HTML を marked（`sanitize: false`）に通して入れ直す。description に markdown のリンク `[x](javascript:alert(document.domain))` を書くと、marked が javascript: のリンクを作る（元のコード・元の修正コード・修正コード2 のどれでも同じ。クリックが必要）。marked の設定（SwaggerUi.js）側の問題。
+- `resource.handlebars` L21 の `href='{{{sanitize url}}}'` のように、ヘルパーの出力を URL 属性の値そのものとして使う箇所では、文字列 `javascript:…` 自体はタグではないので、サニタイザでは止まらない（属性から抜け出すことはできなくなった）。URL の scheme の検査はテンプレート側（URL 用のヘルパー）で行うべき。
+- renderTextParam の default 値や x-data-* の値が `{"toHTML": "x"}` のような JSON オブジェクトだと、Handlebars の escapeExpression が `toHTML()` を呼んで TypeError になり、その param の描画が失敗する（元の修正コードからの挙動。攻撃者は仕様全体を書けるので、実害は描画の失敗だけ。XSS ではない）。
+
+### 修正コード2 の全文: src/main/javascript/helpers/handlebars.js
+
+```javascript
+'use strict';
+/*jslint eqeq: true*/
+
+// 【修正2】元の _sanitize は「<script>…</script> と一部の on属性 を正規表現で消す」ブラックリストで、
+// 引用符なしのイベント属性（onerror=alert(document.domain)）、= の前後の空白、svg/iframe などのタグ、
+// javascript: の URL、引用符（' "）による属性からの脱出、</textarea> による脱出などがすべて残っていた。
+// sanitize ヘルパーはテンプレートで default 値・description・enum 値・名前などの出力に使われている
+// （param_required.handlebars L9 の textarea、param_readonly*.handlebars、param.handlebars L32、
+//   param_list.handlebars L11 の value='…'、resource.handlebars の href='…' など）ため、
+// renderTextParam だけを直しても、同じ default 値・description から XSS が起きたままだった。
+// そこで _sanitize をホワイトリスト型のサニタイザに置き換えた。
+//   - 入力を「タグ」と「それ以外の文字列」に分け、文字列は < > " ' ` = と、文字参照になっていない & を
+//     実体参照にする（正しい形の文字参照 &amp; &lt; &#60; などは表示が変わらないようにそのまま残す）。
+//   - タグは _allowedTags にあるものだけを、タグ名を小文字にして組み立て直す。それ以外のタグ
+//     （script, svg, math, iframe, style, textarea, select, form など）は、文字列としてエスケープして表示する。
+//   - 属性は _allowedAttrs にあるもの（a の href/title、img の src/alt/title）だけを残し、on* や style は捨てる。
+//     href/src は http・https・（a だけ）mailto・相対 URL だけを許可する。
+//   - 残す属性値は引用符を使わずに出力し、英数字と URL で使う記号以外はすべて &#x..; にする。
+//     出力に ' " が含まれないので、テンプレートが value='…' value="…" name='…' href='…' などの
+//     引用符付きの属性の中でこのヘルパーを使っていても、属性から抜け出せない。
+var _has = function(obj, key) {
+    return Object.prototype.hasOwnProperty.call(obj, key);
+};
+
+var _allowedTags = {
+    a: true, b: true, blockquote: true, br: true, code: true, dd: true, del: true, div: true,
+    dl: true, dt: true, em: true, h1: true, h2: true, h3: true, h4: true, h5: true, h6: true,
+    hr: true, i: true, img: true, kbd: true, li: true, ol: true, p: true, pre: true, s: true,
+    small: true, span: true, strike: true, strong: true, sub: true, sup: true, table: true,
+    tbody: true, td: true, tfoot: true, th: true, thead: true, tr: true, u: true, ul: true
+};
+var _voidTags = { br: true, hr: true, img: true };
+var _allowedAttrs = {
+    a: { href: 'url', title: 'text' },
+    img: { src: 'url', alt: 'text', title: 'text' }
+};
+var _textEscapes = { '<': '&lt;', '>': '&gt;', '"': '&quot;', '\'': '&#x27;', '`': '&#x60;', '=': '&#x3D;' };
+var _namedEntities = { amp: '&', lt: '<', gt: '>', quot: '"', apos: '\'' };
+
+// 【修正2】タグ以外の文字列のエスケープ
+var _escapeText = function(text) {
+    return text
+        .replace(/&(?!(?:[a-zA-Z][a-zA-Z0-9]{0,31}|#[0-9]{1,7}|#[xX][0-9a-fA-F]{1,6});)/g, '&amp;')
+        .replace(/[<>"'`=]/g, function(c) {
+            return _textEscapes[c];
+        });
+};
+
+// 【修正2】属性値の文字参照を戻す（数値参照と amp/lt/gt/quot/apos）。戻した値を検査し、出力するときは
+// & も含めて符号化し直すので、ブラウザが受け取る属性値は、ここで検査した値と必ず同じになる。
+var _decodeEntities = function(value) {
+    return value.replace(/&(?:#([0-9]{1,7})|#[xX]([0-9a-fA-F]{1,6})|(amp|lt|gt|quot|apos));/g, function(m, dec, hex, named) {
+        var code;
+        if (named) {
+            return _namedEntities[named];
+        }
+        code = dec ? parseInt(dec, 10) : parseInt(hex, 16);
+        if (code === 0 || code > 0x10FFFF || (code >= 0xD800 && code <= 0xDFFF)) {
+            return '�';
+        }
+        if (code > 0xFFFF) {
+            code -= 0x10000;
+            return String.fromCharCode(0xD800 + Math.floor(code / 0x400), 0xDC00 + code % 0x400);
+        }
+        return String.fromCharCode(code);
+    });
+};
+
+// 【修正2】属性値を引用符なしで出力するための符号化（英数字・URL で使う記号・非 ASCII 文字以外は &#x..; にする。
+// 空白・' " ` = < > & はすべて符号化されるので、属性値の外に出られない）
+var _encodeAttr = function(value) {
+    return value.replace(/[^A-Za-z0-9_.\-:\/?#%~+,;@!$()*\[\]\u0080-￿]/g, function(c) {
+        return '&#x' + c.charCodeAt(0).toString(16) + ';';
+    });
+};
+
+// 【修正2】URL の検査。ブラウザの URL 解析は先頭・末尾の制御文字と空白、途中のタブ・改行を無視するので、
+// 制御文字と空白をすべて除いてから scheme を調べる（java\tscript: なども javascript: として扱う）。
+var _isSafeUrl = function(url, tag) {
+    var scheme = url.replace(/[\u0000- ]/g, '').match(/^([a-zA-Z][a-zA-Z0-9+.\-]*):/);
+    if (!scheme) {
+        return true; // scheme のない相対 URL（#…、/…、//host/… など）
+    }
+    scheme = scheme[1].toLowerCase();
+    return scheme === 'http' || scheme === 'https' || (tag === 'a' && scheme === 'mailto');
+};
+
+// 【修正2】許可したタグだけを組み立て直す。許可しないタグは、文字列としてエスケープする。
+var _sanitizeTag = function(source, slash, name, attrs) {
+    var tag = name.toLowerCase();
+    var allowedAttrs, out;
+    if (!_has(_allowedTags, tag)) {
+        return _escapeText(source);
+    }
+    if (slash) {
+        return _has(_voidTags, tag) ? '' : '</' + tag + '>';
+    }
+    allowedAttrs = _has(_allowedAttrs, tag) ? _allowedAttrs[tag] : {};
+    out = '<' + tag;
+    attrs.replace(/([^\s"'<>\/=]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'<>`=]+)))?/g, function(m, attrName, v1, v2, v3) {
+        var key = attrName.toLowerCase();
+        var value = _decodeEntities(v1 || v2 || v3 || '');
+        if (_has(allowedAttrs, key) && value !== '' &&
+            (allowedAttrs[key] !== 'url' || _isSafeUrl(value, tag))) {
+            out += ' ' + key + '=' + _encodeAttr(value);
+        }
+        return m;
+    });
+    return out + '>';
+};
+
+var _sanitize = function(html) {
+    // 【修正2】文字列以外（真偽値など）も文字列にしてから処理する（元は真偽値で「html.replace is not a function」の TypeError になっていた）。
+    // コメントは先に取り除く（取り除いた後の文字列も、下のホワイトリストを必ず通る）。
+    html = String(html).replace(/<!--[\s\S]*?-->/g, '');
+    // 【修正2】先頭から「タグ」「< を含まない文字列」「単独の <」のどれかとして読み、全部の文字を必ずどれかで処理する。
+    return html.replace(/<(\/?)([a-zA-Z][a-zA-Z0-9]*)((?:[\s\/][^<>]*)?)>|[^<]+|</g, function(m, slash, name, attrs) {
+        if (name) {
+            return _sanitizeTag(m, slash, name, attrs);
+        }
+        return _escapeText(m);
+    });
+};
+
+var sanitize =function (html) {
+    var _html;
+    if( _.isUndefined(html) || _.isNull(html) || _.isNumber(html))  {
+        return new Handlebars.SafeString(html);
+    }
+
+    if (_.isObject(html)){
+        _html = JSON.stringify(html);
+        // 【修正2】JSON の文字列のまま _sanitize に通すと、" のエスケープで JSON が壊れて JSON.parse できず、
+        // また元のように JSON の文字列を消すだけの処理では、配列の要素などに入れた攻撃の文字列が残る。
+        // 元のコードは JSON.parse で戻したオブジェクトを SafeString にして、文字列連結（'' + オブジェクト）で
+        // 出力していたので、先に同じ文字列にしてから _sanitize に通す（表示される文字列は元と同じ形になる）。
+        return new Handlebars.SafeString(_sanitize('' + JSON.parse(_html)));
+    }
+
+    return new Handlebars.SafeString(_sanitize(html));
+};
+
+Handlebars.registerHelper('sanitize', sanitize);
+
+Handlebars.registerHelper('renderTextParam', function(param) {
+    var result, type = 'text', idAtt = '';
+    var paramType = param.type || param.schema && param.schema.type || '';
+    var isArray = paramType.toLowerCase() === 'array' || param.allowMultiple;
+    var defaultValue = isArray && Array.isArray(param.default) ? param.default.join('\n') : param.default;
+    var name = Handlebars.Utils.escapeExpression(param.name);
+    var valueId = Handlebars.Utils.escapeExpression(param.valueId);
+    paramType = Handlebars.Utils.escapeExpression(paramType);
+
+    var dataVendorExtensions = Object.keys(param).filter(function(property) {
+        // filter X-data- properties
+        // 【修正】属性名に使うプロパティ名は英数字・ハイフン・アンダースコアだけに限定する（属性名からの脱出を防ぐ）
+        return property.match(/^X-data-[A-Za-z0-9_-]+$/i) !== null;
+    }).reduce(function(result, property) {
+        // remove X- from property name, so it results in html attributes like data-foo='bar'
+        // 【修正】属性値 param[property] を escapeExpression でエスケープしてから連結する（' " < > & ` = を実体参照に変換）
+        return result += ' ' + property.substring(2, property.length) + '=\'' + Handlebars.Utils.escapeExpression(param[property]) + '\'';
+    }, '');
+
+    if(param.format && param.format === 'password') {
+        type = 'password';
+    }
+
+    if(valueId) {
+        idAtt = ' id=\'' + valueId + '\'';
+    }
+
+    // 【修正】default 値は HTML として表示する必要がないため、不十分な sanitize() ではなく escapeExpression でエスケープする。
+    // これで value='…' 属性からの脱出（'）や </textarea> によるタグ挿入ができなくなる。
+    // 【修正2】sanitize() はホワイトリスト型に直したが、HTML として表示するためのもの（許可したタグや文字参照を残す）なので、
+    // 値を入力どおりに表示する default 値には、ここは escapeExpression のままにする。
+    defaultValue = Handlebars.Utils.escapeExpression(defaultValue);
+
+    if(isArray) {
+        result = '<textarea class=\'body-textarea' + (param.required ? ' required' : '') + '\' name=\'' + name + '\'' + idAtt + dataVendorExtensions;
+        result += ' placeholder=\'Provide multiple values in new lines' + (param.required ? ' (at least one required).' : '.') + '\'>';
+        result += defaultValue + '</textarea>';
+    } else {
+        var parameterClass = 'parameter';
+        if(param.required) {
+          parameterClass += ' required';
+        }
+        result = '<input class=\'' + parameterClass + '\' minlength=\'' + (param.required ? 1 : 0) + '\'';
+        result += ' name=\'' + name +'\' placeholder=\'' + (param.required ? '(required)' : '') + '\'' + idAtt + dataVendorExtensions;
+        result += ' type=\'' + type + '\' value=\'' + defaultValue + '\'/>';
+    }
+    return new Handlebars.SafeString(result);
+});
+
+Handlebars.registerHelper('ifCond', function (v1, operator, v2, options) {
+
+    switch (operator) {
+        case '==':
+            return (v1 == v2) ? options.fn(this) : options.inverse(this);
+        case '===':
+            return (v1 === v2) ? options.fn(this) : options.inverse(this);
+        case '<':
+            return (v1 < v2) ? options.fn(this) : options.inverse(this);
+        case '<=':
+            return (v1 <= v2) ? options.fn(this) : options.inverse(this);
+        case '>':
+            return (v1 > v2) ? options.fn(this) : options.inverse(this);
+        case '>=':
+            return (v1 >= v2) ? options.fn(this) : options.inverse(this);
+        case '&&':
+            return (v1 && v2) ? options.fn(this) : options.inverse(this);
+        case '||':
+            return (v1 || v2) ? options.fn(this) : options.inverse(this);
+        default:
+            return options.inverse(this);
+    }
+});
+
+Handlebars.registerHelper('escape', function (value) {
+    var text = Handlebars.Utils.escapeExpression(value);
+
+    return new Handlebars.SafeString(text);
+});
+```
+
+---
