@@ -1,0 +1,429 @@
+## No.41 tj/node-growl lib/growl.js (prePatch dc8aae0)
+
+- 検証した修正コード: "xss以外の修正コード"
+- 検証結果: **不備あり** — OS コマンドインジェクションは全経路で直った（偽コマンドで argv を記録し、元は 28 通りで実行、修正後 0）。ただし execFile に変えたため、msg などに NUL 文字があると execFile が同期的に TypeError を投げ、利用側のプロセスが停止する新しい DoS が入った（元は JSON.stringify で \u0000 になり起きない）。修正コード2: execFile の呼び出しを try/catch で囲み、例外はコールバックのエラーとして返す
+- 修正コード2 のファイル: lib/growl.js
+- 親の確認: lib/growl.js: node --check で構文エラーなし。エージェントが読み取り専用の材料（orig・given）を変えていないこと、読まない範囲のファイルを読んでいないことを、記録で確認した。
+- 使用トークン量（検証）: 新規 99,269（入力 18 ／ キャッシュ作成 64,545 ／ 出力〔推定〕 34,706）、キャッシュ読込 473,819、総処理 573,088、リクエスト 9 回
+- 使用トークン量（再修正）: 新規 26,369（入力 16 ／ キャッシュ作成 16,569 ／ 出力〔推定〕 9,784）、キャッシュ読込 716,541、総処理 742,910、リクエスト 8 回
+
+対象の修正コード: "xss以外の修正コード" の lib/growl.js（`$R/given/fix_nx/lib/growl.js`）
+修正コード2: `$R/fix2/lib/growl.js`（直したのはこのファイルだけ）
+
+根拠の脆弱性（exec と args.join(' ') で /bin/sh を経由する OS コマンドインジェクション）は、元の修正コードで直っていた。攻撃の入力をすべての経路で試しても、コマンドは 1 つも実行されなかった。不備は、修正で新しく入った「NUL 文字による未捕捉の例外（プロセスの停止）」の 1 件である。
+
+### 元の修正コードの不備
+
+#### 不備1: msg などに NUL 文字（U+0000）があると growl() が例外を同期的に投げ、利用側のプロセスが停止する（修正で新しく入った DoS）
+
+- 場所: `lib/growl.js` 323 行（元の修正コード）
+  ```js
+  execFile(String(args[0]), args.slice(1).map(String), fn);
+  ```
+- 問題: Node の `child_process.execFile`（内部の spawn）は、コマンド名や引数に NUL 文字があると、`TypeError [ERR_INVALID_ARG_VALUE]: The argument 'args[1]' must be a string without null bytes` を**同期的に throw** する。このときコールバック `fn` は呼ばれない。元の修正コードは、msg・title・subtitle・url・image・Custom（options.exec）の message を、加工しないで引数にしている。そのため、これらの値に U+0000 が 1 文字でもあれば、例外がそのまま growl() の呼び出し元に伝わる。
+- 修正前のコードとの違い: 修正前のコードでは、これらの値を `quote = JSON.stringify` に通していた。JSON.stringify は U+0000 を 6 文字の文字列 `\u0000` に変えるので、例外は起きず、通知も出ていた。この例外は、quote() をやめて execFile にしたことで新しく生じた。
+- 問題になる入力・条件: 判定で想定した使い方では、チャットのメッセージ、ファイル名、テスト名、コミットメッセージなど、外部から来た文字列を通知に使う。growl は結果をコールバックで返す API なので、利用側は普通 try/catch で囲まない。この使い方で、攻撃者がメッセージに NUL を 1 文字入れると、未捕捉の例外でプロセスが終了する（サービス拒否。CWE-248 未捕捉の例外）。
+- 実際に確かめた（Node v22.22.1）:
+  - `a_nul_msg`（NC/DG/LG/LX/WIN の 5 種類すべて）、`a_nul_title`（LX）、`a_nul_custom`（LX）: 修正前のコードは正常にコールバックが呼ばれた。元の修正コードは、どれも上の TypeError を throw した。
+  - `bench/crash_demo.js`: EventEmitter の 'message' リスナーで、`growl(text, {title: from}, cb)` を try/catch なしで呼ぶ利用側を想定した。`'evil\u0000'` を流すと、修正前のコードは exit=0（2 回ともコールバックが呼ばれた）だった。元の修正コードは、未捕捉の TypeError で exit=1 になり、プロセスが停止した。
+- 同じ箇所の関連（Linux では再現できないため未確認）: Windows で options.exec に .bat/.cmd を指定すると、新しい Node では spawn が EINVAL を同期的に throw する。これも同じように、コールバックに渡らない例外になる。
+
+### 再修正の内容
+
+#### 変更1: execFile の呼び出しを try/catch で囲み、同期的な例外をコールバックに渡す（`lib/growl.js` 320-333 行）
+
+```js
+  // execute
+  // 【修正】args.join(' ') を exec でシェルに渡すのをやめ、execFile でコマンド名と引数の配列を直接渡す。
+  //        引数はシェルに解釈されないので、$(...)・`...`・$VAR・;・| などを含んでいてもコマンドは実行されない。
+  // 【修正2】execFile は、コマンド名や引数に NUL 文字（U+0000）があると TypeError を同期的に投げる
+  //         （Windows で .bat/.cmd を指定したときの EINVAL なども同様）。msg・title などは外部から来た文字列で
+  //         ありうるため、そのままでは growl() の呼び出し元で未捕捉の例外になり、利用側のプロセスが停止する。
+  //         例外を捕まえて、ほかの失敗（コマンドが見つからない等）と同じくコールバック fn にエラーとして渡す。
+  //         値の検査は execFile 自身が行うので、NUL を含む引数がコマンドに渡ることはない。
+  try {
+    execFile(String(args[0]), args.slice(1).map(String), fn);
+  } catch (err) {
+    return fn(err);
+  }
+};
+```
+
+- 何をどう変えたか: 元の修正コードの execFile の呼び出しは、そのまま try ブロックに入れた。execFile が同期的に例外を投げたときは、catch で受け取り、`fn(err)` でコールバックに渡す。ほかの行は変えていない。元の【修正】コメントも残した。
+- どう動くか:
+  - 通常の場合: execFile は子プロセスを起動し、終了したときに `fn(error, stdout, stderr)` を 1 回呼ぶ（元の修正コードと同じ）。
+  - msg などに NUL がある場合: execFile は引数を検査する段階で TypeError を投げ、子プロセスは起動しない。catch がこの例外を受け取って `fn(err)` を 1 回呼び、growl() は例外を投げずに戻る。NUL を含む引数が通知コマンドに渡ることはない。
+  - `String(args[0])` や `args.slice(1).map(String)` の文字列化で起きる例外（toString が例外を投げるオブジェクトなど）も、同じように fn に渡る。
+- なぜこの方法にしたか:
+  - growl は、結果やエラーをコールバックで知らせる API である。コマンドが見つからない（ENOENT）、対応していないプラットフォーム（`fn(new Error('growl not supported on this platform'))`）などの失敗も、すでに fn で知らせている。NUL による失敗も同じ経路で知らせるのが、API の約束に合っている。
+  - fn を同期的に呼ぶのは、既存の「対応していないプラットフォーム」の処理（189 行 `return fn(new Error(...))`）に合わせた。
+  - NUL を取り除いたり別の文字に置き換えたりする方法も考えた。しかし、通知の内容を黙って書き換えることになるうえ、NUL 以外の同期的な例外（Windows の EINVAL など）は防げない。そこで、例外をまとめて受け止める方法にした。値の検査は Node の execFile が必ず行うので、検査が抜ける心配もない。
+  - 変更は、問題の箇所（323 行）だけにとどめた。
+
+### 確認した内容と結果
+
+確認には Node v22.22.1 を使った。`$R/bench/` に次のものを用意した。
+- `osmock.js`: os.type() を環境変数で差し替える preload
+- `binA` / `binB`: 受け取った argv を JSON で記録するだけの偽コマンド（terminal-notifier / growlnotify / growl / notify-send / customnotify）
+- `drive.js` / `runner.js` / `cases.js` / `cases_edge.js`: 5 種類の cmd（Darwin-NotificationCenter, Darwin-Growl, Linux-Growl, Linux(notify-send), Windows）と Custom を実際に動かす。
+
+これを使って、次の確認をした。
+
+1. 構文確認: `node --check $R/fix2/lib/growl.js` → エラーなし。
+2. 修正前のコードと修正コード2 の比較（`node drive.js`、106 の組み合わせ）:
+   - 攻撃の入力: msg・title・subtitle・url・image への `$(touch 目印)`、バッククォート、`"; touch …; echo "`、`\"; touch … #`、改行。sound/name への `;`・`|`。照合の後で値を変える priority オブジェクト。Custom の `%s` あり・なし・title 経由・`$\`` `$'`。`$HOME ${PATH}`。
+   - 結果: 修正前のコードでは 28 の組み合わせで目印ファイルが作られた。修正コード2 では 0 件だった。値はすべて、そのまま 1 つの argv 要素として渡った。
+   - NUL の入力（`a_nul_msg` ×5、`a_nul_title`、`a_nul_custom`）: 修正コード2 では例外が throw されず、コールバックに `The argument 'args[1]' must be a string without null bytes…` のエラーが 1 回渡った。偽コマンドは起動されなかった。
+   - 正常な入力（18 種）: argv が修正前のコードと同じになった。Linux(notify-send) で `--` が加わる点、priority の不具合（`[object Object]`）が直った点は、元の修正コードと同じである。
+3. 元の修正コードと修正コード2 の比較（106 の組み合わせ、目印ファイル名の違いをそろえて比較）: 違いは NUL の 7 つの組み合わせだけだった。そこでは、throw がコールバックへのエラーに変わった。ほかの 99 の組み合わせでは、argv・コールバックの結果・目印ファイル（0 件）がすべて同じだった。コールバックが 2 回呼ばれた組み合わせはなかった。境界の入力（`cases_edge.js`。msg が undefined・数値・オブジェクト、数値の priority、Linux-Growl での priority、Custom の余分な空白・クォート）も、元の修正コードと同じ結果だった。
+4. 利用側のプロセスの停止の確認（`crash_demo.js`）: 修正コード2 では、`'evil\u0000'` のメッセージに対してコールバックが `err=The argument 'args[2]' must be a string without null bytes…` で呼ばれた。続く処理も動き、exit=0 だった（元の修正コードでは exit=1 で停止した）。
+5. 実物の notify-send 0.8.8 の解析: DBus の宛先を存在しないパスにして、通知は出さずに確かめた。`notify-send -- -u` は送信の段階まで進んだ。`notify-send -- a b c` は「Invalid number of options.」になった。このことから、元の修正コードが加えた `--` は引数に数えられず、正しく働くことがわかった（修正コード2 でも同じ）。
+
+### 副作用・残る点
+
+- 動作の変化: msg などに NUL 文字があるとき、修正前のコードは文字列 `\u0000` を含む通知を出していた。修正コード2 では通知を出さず、エラーをコールバックに渡す。プロセスは停止しない。このとき fn は、growl() から戻る前に同期的に呼ばれる（既存の「対応していないプラットフォーム」の場合と同じ）。
+- 元の修正コードから引き継ぐ、直していない点（修正の説明に記載済み、または脆弱性と関係しないもの）:
+  - terminal-notifier / growlnotify / growl / Windows の growlnotify には `--` を付けていない。msg・title などが `-`（Windows では `/`）で始まると、オプションとして解釈される余地がある。これは修正前のコードでも同じで（JSON.stringify のクォートはシェルで外れる）、シェルによるコマンド実行にはならない。値は常に固定のフラグの直後に置かれるので、terminal-notifier の `-execute` に攻撃者の値を組で渡すこともできない。各ツールが `--` に対応しているかを確かめられないため、変えていない。
+  - options.exec でシェルの構文（クォート、パイプなど）が使えない（例: `customnotify "My App" %s` は `"My` と `App"` に分かれる）。シェルを使わないことによる、意図した変化である。
+  - 既存の不具合は、脆弱性と関係しないので直していない。Linux-Growl / Custom で priority を指定すると TypeError になる。数値の priority は文字列との indexOf で一致しない。options.exec を一度使うと、モジュール変数 cmd が Custom のまま残る。path.extname に文字列以外の image を渡すと TypeError になる（修正前のコードと同じ）。
+  - msg がオブジェクトのとき、表示が JSON 風（`{a:1}`）から `[object Object]` に変わる（元の修正コードからの変化。msg は文字列と文書化されているので、不備としない）。
+
+### 修正コード2 の全文: lib/growl.js
+
+```javascript
+// Growl - Copyright TJ Holowaychuk <tj@vision-media.ca> (MIT Licensed)
+
+/**
+ * Module dependencies.
+ */
+
+// 【修正】exec は /bin/sh -c（Windows では cmd.exe）を経由してシェルのメタ文字を解釈するため、
+//        シェルを経由せずにコマンド名と引数の配列を渡す execFile に置き換えた。
+var execFile = require('child_process').execFile
+  , fs = require('fs')
+  , path = require('path')
+  , exists = fs.existsSync || path.existsSync
+  , os = require('os')
+  // 【修正】quote = JSON.stringify は削除した。ダブルクォートで囲むだけで $(...) や `...` を防げず、
+  //        引数を配列で渡す execFile ではクォート自体が不要になるため。
+  , cmd;
+
+function which(name) {
+  var paths = process.env.PATH.split(':');
+  var loc;
+
+  for (var i = 0, len = paths.length; i < len; ++i) {
+    loc = path.join(paths[i], name);
+    if (exists(loc)) return loc;
+  }
+}
+
+// 【修正】sound や name のように、利用側から来た値をコマンドのオプションの値として渡してよいかを確かめる。
+//        文字列だけを受け付け、'-' で始まる値（別のオプションとして解釈されうる）は渡さない。
+function isSafeOptionValue(value) {
+  return typeof value === 'string' && value !== '' && value.charAt(0) !== '-';
+}
+
+switch(os.type()) {
+  case 'Darwin':
+    if (which('terminal-notifier')) {
+      cmd = {
+          type: "Darwin-NotificationCenter"
+        , pkg: "terminal-notifier"
+        , msg: '-message'
+        , title: '-title'
+        , subtitle: '-subtitle'
+        , icon: '-appIcon'
+        , sound:  '-sound'
+        , url: '-open'
+        , priority: {
+              cmd: '-execute'
+            , range: []
+          }
+      };
+    } else {
+      cmd = {
+          type: "Darwin-Growl"
+        , pkg: "growlnotify"
+        , msg: '-m'
+        , sticky: '--sticky'
+        , priority: {
+              cmd: '--priority'
+            , range: [
+                -2
+              , -1
+              , 0
+              , 1
+              , 2
+              , "Very Low"
+              , "Moderate"
+              , "Normal"
+              , "High"
+              , "Emergency"
+            ]
+          }
+      };
+    }
+    break;
+  case 'Linux':
+    if (which('growl')) {
+      cmd = {
+          type: "Linux-Growl"
+        , pkg: "growl"
+        , msg: '-m'
+        , title: '-title'
+        , subtitle: '-subtitle'
+        , host: {
+            cmd: '-H'
+          , hostname: '192.168.33.1'
+        }
+      };
+    } else {
+      cmd = {
+          type: "Linux"
+        , pkg: "notify-send"
+        , msg: ''
+        // 【修正】execFile では配列の 1 要素が 1 つの引数になるので、'-t 0' を 2 つの引数に分けて持つ。
+        , sticky: ['-t', '0']
+        , icon: '-i'
+        , priority: {
+            cmd: '-u'
+          , range: [
+              "low"
+            , "normal"
+            , "critical"
+          ]
+        }
+      };
+    }
+    break;
+  case 'Windows_NT':
+    cmd = {
+        type: "Windows"
+      , pkg: "growlnotify"
+      , msg: ''
+      , sticky: '/s:true'
+      , title: '/t:'
+      , icon: '/i:'
+      , url: '/cu:'
+      , priority: {
+            cmd: '/p:'
+          , range: [
+              -2
+            , -1
+            , 0
+            , 1
+            , 2
+          ]
+        }
+    };
+    break;
+}
+
+/**
+ * Expose `growl`.
+ */
+
+exports = module.exports = growl;
+
+/**
+ * Node-growl version.
+ */
+
+exports.version = '1.4.1'
+
+/**
+ * Send growl notification _msg_ with _options_.
+ *
+ * Options:
+ *
+ *  - title   Notification title
+ *  - sticky  Make the notification stick (defaults to false)
+ *  - priority  Specify an int or named key (default is 0)
+ *  - name    Application name (defaults to growlnotify)
+ *  - sound   Sound efect ( in OSx defined in preferences -> sound -> effects) * works only in OSX > 10.8x
+ *  - image
+ *    - path to an icon sets --iconpath
+ *    - path to an image sets --image
+ *    - capitalized word sets --appIcon
+ *    - filename uses extname as --icon
+ *    - otherwise treated as --icon
+ *
+ * Examples:
+ *
+ *   growl('New email')
+ *   growl('5 new emails', { title: 'Thunderbird' })
+ *   growl('5 new emails', { title: 'Thunderbird', sound: 'Purr' })
+ *   growl('Email sent', function(){
+ *     // ... notification sent
+ *   })
+ *
+ * @param {string} msg
+ * @param {object} options
+ * @param {function} fn
+ * @api public
+ */
+
+function growl(msg, options, fn) {
+  var image
+    , args
+    , options = options || {}
+    , fn = fn || function(){};
+
+  if (options.exec) {
+    cmd = {
+        type: "Custom"
+      , pkg: options.exec
+      , range: []
+    };
+  }
+
+  // noop
+  if (!cmd) return fn(new Error('growl not supported on this platform'));
+  args = [cmd.pkg];
+
+  // image
+  // 【修正】image は quote() で囲まず、そのまま 1 つの引数として渡す（この switch 内すべて）。
+  if (image = options.image) {
+    switch(cmd.type) {
+      case 'Darwin-Growl':
+        var flag, ext = path.extname(image).substr(1)
+        flag = flag || ext == 'icns' && 'iconpath'
+        flag = flag || /^[A-Z]/.test(image) && 'appIcon'
+        flag = flag || /^png|gif|jpe?g$/.test(ext) && 'image'
+        flag = flag || ext && (image = ext) && 'icon'
+        flag = flag || 'icon'
+        args.push('--' + flag, image)
+        break;
+      case 'Darwin-NotificationCenter':
+        args.push(cmd.icon, image);
+        break;
+      case 'Linux':
+        args.push(cmd.icon, image);
+        // libnotify defaults to sticky, set a hint for transient notifications
+        if (!options.sticky) args.push('--hint=int:transient:1');
+        break;
+      case 'Windows':
+        args.push(cmd.icon + image);
+        break;
+    }
+  }
+
+  // sticky
+  // 【修正】sticky のオプションがない種類（cmd.sticky が undefined）では引数を足さない
+  //        （execFile では undefined が "undefined" という引数になってしまうため）。
+  //        Linux の ['-t', '0'] のような配列は別々の引数として足す。
+  if (options.sticky && cmd.sticky) args.push.apply(args, [].concat(cmd.sticky));
+
+  // priority
+  if (options.priority) {
+    var priority = options.priority + '';
+    var checkindexOf = cmd.priority.range.indexOf(priority);
+    if (~cmd.priority.range.indexOf(priority)) {
+      // 【修正】照合に使った文字列 priority をそのまま渡す（options.priority を渡すと、照合後に
+      //        別の値へ文字列化されるオブジェクトを渡されうるため）。また、オブジェクトの
+      //        cmd.priority ではなく、オプション名の cmd.priority.cmd を渡す。
+      args.push(cmd.priority.cmd, priority);
+    }
+  }
+
+  //sound
+  // 【修正】sound は文字列で、'-' で始まらない場合だけ渡す。
+  if(options.sound && cmd.type === 'Darwin-NotificationCenter' && isSafeOptionValue(options.sound)){
+    args.push(cmd.sound, options.sound)
+  }
+
+  // name
+  // 【修正】name も sound と同じく、文字列で '-' で始まらない場合だけ渡す。
+  if (options.name && cmd.type === "Darwin-Growl" && isSafeOptionValue(options.name)) {
+    args.push('--name', options.name);
+  }
+
+  // 【修正】以下の switch では quote() とその後の改行の置換をやめ、msg・title・subtitle・url を
+  //        文字列のまま 1 つずつの引数として渡す（シェルを通らないので改行もそのまま保たれる）。
+  switch(cmd.type) {
+    case 'Darwin-Growl':
+      args.push(cmd.msg);
+      args.push(String(msg));
+      if (options.title) args.push(String(options.title));
+      break;
+    case 'Darwin-NotificationCenter':
+      args.push(cmd.msg);
+      args.push(String(msg));
+      if (options.title) {
+        args.push(cmd.title);
+        args.push(String(options.title));
+      }
+      if (options.subtitle) {
+        args.push(cmd.subtitle);
+        args.push(String(options.subtitle));
+      }
+      if (options.url) {
+        args.push(cmd.url);
+        args.push(String(options.url));
+      }
+      break;
+    case 'Linux-Growl':
+      args.push(cmd.msg);
+      args.push(String(msg));
+      if (options.title) args.push(String(options.title));
+      if (cmd.host) {
+        args.push(cmd.host.cmd, cmd.host.hostname)
+      }
+      break;
+    case 'Linux':
+      // 【修正】title や msg が '-' で始まっても notify-send のオプションとして解釈されないよう、
+      //        '--' でオプションの終わりを示してから渡す。
+      args.push('--');
+      if (options.title) {
+        args.push(String(options.title));
+        // 【修正】cmd.msg は空文字で、execFile では空の引数になってしまうため渡さない。
+        args.push(String(msg));
+      } else {
+        args.push(String(msg));
+      }
+      break;
+    case 'Windows':
+      args.push(String(msg));
+      if (options.title) args.push(cmd.title + options.title);
+      if (options.url) args.push(cmd.url + options.url);
+      break;
+    case 'Custom':
+      // 【修正】options.exec のコマンド文字列を空白で区切ってコマンド名と引数に分け、message は
+      //        シェルを通さずに引数として渡す。%s を含む引数には message を埋め込み（replace には関数を渡し、
+      //        message 内の $& や $1 などが置換パターンとして解釈されないようにする）、%s がなければ
+      //        最後の引数として足す。
+      (function(origCommand) {
+        var message = String(options.title
+          ? options.title + ': ' + msg
+          : msg);
+        var replaced = false;
+        var parts = String(origCommand).trim().split(/\s+/).map(function(part) {
+          return part.replace(/(^|[^%])%s/g, function(all, before) {
+            replaced = true;
+            return before + message;
+          });
+        });
+        args = parts.concat(args.slice(1));
+        if (!replaced) args.push(message);
+      })(args[0]);
+      break;
+  }
+
+  // execute
+  // 【修正】args.join(' ') を exec でシェルに渡すのをやめ、execFile でコマンド名と引数の配列を直接渡す。
+  //        引数はシェルに解釈されないので、$(...)・`...`・$VAR・;・| などを含んでいてもコマンドは実行されない。
+  // 【修正2】execFile は、コマンド名や引数に NUL 文字（U+0000）があると TypeError を同期的に投げる
+  //         （Windows で .bat/.cmd を指定したときの EINVAL なども同様）。msg・title などは外部から来た文字列で
+  //         ありうるため、そのままでは growl() の呼び出し元で未捕捉の例外になり、利用側のプロセスが停止する。
+  //         例外を捕まえて、ほかの失敗（コマンドが見つからない等）と同じくコールバック fn にエラーとして渡す。
+  //         値の検査は execFile 自身が行うので、NUL を含む引数がコマンドに渡ることはない。
+  try {
+    execFile(String(args[0]), args.slice(1).map(String), fn);
+  } catch (err) {
+    return fn(err);
+  }
+};
+```
+
+---
