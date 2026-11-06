@@ -1,0 +1,108 @@
+## No.82 CVE-2019-10744 lodash/lodash lodash.js 4.17.11（prePatch 1f8ea07）
+
+- 修正した脆弱性: _.template のコードインジェクション（CWE-94・CWE-116）と baseSet のプロトタイプ汚染（CWE-1321）
+- 修正対象ファイル: lodash.js（パッチ形式）
+- 形式: No.79 と同じく、元のファイルに対する unified diff 形式のパッチ（5 ハンク）を載せる。`patch -F0` で prePatch の lodash.js にずれなく当たり、当てたファイルが node --check に通ることを親が確認した。
+- 修正の内容（行番号は元のファイル）:
+  - 193 行目の後: 正規表現 `reTemplateLineTerminator = /[\n\r\u2028\u2029]/g`（改行文字）と `reTemplateVariable = /^[A-Za-z_$][\w$]*$/`（変数名として許す形）を加えた。
+  - _.template 14766・14768 行目: `assignInWith` を `assignWith` に替え、options と imports は自分自身のプロパティだけをコピーするようにした。汚染された Object.prototype の sourceURL・variable・imports のキーが options に入らなくなる（imports のキーは Function の引数名になるので、`a,b=…` のような既定値によるコード注入もここで防ぐ）。
+  - 14788〜14789 行目: `'sourceURL' in options` を `hasOwnProperty.call(options, 'sourceURL')` にし、値は文字列にしてから改行文字を取り除く。`//# sourceURL=` のコメントの外へ抜け出せなくなる。
+  - 14822〜14825 行目: variable も自分自身のプロパティだけを読み、値があれば文字列にして reTemplateVariable で検査し、合わなければ `throw new Error('Invalid `variable` option passed into `_.template`')` にした。検査した文字列をそのまま `'function(' + variable` に使う。
+  - baseSet（3968 行目の後）: パスのどの位置でもキーが `'__proto__'` のとき、または最後ではないキーが `'constructor'`・`'prototype'` のときは、代入せずに `return object` する。`_.set`・setWith・update・updateWith・zipObjectDeep・`_.pick`（basePickBy 経由）から Object.prototype を書き換えられなくなる。
+- 副作用・直さなかった点（エージェントの最終報告による）:
+  - baseSet: 途中のキーに constructor や prototype がある正当な使い方（例: `_.set(Fn, 'prototype.m', 1)`）も、黙って何もしなくなる。最後のキーとしての `_.set(o, 'constructor', v)` は残した（判定時のメモは「3 つとも拒否」だが、汚染が起きるのは辿るときだけなので範囲を絞った）。禁止キーに当たる前に作られた中間のオブジェクトは残る。
+  - template: 継承プロパティで渡した options は使われなくなる。variable は ASCII の識別子だけを許すので、日本語などの識別子は例外になる。
+  - 対象外: merge／defaultsDeep の経路（指示どおり）。_.templateSettings の escape・evaluate・interpolate が削除されたときの継承値の読み込み。baseSet が一般の継承値（`{}.toString` などの組み込みの関数）を辿ってそれに書き込める点（CWE-1321 の 3 つのキーとは別の問題で、直すと getter を使う正当な使い方を壊すおそれがある）。
+- MARK END の後の手直し（エージェントが行った。トークン量の区間には含めていない）:
+  - Write の入力の時点で、パッチに書いた `\u2028`・`\u2029` のエスケープ表記が実体の U+2028・U+2029 の文字に変わっていた（ファイル2 No.29 などと同じ現象）。影響したのは 2 行（ハンク 1 の文脈行と、追加した正規表現の行）で、ハンク 1 が当たらず、正規表現も構文エラーになる状態だった（JavaScript では U+2028 は行終端文字で、正規表現リテラルの中に置けない）。エージェントが perl でエスケープ表記に戻した。
+  - Write の入力の時点で、空の文脈行 8 行の先頭の空白 1 文字も消えていた。エージェントが `sed 's/^$/ /'` で補った。
+  - 親が、Write の入力と最終のパッチの差がこの 10 行だけで、修正の中身は変わっていないことを確認した。Write した直後のパッチ（bench/fix01_lodash.js.patch.as-written に残してある）は `patch -F0` で当たらないことも確認した。
+- 確認（MARK END の後）: エージェントが、攻撃のケース（sourceURL に `\n` や U+2028 を入れたコード注入、variable の注入、Object.prototype の sourceURL・variable・imports の汚染、`_.set` の `__proto__`・`constructor.prototype`・配列パス・入れ子の `__proto__`、setWith・update・zipObjectDeep、`_.pick(JSON.parse('{"__proto__":…}'), '__proto__.polluted')`）を 1 ケース 1 プロセスで動かし、元のコードでは成立し、修正後は成立しない（variable の注入は例外になる）ことを確かめた。通常の使い方（`<%= %>`・`<%- %>`・print・`${}`、variable `data`・`$data_1`、imports、sourceURL、`_.set` など）は元と同じ出力になった。処理時間に、はっきりした差はなかった。
+- 使用トークン量（修正）: 新規 54,130（入力 16 ／ キャッシュ作成 27,513 ／ 出力〔推定〕 26,601）、キャッシュ読込 202,105、総処理 256,235、リクエスト 8 回
+
+```diff
+--- lodash.js
++++ lodash.js
+@@ -191,6 +191,12 @@
+ 
+   /** Used to match unescaped characters in compiled string literals. */
+   var reUnescapedString = /['\n\r\u2028\u2029\\]/g;
++
++  // 【修正】_.template の `sourceURL` オプションから除去する改行文字（JavaScript の行終端文字）。
++  var reTemplateLineTerminator = /[\n\r\u2028\u2029]/g;
++
++  // 【修正】_.template の `variable` オプションとして許可する識別子（ASCII の英字・数字・_・$）。
++  var reTemplateVariable = /^[A-Za-z_$][\w$]*$/;
+ 
+   /** Used to compose unicode character classes. */
+   var rsAstralRange = '\\ud800-\\udfff',
+@@ -3967,6 +3973,14 @@
+         var key = toKey(path[index]),
+             newValue = value;
+ 
++        // 【修正】パスに '__proto__' があるか、途中のキーに 'constructor'・'prototype' があると、
++        // Object.prototype などの共有のプロトタイプまで辿って書き換えてしまう（プロトタイプ汚染）。
++        // その場合はそれ以上辿らず、代入もしないで object をそのまま返す。
++        if (key === '__proto__' ||
++            (index != lastIndex && (key === 'constructor' || key === 'prototype'))) {
++          return object;
++        }
++
+         if (index != lastIndex) {
+           var objValue = nested[key];
+           newValue = customizer ? customizer(objValue, key, nested) : undefined;
+@@ -14763,9 +14777,12 @@
+         options = undefined;
+       }
+       string = toString(string);
+-      options = assignInWith({}, options, settings, customDefaultsAssignIn);
++      // 【修正】assignInWith は継承プロパティ（keysIn）もコピーするので、Object.prototype が汚染されていると
++      // その値（sourceURL・variable・imports など）が options に入る。own プロパティだけをコピーする assignWith にする。
++      options = assignWith({}, options, settings, customDefaultsAssignIn);
+ 
+-      var imports = assignInWith({}, options.imports, settings.imports, customDefaultsAssignIn),
++      // 【修正】imports のキーは Function の引数名になるので、同じく own プロパティだけをコピーする。
++      var imports = assignWith({}, options.imports, settings.imports, customDefaultsAssignIn),
+           importsKeys = keys(imports),
+           importsValues = baseValues(imports, importsKeys);
+ 
+@@ -14784,9 +14801,12 @@
+       , 'g');
+ 
+       // Use a sourceURL for easier debugging.
++      // 【修正】`'sourceURL' in options` はプロトタイプ鎖も見るので、own プロパティだけを見る。
++      // 【修正】sourceURL は 1 行コメント（//# sourceURL=）の中に連結されるので、改行文字
++      // （\n \r U+2028 U+2029）を除去し、コメントの外（関数本体）にコードを書けないようにする。
+       var sourceURL = '//# sourceURL=' +
+-        ('sourceURL' in options
+-          ? options.sourceURL
++        (hasOwnProperty.call(options, 'sourceURL')
++          ? (options.sourceURL + '').replace(reTemplateLineTerminator, '')
+           : ('lodash.templateSources[' + (++templateCounter) + ']')
+         ) + '\n';
+ 
+@@ -14819,10 +14839,19 @@
+ 
+       // If `variable` is not specified wrap a with-statement around the generated
+       // code to add the data object to the top of the scope chain.
+-      var variable = options.variable;
++      // 【修正】継承プロパティ（汚染された Object.prototype.variable など）は使わず、own プロパティだけを見る。
++      var variable = hasOwnProperty.call(options, 'variable') && options.variable;
+       if (!variable) {
+         source = 'with (obj) {\n' + source + '\n}\n';
+-      }
++      } else {
++        // 【修正】variable は 'function(' + variable + ') {' として関数の引数名に連結されるので、
++        // 識別子として正しい文字列（ASCII の英字・数字・_・$）だけを許可し、それ以外は例外にする。
++        // 文字列への変換は 1 回だけ行い、検査した文字列をそのまま後の連結に使う。
++        variable = toString(variable);
++        if (!reTemplateVariable.test(variable)) {
++          throw new Error('Invalid `variable` option passed into `_.template`');
++        }
++      }
+       // Cleanup code by stripping empty strings.
+       source = (isEvaluating ? source.replace(reEmptyStringLeading, '') : source)
+         .replace(reEmptyStringMiddle, '$1')
+```
+
+---
