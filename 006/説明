@@ -1,0 +1,382 @@
+## No.6 OWASP BenchmarkJava BenchmarkTest00030.java
+
+- XSS の種別: 反射型（クエリやフォームのパラメータが保存されずに、そのレスポンスへ直接返される）
+- source（ユーザーの入力）: リクエストパラメータ BenchmarkTest00030 の最初の値（L44 `request.getParameterMap()`、L47〜48 `map.get("BenchmarkTest00030")[0]`）
+- sink（出力先）: L53 `response.getWriter().printf(param, obj)`（text/html のレスポンス本文）
+- 修正したファイル: src/main/java/org/owasp/benchmark/testcode/BenchmarkTest00030.java
+- 検証（プロンプトファイル2）の結果: 問題なし
+
+OWASP Benchmark のサーブレットである。No.4・No.5 と同じく、外部の入力を書式文字列として出力している。違いは、入力が Referer ヘッダではなくリクエストパラメータであることと、`format` ではなく `printf` を使っていることである。判定では XSS（CWE-79）とあわせて、書式文字列の外部制御（CWE-134）も指摘している。
+
+### 1. 元のコードの問題
+
+元のコードの関係する部分:
+
+```java
+ 42	        response.setContentType("text/html;charset=UTF-8");
+ 43	
+ 44	        java.util.Map<String, String[]> map = request.getParameterMap();
+ 45	        String param = "";
+ 46	        if (!map.isEmpty()) {
+ 47	            String[] values = map.get("BenchmarkTest00030");
+ 48	            if (values != null) param = values[0];
+ 49	        }
+ 50	
+ 51	        response.setHeader("X-XSS-Protection", "0");
+ 52	        Object[] obj = {"a", "b"};
+ 53	        response.getWriter().printf(param, obj);
+```
+
+値の流れ:
+
+1. L44: `getParameterMap()` で、すべてのリクエストパラメータを「名前 → 値の配列」の形で受け取る。GET のクエリ文字列（URL の `?` の後ろ）でも、POST の本文でもよい。
+2. L47〜48: 名前が BenchmarkTest00030 のパラメータの最初の値を `param` に入れる（source）。加工も検証もしない。
+3. L42 で Content-Type を text/html にし、L51 でブラウザの XSS フィルタを無効にする（`X-XSS-Protection: 0`）。
+4. L53: `printf(param, obj)` で出力する（sink）。`printf` は `format` と同じ働きをするメソッドで、`param` は書式文字列（`%s` などの書式指定子を含むひな形）として使われる。`%` で始まる部分以外は、そのまま出力される。
+
+なぜ危ないのか:
+
+- `param` を HTML エスケープ（`<` などを別の書き方に置き換えること）せずに出力している。
+- 外部の入力を書式文字列にしている（CWE-134）。`%s` は `obj` の値 `a` に置き換わり、不正な指定子では IllegalFormatException という例外が起きて 500 エラーになる（検証の記録による）。
+
+攻撃の入力の例:
+
+- 攻撃者は、`/xss-00/BenchmarkTest00030?BenchmarkTest00030=<スクリプト要素>` のような URL を作り、メールなどで被害者にクリックさせる（"xssの詳細" の攻撃例）。
+- 例えば値が `<script>alert(1)</script>` のとき、`%` を含まないので、L53 はそのまま出力する。ブラウザは `<script>` をタグと解釈し、`alert(1)` を実行する。
+
+### 2. 修正の内容
+
+元の L53 の 1 行だけを、修正コードの L36〜38 に置き換えた（L36・L37 は【修正】コメント）。ほかの行は元のままである。
+
+#### 修正 1: 出力する値を ESAPI の encodeForHTML で HTML エンコードする（XSS 対策。元のコード L53 → 修正コード L36〜38）
+
+修正前:
+```java
+ 53	        response.getWriter().printf(param, obj);
+```
+
+修正後:
+```java
+ 36	        // 【修正】外部入力 param を書式文字列として使わず（CWE-134 対策）、固定の書式 "%s" の引数として渡す。
+ 37	        // 【修正】出力前に ESAPI の encodeForHTML で HTML エンティティ化し、タグや属性として解釈されないようにする（XSS 対策）。
+ 38	        response.getWriter().printf("%s", org.owasp.esapi.ESAPI.encoder().encodeForHTML(param));
+```
+
+- `org.owasp.esapi.ESAPI.encoder()`: OWASP のセキュリティ用ライブラリ ESAPI から、文字列を変換する Encoder を取り出す。完全修飾名（パッケージ名から書いた名前）なので import は要らない。
+- `.encodeForHTML(param)`: `param` を HTML 本文用に変換する。英数字と `, . - _ 空白` 以外は、すべて文字参照にする。
+  - 文字参照は、`&lt;` のように文字を別の書き方で表したもの。ブラウザは文字として表示するが、タグの始まりとは見なさない。
+  - `< > & "` は `&lt; &gt; &amp; &quot;` に、`' / = ( ) : % +` などは `&#x27;` のような 16 進数の形に、制御文字は `&#xfffd;` になる（検証の記録による）。
+- 出力先は HTML 本文のテキストなので、生の `<` `>` `"` `'` `&` が残らなければ、タグも属性も作れない。
+- このプロジェクトでは、既存の helpers/Utils.java（L242・L249・L367）でも同じ `ESAPI.encoder().encodeForHTML()` を使っている（検証で確認）。新しいライブラリを持ち込む修正ではない。
+
+#### 修正 2: 書式文字列を固定の "%s" にする（CWE-134 対策。元のコード L53 → 修正コード L38）
+
+修正前:
+```java
+ 53	        response.getWriter().printf(param, obj);
+```
+
+修正後（修正 1 と同じ行の、書式の部分）:
+```java
+ 38	        response.getWriter().printf("%s", …);
+```
+
+- 書式を定数の `"%s"` にしたので、出力は encodeForHTML の結果そのものになる。
+- 入力の `%` は引数の中の文字として扱われ、書式指定子として解釈されない。例外も起きない。
+- `obj` は渡さなくなり、L35 の `Object[] obj` は使われないまま残っている。
+
+### 3. 修正の結果
+
+攻撃の入力の出力（ESAPI の規則に従って求めたもの）:
+
+- 値 `<script>alert(1)</script>` は、`&lt;script&gt;alert&#x28;1&#x29;&lt;&#x2f;script&gt;` と出力される。画面には `<script>alert(1)</script>` という文字が表示されるだけで、スクリプトは実行されない。
+- 値 `"><svg/onload=alert(1)>` は、`&quot;&gt;&lt;svg&#x2f;onload&#x3d;alert&#x28;1&#x29;&gt;` と出力され、タグにならない。
+- 値 `100%` や `%s` は、`100&#x25;`、`&#x25;s` と出力され、画面には入力どおり表示される。
+
+正常な入力での動作:
+
+- 英数字・空白・`, . - _` だけの入力は、元と同じ出力になる。
+- それ以外の文字（日本語や記号）は文字参照で出力されるので、バイト列は変わるが、ブラウザでの表示は同じである。
+- 値がない場合や空の場合は、元と同じく何も出力しない。
+- 変わるのは、入力の `%` を書式指定子として解釈しなくなった点だけで、これは CWE-134 の修正による意図した変化である。
+
+検証（プロンプトファイル2）で確かめたこと:
+
+- diff で、変更が sink の 1 行の置き換えとライセンスヘッダの省略だけであることを確かめた。
+- 構文: java/javac がないため、コードを読んで確かめた。import・型・API の存在、Java 8 で通る構文を確認し、括弧の対応はスクリプトで確認した。
+- 依存: 同じコミットの pom.xml に esapi 2.7.0.0 の依存があり、ESAPI.properties に Encoder の設定があることを確かめた。
+- 攻撃の入力: ESAPI の HTMLEntityCodec の挙動を Python で再現し、17 種の入力を通した。全件で、生の `<` `>` `"` `'` とバッククォート（`` ` ``）、文字参照でない `&` は出力に出なかった。
+  - 入力は、script タグ、大文字小文字の混在、onerror、`"><svg>`、`'` で属性を抜ける入力、エンティティ化済みの文字列、二重 URL エンコード、全角の＜＞、NUL の混入、`javascript:`、UTF-7、書式指定子、`100%` など。
+  - ESAPI そのものを動かしたのではなく、自作の再現コードによる確認である。
+
+残った注意点（検証で「不備ではない」とされたもの）:
+
+- L35 の `Object[] obj` が未使用で残っている。動作には影響しない。
+- ESAPI.properties のコメントにある esapi-java-logging.properties が、同じコミットで見つからなかった。プロジェクト全体の設定の話で、既存の Utils.java も同じ API を使っているため、この修正に固有の問題ではない。実行時の初期化は確かめていない。
+
+## No.7 OWASP BenchmarkJava BenchmarkTest00036.java
+
+- XSS の種別: 反射型（リクエストのパラメータ名が保存されずに、そのレスポンスへ直接返される）
+- source（ユーザーの入力）: リクエストパラメータの「名前」（L46 `request.getParameterNames()`、L48 `names.nextElement()`）
+- sink（出力先）: L65 `response.getWriter().write(param.toCharArray(), 0, length)`（text/html のレスポンス本文）
+- 修正したファイル: src/main/java/org/owasp/benchmark/testcode/BenchmarkTest00036.java
+- 検証（プロンプトファイル2）の結果: 問題なし
+
+OWASP Benchmark のサーブレットである。このテストケースでは、パラメータの「値」ではなく「名前」が出力される。値が `BenchmarkTest00036` であるパラメータを探し、その名前をレスポンスに書く。XSS 以外の脆弱性はない（"xss以外の修正コード" で「なし・対象外」）。
+
+### 1. 元のコードの問題
+
+元のコードの関係する部分:
+
+```java
+ 42	        response.setContentType("text/html;charset=UTF-8");
+ 43	
+ 44	        String param = "";
+ 45	        boolean flag = true;
+ 46	        java.util.Enumeration<String> names = request.getParameterNames();
+ 47	        while (names.hasMoreElements() && flag) {
+ 48	            String name = (String) names.nextElement();
+ 49	            String[] values = request.getParameterValues(name);
+ …
+ 53	                    if (value.equals("BenchmarkTest00036")) {
+ 54	                        param = name;
+ 55	                        flag = false;
+ …
+ 61	        response.setHeader("X-XSS-Protection", "0");
+ 62	        int length = 1;
+ 63	        if (param != null) {
+ 64	            length = param.length();
+ 65	            response.getWriter().write(param.toCharArray(), 0, length);
+ 66	        }
+```
+
+値の流れ:
+
+1. L46〜48: `getParameterNames()` で、すべてのパラメータの名前を 1 つずつ取り出す。クエリ文字列（URL の `?` の後ろ）と POST の本文の両方が対象になる。
+2. L49〜55: そのパラメータの値を順に調べ、値が `BenchmarkTest00036` と一致したら、その名前を `param` に入れて探索を終える（source）。
+3. L42 で Content-Type を text/html にし、L61 でブラウザの XSS フィルタを無効にする（`X-XSS-Protection: 0`）。
+4. L64〜65: `param` を文字の配列（`toCharArray()`）にし、先頭から `length` 文字をレスポンスに書く（sink）。
+
+なぜ危ないのか:
+
+- パラメータの名前は、攻撃者が自由に決められる。URL エンコード（`<` を `%3C` のように `%` と 16 進数で書くこと）を使えば、`<` `>` `"` も名前に入れられる。
+- その名前を、HTML エスケープ（`<` などを別の書き方に置き換えること）せずに出力している。
+
+攻撃の入力の例:
+
+- `?%3Cscript%3Ealert(1)%3C/script%3E=BenchmarkTest00036` のような URL を被害者に踏ませる（"xssの詳細" の攻撃例の形）。
+- サーブレットのコンテナ（Tomcat などの実行環境）がパラメータ名をデコードするので、`param` は `<script>alert(1)</script>` になる。
+- L65 はそれをそのまま出力し、ブラウザは `<script>` をタグと解釈して `alert(1)` を実行する。
+
+### 2. 修正の内容
+
+元の L64〜65 の 2 行を、修正コードの L47〜51 に置き換えた（L47・L48 は【修正】コメント）。ほかの行は元のままである。
+
+#### 修正 1: パラメータ名を ESAPI の encodeForHTML で HTML エンコードし、エンコード後の文字列とその長さで出力する（元のコード L64〜65 → 修正コード L47〜51）
+
+修正前:
+```java
+ 64	            length = param.length();
+ 65	            response.getWriter().write(param.toCharArray(), 0, length);
+```
+
+修正後:
+```java
+ 47	            // 【修正】出力前に ESAPI の encodeForHTML で HTML エンティティ化し、パラメータ名に含まれるタグが解釈されないようにする。
+ 48	            // 【修正】length はエンコード後の文字列から求める（エンコードで文字数が増えるため）。
+ 49	            String encoded = org.owasp.esapi.ESAPI.encoder().encodeForHTML(param);
+ 50	            length = encoded.length();
+ 51	            response.getWriter().write(encoded.toCharArray(), 0, length);
+```
+
+各行の意味:
+
+- L49 `org.owasp.esapi.ESAPI.encoder().encodeForHTML(param)`:
+  - ESAPI は OWASP のセキュリティ用ライブラリ。`encoder()` で文字列を変換する Encoder を取り出し、`encodeForHTML` で HTML 本文用に変換する。完全修飾名（パッケージ名から書いた名前）なので import は要らない。
+  - 英数字と `, . - _ 空白` 以外は、すべて文字参照になる。文字参照は、`&lt;` のように文字を別の書き方で表したもの。ブラウザは文字として表示するが、タグの始まりとは見なさない。
+  - `< > & "` は `&lt; &gt; &amp; &quot;` に、それ以外の記号は `&#x27;` のような 16 進数の形に、制御文字は `&#xfffd;` になる（検証の記録による）。
+  - 結果を新しい変数 `encoded` に入れる。元の `param` は書き換えない。
+- L50 `length = encoded.length()`: 書き出す文字数を、エンコード後の文字列から求め直す。
+  - エンコードすると文字数が増える。例えば `<a>`（3 文字）は `&lt;a&gt;`（9 文字）になる。
+  - 元のように `param.length()` のままだと、コードの上では先頭の 3 文字 `&lt` しか書かれず、出力が途中で切れる。コメント L48 は、これを避けるためと説明している。
+- L51 `write(encoded.toCharArray(), 0, length)`: エンコード後の文字列を文字の配列にし、0 文字目から `length` 文字、つまり全部を書く。
+
+なぜこれで XSS が防げるのか:
+
+- 出力先は HTML 本文のテキストだけで、属性の中やスクリプトの中ではない。
+- encodeForHTML の後には、生の `<` `>` `"` `'` も、文字参照でない `&` も残らない。パラメータ名にどんな文字があっても、タグや属性にはならない。
+
+### 3. 修正の結果
+
+攻撃の入力の出力（ESAPI の規則に従って求めたもの）:
+
+- パラメータ名 `<script>alert(1)</script>` は、`&lt;script&gt;alert&#x28;1&#x29;&lt;&#x2f;script&gt;` と出力される。
+- 画面には `<script>alert(1)</script>` という文字が表示されるだけで、スクリプトは実行されない。
+
+正常な入力での動作:
+
+- 英数字の名前や、`_ - . , 空白` を含む名前は、元のコードとバイト単位で同じ出力になる（検証で確認）。
+- 日本語などの名前は `&#x540d;&#x524d;` のような文字参照になるが、ブラウザでの表示は同じである。
+- 一致する値がないときやパラメータがないときは、`param` が空文字なので、元と同じく何も書かない。
+
+検証（プロンプトファイル2）で確かめたこと:
+
+- 構文: Java と javac がないため、コードを読んで確かめた。括弧の対応（`{}` 8/8、`()` 23/23、`[]` 2/2）はスクリプトで数えた。`ESAPI.encoder()`、`encodeForHTML(String)`、`PrintWriter.write(char[], int, int)` があり、型も合うことを確認した。
+- 依存: 同じコミットの pom.xml に esapi 2.7.0.0 があり、ESAPI.properties に DefaultEncoder の設定があることを確かめた。helpers/Utils.java でも同じ `encodeForHTML` を使っている。
+- 攻撃の入力: サーブレットの処理と ESAPI の変換規則を Python で再現し、パラメータ名に 19 種類の入力を入れて、出力を html.parser で解析した。
+  - 入力は、script・img・svg、引用符で抜けるもの、コメント、`</title>` 抜け、`javascript:`、二重 URL エンコード、実体参照を先に入れたもの、NUL、タブ、全角の＜＞、BMP 外の文字、5000 文字の入力など。
+  - 元のコードでは 14 種類でタグかコメントができた。
+  - 修正後は 19 種類すべてで、タグは 0、生の `< > " '` も文字参照でない `&` も出ず、表示される文字は入力どおりだった。
+- 正常な入力: 英数字の名前、`_ - . , 空白` を含む名前、一致する値なし、パラメータなし、2 番目の値で一致、の各場合で、出力が元とバイト単位で同じことを確かめた。
+- 本物の ESAPI（Java）は実行しておらず、Python で再現した規則による確認である。
+
+残った注意点（検証で「不備ではない」とされたもの）:
+
+- L44 の `X-XSS-Protection: 0` は残っているが、出力をエンコードしたので XSS の成立には関係しない。
+- L45 の `int length = 1` と、常に真になる L46 の `if (param != null)` は元のコードのまま。動作には影響しない。
+
+## No.9 OWASP BenchmarkPython BenchmarkTest00096.py
+
+- XSS の種別: 反射型（POST パラメータが保存されずに、そのレスポンスへ直接返される）
+- source（ユーザーの入力）: L31 `request.form.get("BenchmarkTest00096")`（フォームから POST された値）
+- sink（出力先）: L50〜54 の f 文字列への埋め込みと `return RESPONSE`（Flask の text/html のレスポンス本文）
+- 修正したファイル: testcode/BenchmarkTest00096.py
+- 検証（プロンプトファイル2）の結果: 問題なし
+
+OWASP Benchmark の Python 版のテストケースである。Flask（Python の Web アプリ用フレームワーク）の上で動く。`init(app)` が、URL `/benchmark/xss-00/BenchmarkTest00096` の GET と POST の処理を登録する。GET の処理は POST の関数を呼ぶだけである。XSS 以外の脆弱性はない（"xss以外の修正コード" で「なし・対象外」）。
+
+### 1. 元のコードの問題
+
+元のコードの関係する部分:
+
+```python
+ 19	from helpers.utils import escape_for_html
+ …
+ 27		@app.route('/benchmark/xss-00/BenchmarkTest00096', methods=['POST'])
+ 28		def BenchmarkTest00096_post():
+ 29			RESPONSE = ""
+ 30	
+ 31			param = request.form.get("BenchmarkTest00096")
+ 32			if not param:
+ 33				param = ""
+ 34	
+ 35			possible = "ABC"
+ 36			guess = possible[0]
+ …
+ 38			match guess:
+ 39				case 'A':
+ 40					bar = param
+ 41				case 'B':
+ 42					bar = 'bob'
+ …
+ 49			otherarg = "static text"
+ 50			RESPONSE += (
+ 51				f'bar is \'{bar}\' and otherarg is \'{otherarg}\''
+ 52			)
+ 53	
+ 54			return RESPONSE
+```
+
+値の流れ:
+
+1. L31: フォームの BenchmarkTest00096 の値を `param` に入れる（source）。L32〜33 で、値がなければ空文字にする。
+2. L35〜36: `guess` は `"ABC"` の 0 文字目なので、いつも `'A'` になる。
+3. L38〜40: `match` 文（値によって処理を分ける構文）は、いつも `case 'A'` に入り、`bar = param` になる。定数を入れる分岐（`'B'` や `_`）には入らない。
+4. L50〜52: f 文字列（`{ }` の中の式の値を埋め込む文字列）で、`bar` をそのまま埋め込む。
+5. L54: `RESPONSE` を返す（sink）。Flask は、関数が返した文字列を Content-Type: text/html のレスポンスとして送る。ブラウザは HTML として解釈する。
+
+なぜ危ないのか:
+
+- `bar` を HTML エスケープ（`<` などを別の書き方に置き換えること）せずに埋め込んでいる。
+- L19 でエスケープ用の関数 `escape_for_html` を import しているのに、使っていない（"脆弱性の詳細" の指摘）。
+
+攻撃の入力の例:
+
+- 攻撃者は、自分のサイトに、この URL へ POST する自動送信フォームを置く。BenchmarkTest00096 の欄にスクリプトを入れておく（"xssの詳細" の攻撃例）。
+- 値が `<script>alert(1)</script>` のとき、元のコードは `bar is '<script>alert(1)</script>' and otherarg is 'static text'` を返す。
+- ブラウザは `<script>` をタグと解釈し、対象サイトのオリジン（サイトを区別する単位。スキーム・ホスト・ポートの組）で `alert(1)` を実行する。
+
+### 2. 修正の内容
+
+f 文字列の 1 行（元の L51）を、修正コードの L34〜35 に置き換えた（L34 は【修正】コメント）。ほかの差分は、空白だけの行の行末の空白の削除（元 L37 → 修正 L20）、ファイル末尾の空行の削除、ライセンスヘッダの省略だけで、動作には関係しない。
+
+#### 修正 1: bar を escape_for_html で HTML エンティティ化してから埋め込む（元のコード L51 → 修正コード L34〜35）
+
+修正前:
+```python
+ 51				f'bar is \'{bar}\' and otherarg is \'{otherarg}\''
+```
+
+修正後:
+```python
+ 34				# 【修正】ユーザー入力由来の bar を、import 済みの escape_for_html で HTML エンティティ化してから埋め込む。
+ 35				f'bar is \'{escape_for_html(bar)}\' and otherarg is \'{otherarg}\''
+```
+
+- 変更点は、`{bar}` を `{escape_for_html(bar)}` にしたことだけである。f 文字列の中で関数を呼び、その戻り値を埋め込む。
+- `escape_for_html` は、元のファイルの L19（修正コードの L2）で import 済みの関数である。新しい import は増えていない。
+
+`escape_for_html` の中身（同じコミットの helpers/utils.py L42〜57。検証で取得して読んだもの）:
+
+```python
+ 33	html_entity_names = {
+ 34		34: 'quot',
+ 35		38: 'amp',
+ 36		60: 'lt',
+ 37		62: 'gt'
+ …
+ 42	def escape_for_html(s: str):
+ 43		immune = [',', '.', '-', '_', ' ']
+ 44		ret = ''
+ 45	
+ 46		for c in s:
+ 47			if c.isalnum() or c in immune:
+ 48				ret += c
+ 49			elif (ord(c) <= 0x1f and (c != '\t') and (c != '\n') and (c != '\r')) or (0x7f <= ord(c) and ord(c) <= 0x9f):
+ 50				# illegal character
+ 51				ret += '&#xfffd;'
+ 52			elif ord(c) in html_entity_names:
+ 53				ret += f'&{html_entity_names[ord(c)]};'
+ 54			else:
+ 55				ret += f'&#x{hex(ord(c))[2:]};'
+ 56	
+ 57		return ret
+```
+
+- L46: 入力を 1 文字ずつ調べる。
+- L47〜48: 英数字（`isalnum()` が真の文字。日本語の文字なども含む）と、`immune` の 5 文字（`, . - _` と空白）は、そのまま残す。
+- L49〜51: 制御文字（タブ・改行・復帰以外の 0x00〜0x1f と、0x7f〜0x9f）は、`&#xfffd;`（置換文字 �）にする。
+- L52〜53: `"` `&` `<` `>` は、`&quot;` `&amp;` `&lt;` `&gt;` という名前付きの文字参照にする。文字参照は、文字を別の書き方で表したもの。ブラウザは `<` という文字として表示するが、タグの始まりとは見なさない。
+- L54〜55: 残りの文字は、すべて `&#x` + 16 進数 + `;` の文字参照にする（`'` は `&#x27;`、`/` は `&#x2f;`、`=` は `&#x3d;`、`(` は `&#x28;`）。
+
+なぜこれで XSS が防げるのか:
+
+- 埋め込む場所は HTML 本文のテキストである。前後の `'` はただの文字で、属性の引用符ではない。
+- エスケープ後には、生の `<` `>` `"` `'` も、文字参照でない `&` も残らない。そのため、タグも属性も作れない。
+- `bar` が出力されるのはこの 1 か所だけで、GET の処理も同じ関数を通る。どの経路でもエスケープを通る。
+
+### 3. 修正の結果
+
+攻撃の入力の出力（escape_for_html の実装に従って求めたもの）:
+
+- 値 `<script>alert(1)</script>` のとき、修正コードは次の文字列を返す。
+  `bar is '&lt;script&gt;alert&#x28;1&#x29;&lt;&#x2f;script&gt;' and otherarg is 'static text'`
+- 画面には `bar is '<script>alert(1)</script>' and otherarg is 'static text'` という文字が表示されるだけで、スクリプトは実行されない。
+
+正常な入力での動作:
+
+- 英数字・空白・`, . - _`・日本語の入力は、出力の文字列が元と完全に同じである（`isalnum()` が日本語も英数字として扱うため）。
+- 記号や改行を含む入力は、その文字が文字参照になるが、ブラウザでの表示は元と同じである。
+- 制御文字は U+FFFD（�）として表示されるようになる。検証では「安全側への変化」としている。
+
+検証（プロンプトファイル2）で確かめたこと:
+
+- 構文と読み込み: 元のコードと修正コードの両方で `ast.parse`（Python の構文解析）が通った。Flask の代わりの最小のスタブ（まねをする部品）の上で読み込み、`init(app)` で GET と POST のルートが登録されることを確かめた。
+- 攻撃の入力 28 種: script・img・svg などのタグ、大文字や大小混在、`'>` や `">` で抜けるもの、`&lt;` や `&#60;` による二重解釈、`%3C`、NUL や制御文字、全角の＜＞、UTF-7、孤立サロゲート、10 万文字などを試した。
+  - 修正版の出力には、生の `<` `>` `"` `'` `=` とバッククォート（`` ` ``）も、文字参照でない `&` も出ず、html.parser で解析してもタグは 0 個だった。
+  - 元のコードでは、同じ入力でタグが最大 3 個解析された。
+- 全コードポイント（0〜0x10FFFF）: escape_for_html の出力が、どの文字でも「元の 1 文字そのまま」か「正しい形の文字参照 1 個」であることを確かめた。HTML の特殊文字がそのまま出るものはなかった。
+- HTTP 経由: 127.0.0.1 でスタブのサーバを起動し、curl で `%3C`、二重符号化の `%253C`、不正な UTF-8 の `%C0%BC`、同名パラメータ 2 つ、クエリ付きの GET を送った。元のコードはタグをそのまま返し、修正コードはすべて文字参照で返した。
+- 正常な入力 14 種と、パラメータなし・空文字・GET: 英数字・空白・日本語では出力が元と同じ、記号を含むものは文字参照を戻すと元と同じ、を確かめた。
+- 実際の Flask はこの環境になく、スタブでの確認である。Content-Type が text/html になる点も、Flask の既定の動作をまねたもので、実物では確かめていない。
+
