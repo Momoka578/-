@@ -1,0 +1,296 @@
+## No.45 KoryNunn/list-n-stream server.js (prePatch 87de3f1)
+
+- 検証した修正コード: "xss以外の修正コード"
+- 検証結果: **不備あり** — CWE-22（判定の根拠）と補足の XSS 3 か所は直った。ただし path.resolve で .. を文字列として消す一方、HTML の URL は生のリクエストから作るため、//evil.example/..%2f のような URL で一覧のリンクと ?view の video src が外部ホストを指す（元は 500）。説明の「生のリクエストでしか起きない」は成り立たない（重大度は低い）。修正コード2: 検査を通ったパスからルート相対の URL を部品ごとに encodeURIComponent して作り、生の request.url を使わない
+- 修正コード2 のファイル: server.js
+- 親の確認: server.js: node --check で構文エラーなし。エージェントが読み取り専用の材料（orig・given）を変えていないこと、読まない範囲のファイルを読んでいないことを、記録で確認した。
+- 使用トークン量（検証）: 新規 79,808（入力 30 ／ キャッシュ作成 47,304 ／ 出力〔推定〕 32,474）、キャッシュ読込 531,005、総処理 610,813、リクエスト 15 回
+- 使用トークン量（再修正）: 新規 38,009（入力 18 ／ キャッシュ作成 23,183 ／ 出力〔推定〕 14,808）、キャッシュ読込 683,529、総処理 721,538、リクエスト 9 回
+
+- 検証した修正コード: `fix_nx_2/server.js`（CWE-22 の修正と、補足の XSS の修正を両方含む最終版）。`fix_nx_1/server.js` も同じテストで比べた。
+- 修正コード2: `fix2/server.js`（`fix_nx_2/server.js` をもとに、不備の箇所だけを直したもの）
+- 判定の根拠の CWE-22（パストラバーサル）と、補足の XSS（CWE-79）は、元の修正コードで直っていた。不備は、修正で新しく入った問題 1 件。重大度は低い。
+
+### 元の修正コードの不備
+
+#### 不備1: パスの正規化を入れたことで、攻撃者が選んだ外部ホストを指すリンク・動画の読み込み先を、正規のサーバのページに出させられるようになった（プロトコル相対 URL の注入。オープンリダイレクト型のリンク改ざん／コンテンツのなりすまし。CWE-601 に近い）
+
+- 該当箇所（`fix_nx_2/server.js`）
+  - 128 行: `var path = pathHelpers.resolve(root, '.' + pathHelpers.sep + requestedPath);`
+    - '..' を字句的に（ディスクを見ずに文字列として）解決する。CWE-22 の対策としては正しい。ただし、実在しない部品の後ろの '..' も消えるので、元のコードでは 500 だった要求が、ルートの一覧やファイルの表示として通るようになった。
+  - 54 行: `var currentPath = urlHelpers.parse(request.url).pathname;`
+  - 62 行: `return '<a href="' + escapeHtml(currentPath) + (currentPath === '/' ? '' : '/') + escapeHtml(fileName) + '?view">' + ...`
+  - 82 行: `'<video src="' + escapeHtml(urlBits[0]) + '" autoplay controls></video>'`
+    - どれも、HTML に入れる URL のパスを生のリクエスト（request.url）からそのまま作っている。escapeHtml は属性値から抜け出すことを防ぐだけで、値が `//ホスト名` で始まること（ブラウザはプロトコル相対 URL、つまり別のホストへの URL と解釈する）は防げない。
+- 問題になる入力と起きること（実際に確認した）
+  - `http://<サーバ>//evil.example/..%2f`（一覧）
+    - `..%2f` は WHATWG URL の dot セグメント（`..` `.%2e` `%2e.` `%2e%2e`）に当たらない。そのため、ブラウザは正規化せずにこのまま送る（Node の `new URL()` で、pathname が `//evil.example/..%2f` のまま残ることを確かめた）。
+    - beeline が `%2f` をデコードして details.path = `/evil.example/../` になる。128 行の path.resolve が `evil.example/..` を消してルートに解決するので、200 で一覧が返る。
+    - 一覧のリンクは `href="//evil.example/..%2f/<ファイル名>?view"` になる。ブラウザの解決先は `http://evil.example/..%2f/<ファイル名>?view`（外部ホスト）になる。テストでは、一覧の 13 個のリンクがすべて外部ホストを指した。
+  - `http://<サーバ>//evil.example/..%2fvideo.mp4?view`（動画ページ）
+    - 200 で `<video src="//evil.example/..%2fvideo.mp4" autoplay controls>` が返る。正規のサーバの URL のページで、攻撃者のホストの動画が自動再生される。そのとき閲覧者の IP アドレスと Referer も外部ホストに送られる。
+  - 元のコードでは、上の 2 つはどちらも 500 になった。fs.stat ではカーネルがパスを部品ごとに解決するので、実在しない `evil.example/..` は ENOENT になる。元のコードで同じことが起きるのは、`//sub/..%2f` のように、公開ルートに実在するディレクトリ名をホストにした場合だけ。攻撃者が任意のホストを選ぶことはできなかった。つまり、修正によって新しく到達できるようになった問題である。
+  - スクリプトは実行できない（XSS ではない）。ただし、被害者に正規サイトの URL を 1 回開かせれば、その後の遷移先や表示される動画を攻撃者のものにできる。修正の説明では、この点を「生のリクエスト `//evil.example/..` で起きる」として対象外にしていた。実際には、ブラウザがそのまま送れる URL（`..%2f`）で起きるので、対象外とした理由は妥当でない。
+- 関連（元からある点。同じ原因なので、再修正で一緒に防いだ）
+  - 62 行では、ファイル名を URL として符号化していない。そのため、公開ルートに `\evil.example.mp4` のような名前のファイルを置くと、ルートの一覧で `href="/\evil.example.mp4?view"` になる。ブラウザは http の URL の `\` を `/` として扱うので、`http://evil.example.mp4/?view`（外部ホスト）へのリンクになる（実際に確認した）。ファイルを置ける攻撃者が前提で、補足の XSS と同じ条件である。
+
+### 再修正の内容
+
+方針: HTML に入れる URL のパスを、生のリクエストから作るのをやめる。かわりに「公開ルートの中にある」と確認したファイルシステム上のパスから作り直す。CWE-22 の検査（root・rootPrefix・403・400）と escapeHtml は、元の修正コードのまま残した。変更は、URL を作る 1 つの関数の追加と、その値を使う 3 か所だけにした。
+
+1. `toUrlPath(root, fsPath)` を追加した（`fix2/server.js` 47〜61 行）
+   ```js
+   function toUrlPath(root, fsPath){
+       var relativePath = pathHelpers.relative(root, fsPath);
+       if(!relativePath){
+           return '/';
+       }
+       return '/' + relativePath.split(pathHelpers.sep).map(encodeURIComponent).join('/');
+   }
+   ```
+   - 403 の検査を通った path について、ルートからの相対パスを path.relative で求める。それを区切り文字（Linux では `/`、Windows では `\`）で部品に分け、部品ごとに encodeURIComponent で符号化して `/` でつなぐ。ルート自身なら `/` を返す。
+   - 例: ルート/sub/clip.mp4 は `/sub/clip.mp4`、ルート/100%.mp4 は `/100%25.mp4`、ルート/\evil.example.mp4 は `/%5Cevil.example.mp4`、ルート自身は `/`。
+   - この方法にした理由:
+     - path はルートの中と確認済みなので、相対パスは `..` で始まらず、空の部品もない。先頭は必ず `/` 1 つになり、`//ホスト名` や `/\ホスト名` で始まる値にはならない。
+     - 要求側の書き方（`..%2f`、`//`、`./` など）は残らず、正規化済みのパスだけが出力に入る。生の値を後から消毒するより、確認済みの値から作り直すほうが、書き方の違いによる抜け道が残らない。
+     - 部品ごとに encodeURIComponent するので、名前に含まれる `\` `%` `?` `#` `"` `<` `>` などが、URL の区切り・クエリ・フラグメントや HTML の記号として解釈されない。符号化した値は、beeline が decodeURIComponent で元の名前に戻すので、そのファイルが開ける。
+2. ルーター（`fix2/server.js` 162〜174 行）
+   - 403 の検査の直後に `var urlPath = toUrlPath(root, path);` を加えた。これを serveDir と serveFile の最後の引数として渡す。
+   - serveDir と serveFile には、引数 `urlPath` を 1 つずつ足した（64 行・97 行）。
+3. ディレクトリ一覧（serveDir、71〜84 行）
+   - `var currentPath = urlHelpers.parse(request.url).pathname;` を `var currentPath = urlPath;` に変えた。
+   - href の中のファイル名を `escapeHtml(fileName)` から `escapeHtml(encodeURIComponent(fileName))` に変えた。URL として符号化した後、念のため HTML としてもエスケープする（encodeURIComponent は `'` を符号化しないため。属性値は `"` で囲んでいるので、`'` はもともと抜け出しには使えない）。
+   - リンクの表示文字列（a 要素の内容）は、これまでどおり `escapeHtml(fileName)` だけにした。人が読む名前はそのまま見える。
+   - 一覧の先頭の `<a href="../">../</a>` は相対 URL で、外部ホストにはならないので変えていない。
+4. ?view の動画ページ（serveFile、102〜107 行）
+   - src に入れる値を `escapeHtml(urlBits[0])` から `escapeHtml(urlPath)` に変えた。`//evil.example/..%2fvideo.mp4?view` が来ても、`<video src="/video.mp4">` になる。
+   - Content-Type を決める `urlBits[0].split('.').pop()`（拡張子の取り出し）は、表示に出ない値なので変えていない。
+
+動き: `/`、`/sub/`、`/video.mp4?view` などの通常の要求は、これまでと同じページを返す（リンク先の URL の書き方だけが正規化される）。`//evil.example/..%2f` のような要求が来ても、一覧のリンクと動画の src は、すべて同じサーバの `/...` を指す。
+
+### 確認した内容と結果
+
+環境: Node v22.22.1。同じコミットの package.json の指定どおり、beeline@~0.2.1（0.2.4 が入った）と commander@~2.1.0 を `$R/bench` に `npm install --ignore-scripts` で入れた。サーバは `$R/bench/force-localhost.js`（`-r` で読み込み、listen を 127.0.0.1 に固定する）を付けて起動した。`$R/bench/runner.js` で生の HTTP リクエスト（URL を正規化しないもの）を送り、`$R/bench/linkcheck.js` で一覧のリンクをブラウザと同じ規則（`new URL`）で解決してたどった。公開ルートは `$R/bench/work/www`。
+
+- 構文確認: `node --check fix2/server.js` は OK。`-p` のポート指定で起動でき、`serving ...` を出力した。
+- 不備1の入力（修正コード2）:
+  - `//evil.example/..%2f` は 200。一覧のリンクはすべて `/<符号化した名前>?view` になり、linkcheck では外部ホストを指すリンクが 0 件、全リンクが 200 でたどれた（元の修正コードでは 13 件すべてが外部ホストを指した）。
+  - `//evil.example/..%2fvideo.mp4?view` は `<video src="/video.mp4">`。`//evil.example/%2e%2e%2fsub/` は `href="/sub/clip.mp4?view"`。生のバックスラッシュを使った `/\evil.example/..%2fvideo.mp4?view` は `src="/video.mp4"`。`/sub/./"/..?x` は `href="/sub/clip.mp4?view"`。
+  - `\evil.example.mp4` のリンクは `href="/%5Cevil.example.mp4?view"` になった。同じホストの 200 で、外部ホストへのリンクにはならない（元の修正コードでは `http://evil.example.mp4/?view` になった）。
+- CWE-22 の回帰確認（元の修正コードと同じ結果）:
+  - 403: `/../secret.txt`、`/../../../../etc/passwd`、`/%2e%2e/secret.txt`、`/..%2fsecret.txt`、`/%2E%2E%2Fsecret.txt`、`/.%2e/secret.txt`、`/sub/../../secret.txt`、`/../www-secret/s.mp4`（名前の頭が同じ隣のディレクトリ）、`/..`、`/../`、`/../../../../etc/`、`http://127.0.0.1/../secret.txt`、Range 付きの `/../secret.mp4`、`/../secret.mp4`、`/%2e%2e%2fsecret.mp4`。
+  - 400: `/video.mp4%00.txt`（NUL）。
+  - 500（ルートの中で解決され、存在しない）: `//etc/passwd`、`/%2fetc%2fpasswd`、`/%252e%252e/secret.txt`（二重符号化）、`/..%5csecret.txt`。
+  - 500（beeline）: `/%E0%A4%A`（不正な % 符号）。
+- XSS の回帰確認: `"><img src=x onerror=alert(1)>.mp4`、`'onmouseover=alert(2) x='.mp4`、`a&b.mp4` の一覧と ?view で、href と src は符号化かつエスケープされ、表示文字列はエスケープされた。属性からもタグからも抜け出せない。
+- 正常な動作:
+  - `/` `/sub/` `/sub` `/dir%20with%20space/` の一覧は 200。
+  - `/video.mp4` は 200（Content-Type: video/mp4、Content-Length: 1000）。`Range: bytes=0-9` は 206（Content-Range: bytes 0-9/1000）。
+  - `/video.mp4?view` は `<video src="/video.mp4">`（元と同じ）。`/sub/clip.mp4` と `/100%25.mp4` は 200。日本語名の ?view は `src="/%E3%81%82…"` で 200。存在しないファイルは 500（元と同じ）。
+  - linkcheck で `/` `/sub/` `/dir%20with%20space/` の一覧の全リンクをたどり、?view のページと、その src の動画が、すべて 200 で返ることを確かめた。元の修正コードでは、`100%.mp4` と `q?x#y.mp4` のリンクが 500 になっていた。修正コード2では、どちらも 200 でたどれる。
+
+### 副作用・残る点
+
+- 動作の変化（意図したもの）:
+  - 一覧のリンクと ?view の src は、要求の書き方ではなく正規化したパスで出力する。`/sub/` の一覧のリンクは、`/sub//clip.mp4?view` から `/sub/clip.mp4?view` になった。どちらでも同じファイルが開く。
+  - ファイル名は href の中で符号化して出力する（空白は `%20`、`%` は `%25`、日本語は `%E3…`）。ブラウザが送る URL は実質的に同じ。名前に `%` `?` `#` を含むファイルのリンクは、元のコードでは動かなかったが、動くようになった。
+- 要求そのもの（`//evil.example/..%2f`）は、これまでどおりルートの一覧として 200 を返す。ルートの中に解決されるので、ファイルを読まれる問題はない。出力のリンクはすべて自分のサーバを指す。
+- `urlHelpers`（require('url')）は使わなくなったが、変更を最小にするため require は残した。
+- 直していない点（元からある問題。今回の不備とは別で、元のコード・元の修正コードとも同じ）:
+  - 公開ルートの中にある、外を指すシンボリックリンクはたどる（realpath での検査はしていない）。リンクを置けるのはサーバの運用者なので、攻撃者の入力で外に出る CWE-22 とは別の問題とした。
+  - mimeTypes にない拡張子のファイル（readme.txt など）を要求すると、Node 22 では `writeHead` の `Content-Type: undefined` が ERR_HTTP_INVALID_HEADER_VALUE を投げ、プロセスが落ちる。
+  - `Range: bytes=abc` や `bytes=9-2` を送ると、fs.createReadStream が ERR_OUT_OF_RANGE を投げ、プロセスが落ちる（誰でも送れる DoS）。
+  - これらは判定の対象外で、修正で入ったものでもないので、変更を必要な範囲にとどめるため直していない。text/html に charset がない点も同じ。
+
+### 修正コード2 の全文: server.js
+
+```javascript
+#! /usr/bin/env node
+
+var http = require('http');
+var fs = require("fs");
+var pathHelpers = require('path');
+var beeline = require('beeline');
+var packageJson = require('./package');
+var program = require('commander');
+var querystring = require('querystring');
+var urlHelpers = require('url');
+
+
+program
+  .version(packageJson.version)
+  .option('-p, --port [port]', 'Run on a custom port')
+  .parse(process.argv);
+
+function serverError(response, error){
+    console.log(error);
+    response.statusCode = 500;
+    response.end();
+}
+
+// 【修正】公開ルート外へのアクセスやパスとして不正な値を拒否するための応答
+function clientError(response, statusCode){
+    response.statusCode = statusCode;
+    response.end();
+}
+
+// 【修正】HTML に埋め込む値をエスケープする（XSS 対策、CWE-79）。
+// & < > " ' を文字参照に置き換え、属性値（"..."）や要素の内容から抜け出して
+// タグや属性・スクリプトを差し込めないようにする。
+var htmlEscapes = {
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&#39;'
+};
+
+function escapeHtml(value){
+    return String(value).replace(/[&<>"']/g, function(character){
+        return htmlEscapes[character];
+    });
+}
+
+// 【修正2】HTML に入れる URL のパスを、生のリクエスト（request.url）からではなく、
+// 公開ルートの中にあると確認済みのファイルシステム上のパスから作り直す。
+// 例: ルート/sub/clip.mp4 -> "/sub/clip.mp4"、ルート自身 -> "/"。
+// ・先頭は必ず "/" 1 つになり、"//evil.example/..%2f" のような要求でも
+//   "//ホスト名" で始まるプロトコル相対 URL（外部ホストへのリンク）にならない。
+// ・".." や "%2f" などの要求側の書き方は残らない（正規化済みのパスだけを使う）。
+// ・各部品を encodeURIComponent で符号化するので、"\" "%" "?" "#" などを含む名前でも
+//   ブラウザが別の意味（区切り・クエリ・フラグメント）に解釈しない。
+function toUrlPath(root, fsPath){
+    var relativePath = pathHelpers.relative(root, fsPath);
+    if(!relativePath){
+        return '/';
+    }
+    return '/' + relativePath.split(pathHelpers.sep).map(encodeURIComponent).join('/');
+}
+
+// 【修正2】urlPath（toUrlPath で作った正規化済みの URL のパス）を受け取る引数を追加した。
+function serveDir(request, response, path, urlPath){
+    fs.readdir(path, function(error, files){
+        if(error){
+            serverError(response, error);
+            return;
+        }
+
+        // 【修正2】urlHelpers.parse(request.url).pathname（生のリクエスト由来）をやめ、
+        // 確認済みのパスから作った urlPath を使う。
+        var currentPath = urlPath;
+
+        response.writeHead(200, {"Content-Type": "text/html"});
+        response.end(
+            '<a href="../">../</a><br>' +
+            files.map(function(fileName){
+            // 【修正】currentPath（リクエストの URL 由来）と fileName（ディスク上のファイル名）を
+            // そのまま連結せず、エスケープしてから href 属性値と a 要素の内容に埋め込む。
+            // 【修正2】href の中の fileName は encodeURIComponent で URL として符号化してからエスケープする
+            // （"\evil.example" のような名前が "/\evil.example" = "//evil.example" と解釈されないようにする）。
+            // 表示する文字列（a 要素の内容）は、これまでどおりエスケープだけ。
+            return '<a href="' + escapeHtml(currentPath) + (currentPath === '/' ? '' : '/') + escapeHtml(encodeURIComponent(fileName)) + '?view">' + escapeHtml(fileName) + '</a>';
+        }).join('<br>'));
+    });
+}
+
+var mimeTypes = {
+    'avi': 'video/x-msvideo',
+    'mpg': 'video/mpeg',
+    'mpeg': 'video/mpeg',
+    'mp4': 'video/mp4'
+}
+
+// 【修正2】urlPath（toUrlPath で作った正規化済みの URL のパス）を受け取る引数を追加した。
+function serveFile(request, response, path, info, urlPath){
+    var urlBits = request.url.split('?');
+
+    if('view' in querystring.parse(urlBits[1])){
+        response.writeHead(200, {"Content-Type": "text/html"});
+        response.end(
+            '<style>html, body{margin:0;background:black;}video{height:100%;width:100%}</style>' +
+            // 【修正】URL のパスをエスケープしてから src 属性値に埋め込む。
+            // 【修正2】埋め込む値を urlBits[0]（生のリクエスト）から urlPath（確認済みのパスから作った値）に変えた。
+            // "//evil.example/..%2fvideo.mp4?view" でも src は "/video.mp4" になり、外部ホストの動画を読み込まない。
+            '<video src="' + escapeHtml(urlPath) + '" autoplay controls></video>'
+        );
+        return;
+    }
+
+    var total = info.size,
+        contentType = mimeTypes[urlBits[0].split('.').pop()];
+
+    // https://gist.github.com/paolorossi/1993068
+
+    if (request.headers['range']) {
+        var range = request.headers.range;
+        var parts = range.replace(/bytes=/, "").split("-");
+        var partialstart = parts[0];
+        var partialend = parts[1];
+
+        var start = parseInt(partialstart, 10);
+        var end = partialend ? parseInt(partialend, 10) : total-1;
+        var chunksize = (end-start)+1;
+
+        var file = fs.createReadStream(path, {start: start, end: end});
+        response.writeHead(206, { 'Content-Range': 'bytes ' + start + '-' + end + '/' + total, 'Accept-Ranges': 'bytes', 'Content-Length': chunksize, 'Content-Type': contentType });
+        file.pipe(response);
+    } else {
+        response.writeHead(200, { 'Content-Length': total, 'Content-Type': contentType });
+        fs.createReadStream(path).pipe(response);
+    }
+}
+
+var router = beeline.route({
+    '/`path...`': function(request, response, details){
+        // 【修正】公開ルート（process.cwd()）を絶対パスで求める。
+        // 末尾が区切り文字のとき（ルートが "/" など）は二重にしない。
+        var root = pathHelpers.resolve(process.cwd());
+        var rootPrefix = root.charAt(root.length - 1) === pathHelpers.sep ? root : root + pathHelpers.sep;
+        var requestedPath = String(details.path || '');
+
+        // 【修正】NUL 文字を含むパスは fs が例外を投げるため、先に 400 で拒否する。
+        if(requestedPath.indexOf('\0') !== -1){
+            clientError(response, 400);
+            return;
+        }
+
+        // 【修正】文字列連結（process.cwd() + '/' + details.path）をやめ、
+        // '..' などを解決した正規化済みの絶対パスを作る。
+        // 先頭に '.' + sep を付けて、絶対パス指定（'/etc/passwd' など）でもルート基準で解決させる。
+        var path = pathHelpers.resolve(root, '.' + pathHelpers.sep + requestedPath);
+
+        // 【修正】解決後のパスが公開ルートの中（ルート自身か、ルート + 区切り文字で始まる）に
+        // 収まっていなければ 403 を返し、fs.stat / readdir / createReadStream に渡さない。
+        if(path !== root && path.indexOf(rootPrefix) !== 0){
+            clientError(response, 403);
+            return;
+        }
+
+        // 【修正2】HTML に入れる URL のパスは、ルートの中と確認できたこの path から作る（生の request.url は使わない）。
+        var urlPath = toUrlPath(root, path);
+
+        fs.stat(path, function(error, info){
+            if(error){
+                serverError(response, error);
+                return;
+            }
+
+            if(info.isDirectory()){
+                serveDir(request, response, path, urlPath);
+            }else{
+                serveFile(request, response, path, info, urlPath);
+            }
+        });
+    }
+});
+
+var server = http.createServer(router);
+
+var port = program.port || process.env.PORT || 8080;
+
+server.listen(port);
+
+console.log('serving ' + __dirname + ' on ' + port);
+```
+
+---
