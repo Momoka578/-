@@ -1,0 +1,87 @@
+## No.46 CVE-2017-16098 node-modules/charset index.js（prePatch 5ba8a49）
+
+- 修正した脆弱性: 正規表現による DoS／ReDoS（CWE-400・CWE-1333）
+- 修正対象ファイル: index.js
+- 修正の内容:
+  - 3 行目の正規表現 `/(?:charset|encoding)\s*=\s*['"]? *([\w\-]+)/i` を `/(?:charset|encoding)\s*=\s*(?:['"] *)?([\w\-]+)/i` に変えた。引用符の後ろの空白 ` *` を、引用符があるときだけ使うグループ `(?:['"] *)?` に入れた。
+  - 空白にマッチする `\s*` と ` *` の間に必ず引用符 1 文字が入るので、2 つが同じ空白を取り合わなくなり、バックトラックが O(n^2) から O(n) になる。
+  - 防げること: 悪意あるサーバが「charset=＋大量の空白」の Content-Type ヘッダや本文先頭を返して、クライアントのイベントループを止めること。
+- 副作用・直さなかった点（エージェントの報告）:
+  - マッチする文字列と取り出す文字コード名は元の正規表現と同じで、動作は変わらない。
+  - 判定時のメモにあった `=[\s'"]*` に一本化する案は、引用符が複数ある入力なども受け付けて動作が変わるため採らなかった。正規表現が線形になったので、ヘッダの長さ制限も入れていない。
+- 確認:
+  - 親: 元ファイルとの差分が上の修正箇所（3 行目とコメント）だけであること、node --check で構文エラーがないことを確認した。
+  - エージェント（MARK END の後）: 通常の入力 14 件と、空白・タブ・引用符などを混ぜたランダム入力 20 万件で、元と結果が食い違わないことを確かめた（食い違い 0 件）。空白 n 個の後に「!」を置いた入力で、元は n=40000 で 1739 ms、修正版は 0.12 ms。修正版は n=1000 万でも約 80 ms だった。
+  - 修正ファイルは、書き出した後に直していない。
+- 使用トークン量（修正）: 新規 6,602（入力 4 ／ キャッシュ作成 2,811 ／ 出力〔推定〕 3,787）、キャッシュ読込 31,010、総処理 37,612、リクエスト 2 回
+
+```javascript
+'use strict';
+
+// 【修正】ReDoS 対策（CWE-400 / CWE-1333）。
+// 元の正規表現 /(?:charset|encoding)\s*=\s*['"]? *([\w\-]+)/i は、引用符が無い場合に
+// "=" の後ろの \s* と ' *' が同じ空白文字に重なってマッチできるため、
+// "charset=" + 大量の空白 + 単語文字以外 のような入力でバックトラックが O(n^2) になっていた。
+// 引用符の後ろの空白 ' *' を「引用符がある場合だけ」に限定するグループ (?:['"] *)? にまとめ、
+// 空白を食う量指定子が隣り合わないようにした（\s* と ' *' の間に必ず引用符 1 文字が入る）。
+// マッチする言語（受理する文字列と取り出す文字コード名）は元の正規表現と同じ。
+const CHARTSET_RE = /(?:charset|encoding)\s*=\s*(?:['"] *)?([\w\-]+)/i;
+
+module.exports = charset;
+
+/**
+ * guest data charset from req.headers, xml, html content-type meta tag
+ * headers:
+ *  'content-type': 'text/html;charset=gbk'
+ * meta tag:
+ *  <meta http-equiv="Content-Type" content="text/html; charset=xxxx"/>
+ * xml file:
+ *  <?xml version="1.0" encoding="UTF-8"?>
+ *
+ * @param {Object} obj `Content-Type` String, or `res.headers`, or `res` Object
+ * @param {Buffer} [data] content buffer
+ * @param {Number} [peekSize] max content peek size, default is 512
+ * @return {String} charset, lower case, e.g.: utf8, gbk, gb2312, ....
+ *  If can\'t guest, return null
+ * @api public
+ */
+function charset(obj, data, peekSize) {
+  let matchs = null;
+  let end = 0;
+  if (data) {
+    peekSize = peekSize || 512;
+    // https://github.com/node-modules/charset/issues/4
+    end = data.length > peekSize ? peekSize : data.length;
+  }
+  // charset('text/html;charset=gbk')
+  let contentType = obj;
+  if (contentType && typeof contentType !== 'string') {
+    // charset(res.headers)
+    let headers = obj;
+    if (obj.headers) {
+      // charset(res)
+      headers = obj.headers;
+    }
+    contentType = headers['content-type'] || headers['Content-Type'];
+  }
+  if (contentType) {
+    // guest from obj first
+    matchs = CHARTSET_RE.exec(contentType);
+  }
+  if (!matchs && end > 0) {
+    // guest from content body (html/xml) header
+    contentType = data.slice(0, end).toString();
+    matchs = CHARTSET_RE.exec(contentType);
+  }
+  let cs = null;
+  if (matchs) {
+    cs = matchs[1].toLowerCase();
+    if (cs === 'utf-8') {
+      cs = 'utf8';
+    }
+  }
+  return cs;
+}
+```
+
+---
