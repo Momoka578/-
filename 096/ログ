@@ -1,0 +1,155 @@
+## No.96 CVE-2020-15095 npm/cli lib/fetch-package-metadata.js（prePatch 479e45c）
+
+- 修正した脆弱性: 認証情報を含む URL の平文のログ出力（CWE-312・CWE-532）
+- 修正対象ファイル: lib/fetch-package-metadata.js
+- 修正の内容（行番号は元のファイル。変えたのは 2 か所だけ）:
+  - 17 行目の後: 関数 `redactUrlCredentials(str)` を加えた。文字列の中の URL について、`://` の直後から最初の `/ ? #` または空白までの区間（authority）にある最後の `@` までを `***` に置き換える（`str.replace(/:\/\/[^\s/?#]*@/g, '://***@')`）。例: `https://user:pass@host/x.tgz` → `https://***@host/x.tgz`。`git+https://TOKEN@github.com/...` のようにトークンがユーザー名側に入る形式もあるので、パスワードだけでなく userinfo 全体を伏せる。文字列でない値（er.message が undefined など）はそのまま返す。
+  - 22 行目（log.silly）: `String(spec)` と `er.message` の両方をこの関数に通してからログに出す。spec が npa の Result オブジェクトのときも、toString の結果を伏せる。
+- この修正で防げること: このログは silly レベルでも npmlog の log.record に残り、エラー終了時に npm-debug.log に書き出される（`--loglevel silly` ならコンソールにも出る）。そこから private レジストリや private git リポジトリの認証情報（ユーザー名・パスワード・トークン）が平文で漏れること。
+- 副作用・直さなかった点（エージェントの最終報告による）:
+  - `git+ssh://git@github.com:...` のような秘密でないユーザー名も `***` になる（ログの見た目が変わるだけ）。
+  - er は `done(er, pkg)` で呼び出し元にそのまま返しており、er.message を書き換えるとこのファイルの外の挙動まで変わるので、書き換えていない。呼び出し元や lib/utils/error-handler.js が er.message・er.stack を出す経路では、URL が出る可能性が残る。pacote・npm-registry-fetch の内部のログも、このファイルの範囲外なので対象外。
+  - `user:pass@host:path` のような scheme のない scp 形式は、URL として扱わないので対象外。
+- 確認（MARK END の後。修正ファイルは直していない）:
+  - 親とエージェント: node --check に問題なし。
+  - 親: エージェントが取得した元のファイルが、前回親が取得した prePatch のファイルと同じであることを確認した。
+  - エージェント: 修正ファイルから redactUrlCredentials と andLogAndFinish の定義だけを取り出し、validate と log をスタブにして動かした（npm 本体の依存は読み込んでいない）。redactUrlCredentials の 20 ケース（user:pass、トークンだけ、パスワードに `@` を含む、ポート付き、er.message の中の URL、1 つの文字列に URL が 2 つ。変わらないことの確認として、認証情報のない URL、クエリ・フラグメントの中の `@`、`lodash@^4`、`@scope/pkg@1.0.0`、`git@github.com:...`、`file:`、空文字、undefined、null）はすべて期待どおり。andLogAndFinish でも、spec が文字列の場合と toString を持つオブジェクトの場合の両方で、ログに `pass`・`TOKEN` が残らなかった。
+  - エージェント: 1MB 級の入力 6 種類（`://` の繰り返し、`@` の連続など）で 1.0〜3.2ms。正規表現による DoS の傾向はない。
+- 使用トークン量（修正）: 新規 10,661（入力 4 ／ キャッシュ作成 3,980 ／ 出力〔推定〕 6,677）、キャッシュ読込 31,380、総処理 42,041、リクエスト 2 回
+
+```javascript
+'use strict'
+
+const deprCheck = require('./utils/depr-check')
+const path = require('path')
+const log = require('npmlog')
+const readPackageTree = require('read-package-tree')
+const rimraf = require('rimraf')
+const validate = require('aproba')
+const npa = require('npm-package-arg')
+const npm = require('./npm')
+let npmConfig
+const npmlog = require('npmlog')
+const limit = require('call-limit')
+const tempFilename = require('./utils/temp-filename')
+const pacote = require('pacote')
+const isWindows = require('./utils/is-windows.js')
+
+// 【修正】ログに出す文字列の中の URL から認証情報（userinfo: user:password@ や token@）を伏せ字にする。
+// 「://」の直後から、最初の / ? # 空白 までの区間（authority）にある最後の「@」までを *** に置き換える。
+//   例: https://user:pass@registry.example.com/pkg.tgz → https://***@registry.example.com/pkg.tgz
+//       git+https://TOKEN@github.com/org/repo.git     → git+https://***@github.com/org/repo.git
+// トークンがユーザー名側に入る形式もあるため、パスワードだけでなく userinfo 全体を伏せる。
+// 正規表現は「://」から始まり区切り文字を越えないので、長い文字列でも処理時間は線形に収まる。
+function redactUrlCredentials (str) {
+  if (typeof str !== 'string') return str
+  return str.replace(/:\/\/[^\s/?#]*@/g, '://***@')
+}
+
+function andLogAndFinish (spec, tracker, done) {
+  validate('SOF|SZF|OOF|OZF', [spec, tracker, done])
+  return (er, pkg) => {
+    if (er) {
+      // 【修正】spec（npa の Result の toString を含む）と er.message を、認証情報を伏せてからログに出す。
+      // npmlog は silly レベルでも log.record に保持し、エラー終了時に npm-debug.log へ書き出すため。
+      log.silly('fetchPackageMetaData', 'error for ' + redactUrlCredentials(String(spec)), redactUrlCredentials(er.message))
+      if (tracker) tracker.finish()
+    }
+    return done(er, pkg)
+  }
+}
+
+const LRUCache = require('lru-cache')
+const CACHE = new LRUCache({
+  max: 300 * 1024 * 1024,
+  length: (p) => p._contentLength
+})
+
+module.exports = limit(fetchPackageMetadata, npm.limit.fetch)
+function fetchPackageMetadata (spec, where, opts, done) {
+  validate('SSOF|SSFZ|OSOF|OSFZ', [spec, where, opts, done])
+
+  if (!done) {
+    done = opts
+    opts = {}
+  }
+  var tracker = opts.tracker
+  const logAndFinish = andLogAndFinish(spec, tracker, done)
+
+  if (typeof spec === 'object') {
+    var dep = spec
+  } else {
+    dep = npa(spec)
+  }
+  if (!isWindows && dep.type === 'directory' && /^[a-zA-Z]:/.test(dep.fetchSpec)) {
+    var err = new Error(`Can't install from windows path on a non-windows system: ${dep.fetchSpec.replace(/[/]/g, '\\')}`)
+    err.code = 'EWINDOWSPATH'
+    return logAndFinish(err)
+  }
+  if (!npmConfig) {
+    npmConfig = require('./config/figgy-config.js')
+  }
+  pacote.manifest(dep, npmConfig({
+    annotate: true,
+    fullMetadata: opts.fullMetadata,
+    log: tracker || npmlog,
+    memoize: CACHE,
+    where: where
+  })).then(
+    (pkg) => logAndFinish(null, deprCheck(pkg)),
+    (err) => {
+      if (dep.type !== 'directory') return logAndFinish(err)
+      if (err.code === 'ENOTDIR') {
+        var enolocal = new Error(`Could not install "${path.relative(process.cwd(), dep.fetchSpec)}" as it is not a directory and is not a file with a name ending in .tgz, .tar.gz or .tar`)
+        enolocal.code = 'ENOLOCAL'
+        if (err.stack) enolocal.stack = err.stack
+        return logAndFinish(enolocal)
+      } else if (err.code === 'ENOPACKAGEJSON') {
+        var enopackage = new Error(`Could not install from "${path.relative(process.cwd(), dep.fetchSpec)}" as it does not contain a package.json file.`)
+        enopackage.code = 'ENOLOCAL'
+        if (err.stack) enopackage.stack = err.stack
+        return logAndFinish(enopackage)
+      } else {
+        return logAndFinish(err)
+      }
+    }
+  )
+}
+
+module.exports.addBundled = addBundled
+function addBundled (pkg, next) {
+  validate('OF', arguments)
+  if (pkg._bundled !== undefined) return next(null, pkg)
+
+  if (!pkg.bundleDependencies && pkg._requested.type !== 'directory') return next(null, pkg)
+  const requested = pkg._requested || npa(pkg._from)
+  if (requested.type === 'directory') {
+    pkg._bundled = null
+    return readPackageTree(pkg._requested.fetchSpec, function (er, tree) {
+      if (tree) pkg._bundled = tree.children
+      return next(null, pkg)
+    })
+  }
+  pkg._bundled = null
+  const target = tempFilename('unpack')
+  if (!npmConfig) {
+    npmConfig = require('./config/figgy-config.js')
+  }
+  const opts = npmConfig({integrity: pkg._integrity})
+  pacote.extract(pkg._resolved || pkg._requested || npa.resolve(pkg.name, pkg.version), target, opts).then(() => {
+    log.silly('addBundled', 'read tarball')
+    readPackageTree(target, (err, tree) => {
+      if (err) { return next(err) }
+      log.silly('cleanup', 'remove extracted module')
+      rimraf(target, function () {
+        if (tree) {
+          pkg._bundled = tree.children
+        }
+        next(null, pkg)
+      })
+    })
+  }, next)
+}
+```
+
+---
