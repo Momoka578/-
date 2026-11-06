@@ -1,0 +1,225 @@
+## No.82 CVE-2019-10744 lodash 4.17.11（prePatch 1f8ea07, lodash.js）
+
+- 検証した修正コード: "xss以外の修正コード"
+- 検証結果: **不備あり** — sourceURL の改行・variable の注入・Object.prototype 汚染のガジェット・baseSet のプロトタイプ汚染の 4 経路は直った。ただし _.template の imports のキーが検査なしで Function の仮引数名になるため、'a=式'・'{a=式}'・'[a=式]' のような own のキーで式が実行される（元のコード・元の修正コードとも 3 種で確認。_.templateSettings.imports も同じ）。修正コード2: importsKeys の各キーを variable と同じ reTemplateVariable（/^[A-Za-z_$][\w$]*$/）で検査し、合わなければ例外。攻撃 50 件すべてで実行なし、公式テスト 6,751 件が成功、正常な入力 37 件は説明の副作用 4 件以外は元と同じ。指摘: _.unset({}, '__proto__.toString') で Object.prototype.toString が消える（元から、範囲外）
+- 修正コード2 のファイル: lodash.js、lodash.js.patch
+- 親の確認: lodash.js: node --check で構文エラーなし／lodash.js.patch: 元のファイルに patch -F0 で当てた結果が lodash.js と一致。エージェントが読み取り専用の材料（orig・given）を変えていないこと、読まない範囲のファイルを読んでいないことを、記録で確認した。
+- 使用トークン量（検証）: 新規 105,217（入力 38 ／ キャッシュ作成 67,451 ／ 出力〔推定〕 37,728）、キャッシュ読込 1,091,166、総処理 1,196,383、リクエスト 19 回
+- 使用トークン量（再修正）: 新規 23,264（入力 14 ／ キャッシュ作成 11,960 ／ 出力〔推定〕 11,290）、キャッシュ読込 650,659、総処理 673,923、リクエスト 7 回
+
+- 修正コード2 のファイル: `fix2/lodash.js.patch`（元のファイル `orig/lodash.js` に対する unified diff。元の修正の 5 ハンクと今回の修正を合わせたもの。`patch -F0` で当てた全文が `fix2/lodash.js`）
+- 今回直したのは lodash.js の `_.template` だけ。元の修正（sourceURL の改行除去、variable の識別子検査、options・imports の own プロパティだけのコピー、baseSet の `__proto__`・`constructor`・`prototype` の拒否）は、そのまま残した。
+
+### 元の修正コードの不備
+
+#### 不備 1: `_.template` の `imports` のキーによるコード注入が残っている（判定の根拠 1 のコードインジェクションの別経路）
+
+- 場所: 元の修正コード `lodash.js` 14785〜14787 行（元のファイルでは 14768〜14770 行）
+
+  ```js
+  // 【修正】imports のキーは Function の引数名になるので、同じく own プロパティだけをコピーする。
+  var imports = assignWith({}, options.imports, settings.imports, customDefaultsAssignIn),
+      importsKeys = keys(imports),
+      importsValues = baseValues(imports, importsKeys);
+  ```
+
+  と、14880 行（元のファイルの 14851 行。判定の記録で sink とした行）
+
+  ```js
+  return Function(importsKeys, sourceURL + 'return ' + source)
+    .apply(undefined, importsValues);
+  ```
+
+- 問題: `imports` のキーの一覧 `importsKeys` は、テンプレート関数を作る `Function` の**仮引数名**としてそのまま渡される。元の修正は `assignInWith` を `assignWith` に替えて、汚染された `Object.prototype` から**継承されたキー**が入らないようにしただけで、`options.imports`（と `_.templateSettings.imports`）に **own のキーとして渡された文字列は検査していない**。
+  - `Function` の仮引数の部分では、既定値（`a=式`）や分割代入（`{a=式}`、`[a=式]`）の構文が正しく解釈される。対応する値が `undefined`・`{}`・`[]` のとき、既定値の式が評価される。`Function(...)` は直後に `.apply(undefined, importsValues)` で呼ばれるので、`_.template()` を呼んだ時点で式が実行される。
+  - 元の修正は、`variable` について「`'function(' + variable + ') {'` として関数の引数名に連結されるので、識別子として正しい文字列だけを許可する」として検査を加えた。しかし、同じ `Function` 呼び出しで同じく引数名になる `imports` のキーには、同じ検査がない。`options` の値を外から制御できる（`variable`・`sourceURL` の注入と同じ前提の）アプリでは、`variable` の代わりに `imports` のキーを使えば、同じコード注入ができる。修正を回り込む別の経路なので「不備」とした。
+- 問題になる入力と条件（すべて実際に実行して確かめた。`bench/attack_test.js`・`bench/imports_test.js`）:
+  - `_.template('hi', {imports: {'a=globalThis.pwned="importsKey"': undefined}})()` → 元のコード・元の修正コードの両方で `globalThis.pwned` が書き込まれた（コード実行）。
+  - `_.template('hi', {imports: {'{a=globalThis.pwned="importsDestr"}': {}}})()` → 両方で実行された。
+  - `_.template('hi', JSON.parse('{"imports":{"[a=globalThis.pwned=\"importsJSON\"]":[]}}'))()` → 両方で実行された。JSON の入力（`req.body` などをそのまま options にする場合）だけで成立する。
+  - アプリが `_.templateSettings.imports` に外部の値のキーを足した場合も同じ（`imports_test.js` の「settings.imports bad key」で、元の修正コードで実行されることを確認）。
+  - Node.js では `process` などに届くので任意コード実行（RCE）、ブラウザでは任意スクリプト実行になる。
+
+### 再修正の内容
+
+#### 変更 1: `imports` のキーを、Function に渡す前に識別子として検査する（`fix2/lodash.js` 14790〜14798 行）
+
+```js
+var imports = assignWith({}, options.imports, settings.imports, customDefaultsAssignIn),
+    importsKeys = keys(imports),
+    importsValues = baseValues(imports, importsKeys);
+
+// 【修正2】imports のキーは Function(importsKeys, …) の仮引数名になる。own のキーとして直接渡された
+// 'a=式'（既定値）や '{a=式}'・'[a=式]'（分割代入）は仮引数として正しく解釈され、テンプレート関数を
+// 作るときに式が実行される。variable と同じく、識別子として正しいキー（ASCII の英字・数字・_・$）だけを
+// 許可し、それ以外のキーがあれば Function に渡す前に例外にする。
+arrayEach(importsKeys, function(key) {
+  if (!reTemplateVariable.test(key)) {
+    throw new Error('Invalid `imports` option passed into `_.template`');
+  }
+});
+```
+
+- 何をしたか: `importsKeys`（`options.imports` と `_.templateSettings.imports` を own プロパティだけでまとめた `imports` のキー）を 1 つずつ調べ、元の修正で `variable` の検査に使っている正規表現 `reTemplateVariable`（`/^[A-Za-z_$][\w$]*$/`）に合わないキーが 1 つでもあれば `Error('Invalid `imports` option passed into `_.template`')` を投げる。
+- どう動くか:
+  - 検査は `Function(importsKeys, …)` を呼ぶ前（テンプレート文字列の解析よりも前）に行うので、不正なキーがあればテンプレート関数は作られず、キーの中の式は一度も評価されない。
+  - `jq`・`_`・`$`・`_x1` のような普通の識別子は、これまでどおり通る。既定の `_.templateSettings.imports` のキーは `_` だけなので、既定の使い方には影響しない。
+  - `keys()` は own の列挙可能な文字列キーだけを返し、`imports` は `assignWith` で作った新しいオブジェクトなので、検査したキーの一覧（`importsKeys`）と `Function` に渡すキーの一覧は同じ配列である（検査と使用の間で値が変わらない）。
+  - 正規表現に `m` フラグがないので、`$` は文字列の末尾にだけ合う。末尾に改行を付けたキー（`'a\n'`）も通らない。
+- なぜこの方法にしたか:
+  - 仮引数名として安全なのは識別子だけで、それ以外の文字（`=`、`{`、`[`、`,`、`.`、空白、改行、コメント記号など）は、構文エラーになるか、既定値・分割代入・引数の追加などの構文として解釈されるかのどちらかである。正しい使い方で識別子以外のキーが要ることはないので、許可する形を決めて検査する方法にした（危険な文字を探して除く方法は、漏れが起きやすい）。
+  - 元の修正の `variable` の検査と同じ正規表現・同じ例外の形にそろえ、修正の考え方を統一した。Unicode の識別子まで許すには `\p{ID_Start}` などの `u` フラグ付きの正規表現が要るが、lodash は古い実行環境（package.json の engines は node >=4）も対象にしており、その環境では正規表現リテラル自体が構文エラーになってライブラリ全体が読み込めなくなるため、使わなかった。
+  - `arrayEach` は lodash の中にすでにある内部関数（507 行）で、新しい依存は増やしていない。
+
+#### 変更 2: `reTemplateVariable` のコメントを追記（`fix2/lodash.js` 198〜200 行）
+
+```js
+// 【修正】_.template の `variable` オプションとして許可する識別子（ASCII の英字・数字・_・$）。
+// 【修正2】`imports` オプションのキー（テンプレート関数を作る Function の仮引数名）の検査にも使う。
+var reTemplateVariable = /^[A-Za-z_$][\w$]*$/;
+```
+
+- 正規表現そのものは変えていない。`imports` のキーの検査にも使うことを、コメントに書き足しただけ。
+
+#### 変えていない箇所
+
+- 元の修正の残りのハンク（`reTemplateLineTerminator` の追加、baseSet の禁止キーの検査、`assignWith` への置き換え、`sourceURL` の own 判定と改行除去、`variable` の own 判定と識別子検査）は、そのまま残した。検証で、これらは判定の脆弱性を直していることを確認したため。
+
+### 確認した内容と結果
+
+確認に使ったファイルは `bench/` の下（作業用ディレクトリ `vf_82/` の中）。`fix2/lodash.js` を `bench/fix2_lodash.js` にコピーして実行した。
+
+1. 構文・パッチ
+   - `node --check fix2/lodash.js` → OK。
+   - `fix2/lodash.js.patch` を `orig/lodash.js` に `patch -F0` で当て、結果が `fix2/lodash.js` と一致する（`cmp`）ことを確認。パッチは 5 ハンク。
+   - `require` で読み込めて、`_.VERSION` は `4.17.11`。
+2. 同じコミットの公式テスト（`test/test.js` を同じコミットから取得。qunitjs@2.4.1・qunit-extras@3.0.0 を `npm install --ignore-scripts` で `bench/lt` に入れ、テストが比較用に使う lodashStable には元のコード `orig/lodash.js` を置いた。lodash のパッケージは入れていない）
+   - 元のコード: PASS 6751 / FAIL 0
+   - 元の修正コード: PASS 6751 / FAIL 0
+   - 修正コード2: PASS 6751 / FAIL 0（`_.template` の imports・variable・sourceURL のテストを含む）
+3. imports のキーの攻撃入力（`bench/imports_test.js`、元／元の修正／修正コード2 の比較）
+   - `'a=式'`（値 undefined）、`'{a=式}'`（値 {}）、JSON の `'[a=式]'`（値 []）: 元・元の修正ではコードが実行された → 修正コード2 では 3 つとも `Invalid imports` の例外になり、実行されない。
+   - `'...a'`、`'a,b=式'`、`'a\n'`、`'a/*'` と `'*/b'`、`_.templateSettings.imports` に足した `'x=式'`: 修正コード2 ではすべて例外。`templateSettings` に足したキーは、元の修正では実行されたが、修正コード2 では実行されない。
+   - 正常なキー `jq`・`$`・`_x1`、`_` の上書き、空の `imports`: 元と同じ結果（`"2"`、`"1z"`、`"U"`、`"A"`）。
+4. 判定の脆弱性の攻撃入力（`bench/attack_test.js`、50 件）
+   - sourceURL の改行 5 種（`\n`・`\r`・`\r\n`・U+2028・U+2029）、variable の注入 7 種と配列・toString が変わるオブジェクト、Object.prototype の sourceURL・variable・imports のキー・imports の汚染、`_.set` から template への連鎖、`imports` のキー 3 種、baseSet の汚染 16 種（set・setWith・update・updateWith・zipObjectDeep・pick、エスケープ・入れ子配列・String オブジェクトのキーを含む）、merge／defaultsDeep の 6 種。
+   - 修正コード2 では 50 件すべてでコード実行なし（`pwned=-`）、テスト自身が汚染した 4 件を除き Object.prototype の汚染なし。元の修正コードとの違いは imports のキーの 3 件だけ（元の修正では実行 → 修正コード2 では例外）。
+   - `bench/extra_test.js`: `_.set([], 'constructor.prototype.x', 1)` による Array.prototype の汚染なし（元のコードでは汚染される）。
+5. 正常な入力での動作（`bench/normal_test.js`、37 件）
+   - 修正コード2 の結果は、元の修正コードの結果と全件一致した。元のコードとの違いは、元の修正の説明に書かれた副作用の 4 件だけ（variable に日本語の識別子 → 例外、継承プロパティの options → 使われない、`_.set({}, 'prototype.x', 1)` と `_.set(F, 'prototype.m', 1)` → 何もしない）。
+
+### 副作用・残る点
+
+- 修正コード2 で増えた動作の変化:
+  - `imports` のキーに ASCII の識別子以外（日本語などの Unicode の識別子を含む）を使うと、`_.template` が例外になる（`imports_test.js` の「unicode key」で、元では `"3"`、修正コード2 では例外になることを確認）。`variable` の制限と同じ理由（古い実行環境でも読み込めるようにするため）で、ASCII に限った。
+  - `_.templateSettings.imports` にアプリが不正なキーを入れている場合も、例外になる。
+  - 予約語（`new` など）のキーは正規表現を通るが、これまでどおり `Function` で SyntaxError になって例外になる（`imports_test.js` の「reserved key」で確認）。コードは実行されない。
+- 元の修正から引き継ぐ副作用（変えていない）: `variable` は ASCII の識別子だけ、継承プロパティで渡した options は使われない、baseSet で途中のキーに `constructor`・`prototype` がある正当な使い方（`_.set(Fn, 'prototype.m', 1)` など）は何もしなくなる、禁止キーより前に作った中間のオブジェクトは残る。
+- 直していない点とその理由:
+  - `_.unset({}, '__proto__.toString')` で `Object.prototype.toString` が削除される（元・元の修正・修正コード2 とも。`bench/extra_test.js` で確認）。baseUnset は判定の根拠（baseSet による書き込み）とは別の関数・別の操作（削除）なので、判定の範囲外として直していない。
+  - merge／defaultsDeep の経路: 元のコードでも `safeGet` で塞がれていることを `attack_test.js` で確認したので、元の修正の「対象外」の判断のまま。
+  - `_.templateSettings` の escape・evaluate・interpolate を削除したときの継承値の読み込み、baseSet が一般の継承値（組み込みの関数など）を辿る点は、元の修正の説明のとおり対象外のまま。
+  - テンプレートの区切り（evaluate・interpolate・escape）の中身や、テンプレート文字列そのものは、設計上 JavaScript として実行されるもので、外部の値をテンプレート文字列にしないのはアプリの責任である。
+
+### 修正コード2（元のファイル lodash.js に対するパッチ）: lodash.js.patch
+
+- ファイルが大きいため、ここにはパッチだけを載せる（"xss以外の修正コード" と同じ形）。元のファイル lodash.js（判定と同じコミット）にこのパッチを当てたものが修正コード2 の全文。親が patch -F0 で当てた結果が、エージェントの作った全文と一致することを確かめた。
+
+```diff
+--- lodash.js
++++ lodash.js
+@@ -192,6 +192,13 @@
+   /** Used to match unescaped characters in compiled string literals. */
+   var reUnescapedString = /['\n\r\u2028\u2029\\]/g;
+ 
++  // 【修正】_.template の `sourceURL` オプションから除去する改行文字（JavaScript の行終端文字）。
++  var reTemplateLineTerminator = /[\n\r\u2028\u2029]/g;
++
++  // 【修正】_.template の `variable` オプションとして許可する識別子（ASCII の英字・数字・_・$）。
++  // 【修正2】`imports` オプションのキー（テンプレート関数を作る Function の仮引数名）の検査にも使う。
++  var reTemplateVariable = /^[A-Za-z_$][\w$]*$/;
++
+   /** Used to compose unicode character classes. */
+   var rsAstralRange = '\\ud800-\\udfff',
+       rsComboMarksRange = '\\u0300-\\u036f',
+@@ -3967,6 +3974,14 @@
+         var key = toKey(path[index]),
+             newValue = value;
+ 
++        // 【修正】パスに '__proto__' があるか、途中のキーに 'constructor'・'prototype' があると、
++        // Object.prototype などの共有のプロトタイプまで辿って書き換えてしまう（プロトタイプ汚染）。
++        // その場合はそれ以上辿らず、代入もしないで object をそのまま返す。
++        if (key === '__proto__' ||
++            (index != lastIndex && (key === 'constructor' || key === 'prototype'))) {
++          return object;
++        }
++
+         if (index != lastIndex) {
+           var objValue = nested[key];
+           newValue = customizer ? customizer(objValue, key, nested) : undefined;
+@@ -14763,12 +14778,25 @@
+         options = undefined;
+       }
+       string = toString(string);
+-      options = assignInWith({}, options, settings, customDefaultsAssignIn);
++      // 【修正】assignInWith は継承プロパティ（keysIn）もコピーするので、Object.prototype が汚染されていると
++      // その値（sourceURL・variable・imports など）が options に入る。own プロパティだけをコピーする assignWith にする。
++      options = assignWith({}, options, settings, customDefaultsAssignIn);
+ 
+-      var imports = assignInWith({}, options.imports, settings.imports, customDefaultsAssignIn),
++      // 【修正】imports のキーは Function の引数名になるので、同じく own プロパティだけをコピーする。
++      var imports = assignWith({}, options.imports, settings.imports, customDefaultsAssignIn),
+           importsKeys = keys(imports),
+           importsValues = baseValues(imports, importsKeys);
+ 
++      // 【修正2】imports のキーは Function(importsKeys, …) の仮引数名になる。own のキーとして直接渡された
++      // 'a=式'（既定値）や '{a=式}'・'[a=式]'（分割代入）は仮引数として正しく解釈され、テンプレート関数を
++      // 作るときに式が実行される。variable と同じく、識別子として正しいキー（ASCII の英字・数字・_・$）だけを
++      // 許可し、それ以外のキーがあれば Function に渡す前に例外にする。
++      arrayEach(importsKeys, function(key) {
++        if (!reTemplateVariable.test(key)) {
++          throw new Error('Invalid `imports` option passed into `_.template`');
++        }
++      });
++
+       var isEscaping,
+           isEvaluating,
+           index = 0,
+@@ -14784,9 +14812,12 @@
+       , 'g');
+ 
+       // Use a sourceURL for easier debugging.
++      // 【修正】`'sourceURL' in options` はプロトタイプ鎖も見るので、own プロパティだけを見る。
++      // 【修正】sourceURL は 1 行コメント（//# sourceURL=）の中に連結されるので、改行文字
++      // （\n \r U+2028 U+2029）を除去し、コメントの外（関数本体）にコードを書けないようにする。
+       var sourceURL = '//# sourceURL=' +
+-        ('sourceURL' in options
+-          ? options.sourceURL
++        (hasOwnProperty.call(options, 'sourceURL')
++          ? (options.sourceURL + '').replace(reTemplateLineTerminator, '')
+           : ('lodash.templateSources[' + (++templateCounter) + ']')
+         ) + '\n';
+ 
+@@ -14819,9 +14850,18 @@
+ 
+       // If `variable` is not specified wrap a with-statement around the generated
+       // code to add the data object to the top of the scope chain.
+-      var variable = options.variable;
++      // 【修正】継承プロパティ（汚染された Object.prototype.variable など）は使わず、own プロパティだけを見る。
++      var variable = hasOwnProperty.call(options, 'variable') && options.variable;
+       if (!variable) {
+         source = 'with (obj) {\n' + source + '\n}\n';
++      } else {
++        // 【修正】variable は 'function(' + variable + ') {' として関数の引数名に連結されるので、
++        // 識別子として正しい文字列（ASCII の英字・数字・_・$）だけを許可し、それ以外は例外にする。
++        // 文字列への変換は 1 回だけ行い、検査した文字列をそのまま後の連結に使う。
++        variable = toString(variable);
++        if (!reTemplateVariable.test(variable)) {
++          throw new Error('Invalid `variable` option passed into `_.template`');
++        }
+       }
+       // Cleanup code by stripping empty strings.
+       source = (isEvaluating ? source.replace(reEmptyStringLeading, '') : source)
+```
+
+---
