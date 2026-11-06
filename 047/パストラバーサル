@@ -1,0 +1,110 @@
+## No.47 CVE-2017-16107 Eeems/PooledWebSocket server.js（prePatch d51217a）
+
+- 修正した脆弱性: パストラバーサル／任意ファイルの読み取り（CWE-22）、付随の情報露出（CWE-209）
+- 修正対象ファイル: server.js
+- 修正の内容（行番号は元のファイル）:
+  - 1〜2 行目: path モジュールと、公開ディレクトリ publicRoot = path.resolve(__dirname) を加えた（公開する範囲は元と同じ __dirname）。
+  - 9 行目 `fs.createReadStream(__dirname+req.url, …)` の文字列連結をやめた。読む前に次の順で検査する:
+    - req.url からクエリとフラグメントを除き、decodeURIComponent で %エンコードを戻す（不正な符号化は 400）。NUL 文字を含むパスも 400 で拒否する。
+    - path.join(publicRoot, pathname) で ../ を正規化し、path.relative(publicRoot, filePath) が `..` そのもの、`../` で始まる、絶対パスのいずれかなら 403 を返して読まない（CWE-22）。`..foo.txt` のような名前は誤って拒否しない。
+  - 17 行目 `res.end(e+'')`: 例外の内容（絶対パスを含む）は console.error でサーバのログにだけ出し、応答は固定の文言だけにした（CWE-209）。ENOENT／ENOTDIR／EISDIR は 404、それ以外は 500、Content-Type は text/plain。送信の途中で失敗した場合は接続を切るだけにした。
+  - 防げること: 生の `/../` や `%2e%2e`、`..%2f` で、アプリのディレクトリの外にあるファイル（/etc/passwd など）を読み出すこと。エラー応答から内部の絶対パスが漏れること。
+- 副作用・直さなかった点（エージェントの報告）:
+  - %エンコードしたパスが正しく戻されるようになり、クエリ付きの URL でもファイルが返る。エラー時の状態コードが 200 から 404／403／400／500 に変わる。
+  - 公開ディレクトリ内に外を指すシンボリックリンクを置かれた場合は防げない（realpath での確認はしていない。リンクを置くのは運用者なので信頼する前提）。
+  - 公開範囲が __dirname のままなので、server.js 自体や package.json も配信される。ディレクトリの外へ抜ける問題ではなく設計の問題として変えていない。
+  - 全インタフェースでの待ち受け、正常応答の Content-Type、uncaughtException の握りつぶし、ログへの req.url の出力も変えていない。
+- 確認:
+  - 親: 元ファイルとの差分が上の修正箇所だけであること、node --check で構文エラーがないことを確認した。
+  - エージェント（MARK END の後）: ws をスタブにし、127.0.0.1 のランダムなポートで待ち受けさせ、正規化しない生のリクエストを 19 件送った。修正版は 19 件すべて期待どおり（`/../secret.txt` や `%2e%2e`、多段の `../etc/passwd` は 403、不正な %エンコードと %00 は 400）で、どの応答にも外部ファイルの内容、絶対パス、`Error:` は含まれなかった。元のコードでは `/../secret.txt` などでディレクトリ外のファイルが返り、多くのケースで絶対パスを含む `Error: ENOENT …` が 200 で返った。
+  - 修正ファイルは、書き出した後に直していない。
+- 使用トークン量（修正）: 新規 8,352（入力 4 ／ キャッシュ作成 2,419 ／ 出力〔推定〕 5,929）、キャッシュ読込 31,001、総処理 39,353、リクエスト 2 回
+
+```javascript
+var fs = require('fs'),
+	path = require('path'), // 【修正】パスの正規化と、公開ディレクトリ配下かどうかの確認に path モジュールを使う
+	WebSocketServer = require('ws').Server,
+	// 【修正】公開するディレクトリ（従来どおり __dirname）を絶対パスに正規化して保持する
+	publicRoot = path.resolve(__dirname),
+	wserver = new WebSocketServer({
+		host: 'localhost',
+		port: 8090
+	}),
+	hserver = require('http').createServer(function(req,res){
+		console.log('Serving: %s',req.url);
+		// 【修正】エラー時は例外メッセージ（絶対パスを含む）を返さず、状態コードと固定の文言だけを返す（CWE-209 対策）
+		function sendError(code,message){
+			if(res.headersSent){
+				// 【修正】本文の送信途中で失敗した場合は、応答を打ち切るだけにする
+				res.destroy();
+				return;
+			}
+			res.statusCode = code;
+			res.setHeader('Content-Type','text/plain; charset=utf-8');
+			res.end(message);
+		}
+		// 【修正】クエリ文字列とフラグメントを除き、%エンコード（%2e%2e など）を復号してから検証する
+		var pathname = String(req.url).split(/[?#]/)[0];
+		try{
+			pathname = decodeURIComponent(pathname);
+		}catch(e){
+			sendError(400,'Bad Request');
+			return;
+		}
+		// 【修正】NUL 文字を含むパスは拒否する
+		if(pathname.indexOf('\0') !== -1){
+			sendError(400,'Bad Request');
+			return;
+		}
+		// 【修正】文字列連結（__dirname+req.url）をやめ、公開ディレクトリを基準に "../" を正規化したパスを作る
+		var filePath = path.join(publicRoot,pathname),
+			rel = path.relative(publicRoot,filePath);
+		// 【修正】正規化後のパスが公開ディレクトリの外を指す場合は 403 を返して読み取らない（CWE-22 対策）
+		if(rel === '..' || rel.indexOf('..'+path.sep) === 0 || path.isAbsolute(rel)){
+			sendError(403,'Forbidden');
+			return;
+		}
+		var rs = fs.createReadStream(filePath,{
+			flags: 'r',
+			autoClose: true
+		});
+		rs.on('open',function(){
+			rs.pipe(res);
+		});
+		rs.on('error',function(e){
+			// 【修正】例外の詳細はサーバ側のログにだけ出し、応答には含めない（CWE-209 対策）
+			console.error(e);
+			if(e.code === 'ENOENT' || e.code === 'ENOTDIR' || e.code === 'EISDIR'){
+				sendError(404,'Not Found');
+			}else{
+				sendError(500,'Internal Server Error');
+			}
+		});
+	}),
+	clients = [];
+
+wserver.on('connection', function(ws) {
+	clients.push(ws);
+	ws.on('message', function(data) {
+		console.log('Received: %s', data);
+		console.log('Sent: %s', data);
+		ws.send(data);
+	});
+	ws.on('close',function(){
+		clients.splice(clients.indexOf(ws),1);
+	});
+});
+hserver.listen(8080);
+process.stdin.on('data',function(data){
+	clients.forEach(function(ws){
+		console.log('Sent: %s', data);
+		ws.send(data);
+	});
+});
+process.on('uncaughtException',function(e){
+	console.error(e);
+	console.trace(e.stack);
+});
+```
+
+---
