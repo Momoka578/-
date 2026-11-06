@@ -1,0 +1,239 @@
+## No.92 CVE-2020-11059 ipfs/aegir src/config/webpack.config.js（prePatch 0554d92）
+
+- 修正した脆弱性: ビルド成果物への環境変数の平文の埋め込み（情報漏えい。CWE-312・CWE-200）
+- 修正対象ファイル: src/config/webpack.config.js
+- 修正の内容（行番号は元のファイル。変えたのはこの 1 か所だけ）:
+  - 111 行目 `new webpack.DefinePlugin({ 'process.env': JSON.stringify(process.env) })` を、`new webpack.DefinePlugin({ 'process.env.NODE_ENV': JSON.stringify(isProduction ? 'production' : 'development') })` にした。ビルドしたマシンの環境変数を丸ごと定義するのをやめ、NODE_ENV の 1 つだけを定義する。
+  - NODE_ENV の値は、環境変数の文字列をそのまま使わず、mode と同じ 'production' か 'development' に固定した（webpack 4 の optimization.nodeEnv の既定値と同じなので、同じキーの定義が食い違わない）。
+- この修正で防げること: CI（Travis など）でビルドしたときに、GH_TOKEN・NPM のトークン・クラウドの認証情報などの環境変数が、dist/index.js・index.min.js・ソースマップ・ブラウザテスト用のバンドルに平文で埋め込まれ、npm や CDN から誰でも読めるようになること。
+- 副作用・直さなかった点（エージェントの最終報告による）:
+  - バンドル内の `process.env.NODE_ENV` 以外の `process.env.XXX` は、node.process の polyfill（env が空）で undefined になる。ブラウザ側でビルド時の環境変数を読んでいた利用者は、自分の webpack 設定（userConfig.webpack）の DefinePlugin で明示して加える必要がある。
+  - 33 行目の devtoolModuleFilenameTemplate により、ソースマップにビルドしたマシンの絶対パスが入る点は、判定の記録の対象（環境変数の埋め込み）ではないので変えていない。
+  - karma.conf.js（同じ prePatch コミット。読むためだけに取得した。指示で許可した範囲）の TEST_DIR・TEST_BROWSER_JS は、`process.env` を使わず別の DefinePlugin で定義しているので、この修正の影響を受けない。
+- 確認（MARK END の後。修正ファイルは直していない）:
+  - 親とエージェント: node --check に問題なし。
+  - 親: エージェントが取得した元のファイルが、前回親が取得した prePatch のファイルと同じであることを確認した。
+  - エージェント: webpack などの依存をスタブに置き換えて設定を読み込み、DefinePlugin に渡された定義を取り出した。ダミーの GH_TOKEN・NPM_TOKEN を入れ、`env -i` で環境を空にして実行した。元のファイルでは development・production のどちらの設定にも環境変数全体（ダミーのトークンを含む）が入り、修正版では `process.env.NODE_ENV` だけが入った。webpack を実際に動かしたビルドはしていない。
+- 使用トークン量（修正）: 新規 16,957（入力 6 ／ キャッシュ作成 9,638 ／ 出力〔推定〕 7,313）、キャッシュ読込 51,325、総処理 68,282、リクエスト 3 回
+
+```javascript
+'use strict'
+
+const path = require('path')
+const webpack = require('webpack')
+const merge = require('webpack-merge')
+const { BundleAnalyzerPlugin } = require('webpack-bundle-analyzer')
+const StatsPlugin = require('stats-webpack-plugin')
+const TerserPlugin = require('terser-webpack-plugin')
+const { fromRoot, pkg, paths, getLibraryName } = require('../utils')
+const userConfig = require('./user')()
+const isProduction = process.env.NODE_ENV === 'production'
+
+const base = (env, argv) => {
+  const filename = [
+    'index',
+    isProduction ? '.min' : null,
+    '.js'
+  ]
+    .filter(Boolean)
+    .join('')
+
+  return {
+    bail: Boolean(isProduction),
+    mode: isProduction ? 'production' : 'development',
+    devtool: isProduction ? 'source-map' : undefined,
+    entry: [userConfig.entry],
+    output: {
+      path: fromRoot(paths.dist),
+      filename: filename,
+      sourceMapFilename: filename + '.map',
+      library: getLibraryName(pkg.name),
+      libraryTarget: 'umd',
+      devtoolModuleFilenameTemplate: info => 'file:' + encodeURI(info.absoluteResourcePath)
+    },
+    module: {
+      rules: [
+        {
+          oneOf: [
+            {
+              test: /\.js$/,
+              include: fromRoot(paths.src),
+              use: {
+                loader: require.resolve('babel-loader'),
+                options: {
+                  presets: [require('./babelrc')()],
+                  babelrc: false,
+                  cacheDirectory: true
+                }
+              }
+            },
+            {
+              test: /\.js$/,
+              exclude: /@babel(?:\/|\\{1,2})runtime/,
+              use: {
+                loader: require.resolve('babel-loader'),
+                options: {
+                  presets: [require('./babelrc')()],
+                  babelrc: false,
+                  cacheDirectory: true,
+                  sourceMaps: false
+                }
+              }
+            }
+          ]
+        }
+      ]
+    },
+    resolve: {
+      alias: {
+        '@babel/runtime': path.dirname(
+          require.resolve('@babel/runtime/package.json')
+        )
+      }
+    },
+    optimization: {
+      minimize: isProduction,
+      minimizer: [
+        // This is only used in production mode
+        new TerserPlugin({
+          terserOptions: {
+            parse: {
+              // we want terser to parse ecma 8 code. However, we don't want it
+              // to apply any minfication steps that turns valid ecma 5 code
+              // into invalid ecma 5 code. This is why the 'compress' and 'output'
+              // sections only apply transformations that are ecma 5 safe
+              // https://github.com/facebook/create-react-app/pull/4234
+              ecma: 8
+            },
+            compress: {
+              ecma: 5,
+              warnings: false
+            },
+            mangle: {
+              safari10: true
+            },
+            output: {
+              ecma: 5,
+              comments: false
+            }
+          },
+          // Use multi-process parallel running to improve the build speed
+          // Default number of concurrent runs: os.cpus().length - 1
+          parallel: true,
+          // Enable file caching
+          cache: true,
+          sourceMap: true
+        })
+      ]
+    },
+    plugins: [
+      // 【修正】以前は `'process.env': JSON.stringify(process.env)` で、ビルドしたマシンの
+      // 環境変数すべて（GH_TOKEN や NPM トークン、クラウドの認証情報など）をバンドルに
+      // 埋め込んでいた。そのため、dist/index.js やソースマップに平文で残っていた。
+      // ブラウザ向けバンドルで必要な NODE_ENV だけを許可リストとして個別に定義する。
+      // 値は環境変数の文字列をそのまま使わず、mode と同じ 'production' / 'development' の
+      // どちらかに固定する（webpack の optimization.nodeEnv の既定値と一致するので、定義が衝突しない）。
+      // それ以外の process.env.XXX は、node.process の polyfill（空の env）により undefined になる。
+      // ほかに必要な値がある場合は、利用者が自分の webpack 設定で明示的に追加する。
+      new webpack.DefinePlugin({
+        'process.env.NODE_ENV': JSON.stringify(isProduction ? 'production' : 'development')
+      })
+    ],
+    target: 'web',
+    node: process.env.AEGIR_NODE === 'false' ? {
+      global: true,
+      __filename: 'mock',
+      __dirname: 'mock',
+      dgram: false,
+      fs: false,
+      net: false,
+      tls: false,
+      child_process: false,
+      console: false,
+      process: true, // TODO remove this once readable-stream is fixed
+      Buffer: false,
+      setImmediate: false,
+      os: false,
+      assert: false,
+      constants: false,
+      events: false,
+      http: false,
+      path: false,
+      querystring: false,
+      stream: false,
+      string_decoder: false,
+      timers: false,
+      url: false,
+      util: false,
+      crypto: false
+    } : {
+      dgram: 'empty',
+      fs: 'empty',
+      net: 'empty',
+      tls: 'empty',
+      child_process: 'empty',
+      console: false,
+      global: true,
+      process: true,
+      __filename: 'mock',
+      __dirname: 'mock',
+      Buffer: true,
+      setImmediate: true
+    }
+  }
+}
+
+module.exports = (env, argv) => {
+  const external = typeof userConfig.webpack === 'function'
+    ? userConfig.webpack(env, argv)
+    : userConfig.webpack
+  if (process.env.AEGIR_BUILD_ANALYZE === 'true') {
+    return merge(
+      base(env, argv),
+      {
+        plugins: [
+          new BundleAnalyzerPlugin(),
+          new StatsPlugin('stats.json')
+        ],
+        profile: true
+      },
+      external
+    )
+  }
+  if (isProduction) {
+    return [
+      merge(
+        base(env, argv),
+        {
+          output: {
+            filename: 'index.js',
+            sourceMapFilename: 'index.js.map'
+          },
+          optimization: {
+            minimize: false
+          }
+        },
+        external
+      ),
+      merge(
+        base(env, argv),
+        external
+      )
+    ]
+  }
+
+  return merge(
+    base(env, argv),
+    {
+      output: {
+        filename: 'index.js',
+        sourceMapFilename: 'index.js.map'
+      },
+      optimization: {
+        minimize: false
+      }
+    },
+    external
+  )
+}
+```
