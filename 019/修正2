@@ -1,0 +1,290 @@
+## No.19 CVE-2018-16480 tnantoka/public bin/public（prePatch 6d152eb）
+
+- 検証した修正コード: "修正版コード"・"xss以外の修正コード"
+- 検証結果: **不備あり** — CWE-22 の修正は問題なし。XSS の修正はファイル名を HTML エスケープするだけで、公開ディレクトリを末尾スラッシュ付き（pub/ など）で指定したときや既定の "." のサブディレクトリでは href がファイル名で始まり、javascript: で始まる名前のファイルでクリック時に実行される（ヘッドレス Chrome で確認）。修正コード2: / で始まらない href には ./ を付けてからエスケープ
+- 修正コード2 のファイル: bin/public
+- 親の確認: bin/public: node --check で構文エラーなし。エージェントが読み取り専用の材料（orig・given）を変えていないこと、読まない範囲のファイルを読んでいないことを、記録で確認した。
+- 使用トークン量（検証）: 新規 68,695（入力 24 ／ キャッシュ作成 40,950 ／ 出力〔推定〕 27,721）、キャッシュ読込 442,228、総処理 510,923、リクエスト 12 回
+- 使用トークン量（再修正）: 新規 38,476（入力 18 ／ キャッシュ作成 25,832 ／ 出力〔推定〕 12,626）、キャッシュ読込 623,237、総処理 661,713、リクエスト 9 回
+
+- 修正コード2 のファイル: `fix2/bin/public`（元の修正コードの最終版 `given/fix_nx/bin/public` をコピーし、1 か所だけ直した）
+- 検証結果: **不備あり**（HTML エスケープだけでは、href 属性に `javascript:` スキームの URL が入るのを防げず、一部の起動方法・入力でストア型 XSS が残る）
+
+### 元の修正コードの不備
+
+#### 不備1: ディレクトリ一覧のリンク（href）に、ファイル名から `javascript:` で始まる URL が入る（ストア型 XSS が残る）
+
+- 場所: `given/fix_nx/bin/public` L130（`given/fix_xss/bin/public` では L124）
+
+  ```js
+  list.push('<li><a href="', escapeHtml(path.join(base, file)),'">', escapeHtml(file), '</a></li>');
+  ```
+
+  と、その href の元になる L93
+
+  ```js
+  var base = filePath.replace(dir, ''); // Base path for browser link
+  ```
+
+- 問題の内容:
+  - 元の修正コードは、ファイル名 `file` と `path.join(base, file)` を escapeHtml（`& < > " '` を文字参照に変える）してから埋め込んでいる。これで「属性の外に抜け出してタグやイベント属性を足す」攻撃（`<img src=x onerror=...>`、`"><svg onload=...>` など）は防げている。
+  - しかし、href 属性の値は、ブラウザが文字参照を戻したうえで **URL として** 解釈する。値が `javascript:...` で始まれば、リンクをクリックしたときに、そのページのオリジン（このサーバ）で JavaScript が実行される。`javascript:alert(1)` には HTML の特殊文字が含まれないので、HTML エスケープでは何も変わらない。
+  - また、出力は `list.join('\n')` で連結されるため、href の値の前後に改行が入る（`href="\njavascript:...\n"`）が、ブラウザは URL の前後の空白・改行を取り除くので、スキームの判定には影響しない。
+- href の値の先頭が攻撃者の決めた文字列になる条件（`base` が空、または "/" で始まらない相対パスになる場合）:
+  1. **公開ディレクトリを末尾スラッシュ付きで指定して起動したとき**（`public pub/ 3000`、`public /srv/pub/`、`public ./`、`public /` など。シェルのタブ補完でディレクトリ名を入れると末尾に "/" が付くので、起こりやすい）。ルート（`/`）の一覧では `filePath = path.join(dir, '/')` が `dir` と同じ文字列になり、`base = filePath.replace(dir, '')` が空文字になる。そのため `href = path.join('', file)` = ファイル名そのものになる。
+  2. **既定の dir "."（`public` や `public 3000`）で起動したとき**。`path.join('.', '/x/')` は先頭の `./` が消えて `'x/'` になり、`filePath.replace('.', '')` でも先頭に "/" が付かない。そのため、サブディレクトリ `/x/` の一覧の href は `x/ファイル名` という相対パスになる。ディレクトリ名を `javascript:alert(4)` にすると、その一覧の各エントリの href が `javascript:alert(4)/f` になり、クリックで `alert(4)` が実行される。
+- 攻撃の入力: 判定の攻撃例と同じく、アップロード・共有フォルダ・配布アーカイブなどで、公開ディレクトリに次のような名前のファイル（またはディレクトリ）を置く。ファイル名に "/" は使えないが、":" "(" ")" は使える。
+  - ファイル `javascript:alert(document.domain)`（大文字小文字を混ぜた `JaVaScRiPt:alert(5)` も同じ。ブラウザはスキームの大文字小文字を区別しない）
+  - ディレクトリ `javascript:alert(4)`（中にファイルを 1 つ置く。既定の dir "." の場合）
+- 実際に確かめたか: **確かめた**。ヘッドレス Chrome（CDP）で一覧ページを開き、リンクをマウスイベントでクリックして、JavaScript のダイアログを検出した（`bench/test_browser.js`）。
+  - dir=`pub/`: リンク `javascript:alert(document.domain)` の a.protocol は `javascript:`。クリックで alert("127.0.0.1") が出た。`JaVaScRiPt:alert(5)` も alert("5") が出た。
+  - dir=`./`: 同じく alert("127.0.0.1") が出た。
+  - 既定の dir "."（cwd=公開ディレクトリ）: `/javascript:alert(4)/` を開いてエントリ `f` をクリック → href `javascript:alert(4)/f`、alert("4") が出た。
+  - 対照として dir=`pub`（末尾スラッシュなしの絶対パス）では href が `/javascript:...` になり、protocol は `http:` で、alert は出なかった。
+- 元のコード・XSS の修正版（fix_xss）・最終版（fix_nx）で、この href の出力は同じだった（生の HTTP の出力を diff で比較）。判定の根拠とした sink（元のコード L107、ファイル名を href に入れる箇所）と同じ箇所・同じ source（ファイル名）・同じ攻撃方法で XSS が残るため、修正が不十分と判断した。
+
+#### 不備ではないと確認した点（参考）
+
+- タグ・属性の挿入（`<img ...>`、`"><svg ...>`、`' onmouseover='...`）: エスケープされ、一覧を開いても alert は出なかった（元のコードでは読み込み時に alert が 3 回出た）。
+- `Index of "abs"`、エラー時の `JSON.stringify(err)`、`res.message`: エスケープ済み。
+- CWE-22（プレフィックス比較）: `/../pub2/secret`、`/../pub2`、`/..\pub2\secret`、絶対形式 `GET http://x/../pub2/secret` などはすべて 403 になった。root と完全一致（`/../pub`）や root 内（`/../pub/hello.txt`）は元どおり許可される。CWE-22 の修正には不備はない。
+
+### 再修正の内容
+
+#### 変更した箇所: `fix2/bin/public` L128〜L143（一覧のリンクを組み立てる forEach の中）
+
+変更前（fix_nx L128〜L131）:
+
+```js
+files.forEach(function(file) {
+  // 修正: ファイル名を href 属性と要素内容に埋め込む前に HTML エスケープする
+  list.push('<li><a href="', escapeHtml(path.join(base, file)),'">', escapeHtml(file), '</a></li>');
+});
+```
+
+変更後（fix2 L128〜L143。【修正2】のコメントは省略して示す）:
+
+```js
+files.forEach(function(file) {
+  // 【修正2】…（理由を説明するコメント）
+  var href = path.join(base, file);
+  if (href.charAt(0) !== '/' && href.charAt(0) !== '\\') {
+    href = './' + href;
+  }
+  // 修正: ファイル名を href 属性と要素内容に埋め込む前に HTML エスケープする
+  list.push('<li><a href="', escapeHtml(href),'">', escapeHtml(file), '</a></li>');
+});
+```
+
+- 何をどう変えたか:
+  1. これまで list.push の引数の中で直接計算していた `path.join(base, file)` を、変数 `href` に取り出した。
+  2. `href` の先頭が "/"（Windows で path.join が返す "\" も）でない、つまり相対パスのときだけ、先頭に `./` を付ける。
+  3. その `href` を、元の修正コードと同じく escapeHtml してから href 属性に入れる。要素内容（表示するファイル名）は元の修正コードのまま escapeHtml(file)。
+- なぜこの方法にしたか:
+  - URL の解析では、スキームは「英字で始まり、英数字と + - . が続き、":" で終わる」部分である。値が `./` で始まると先頭が "." なのでスキームにはなりえず、必ず相対 URL として解釈される。`./javascript:alert(1)` は「今のディレクトリの `javascript:alert(1)` というファイル」を指すだけになる。
+  - 相対 URL の `./x` と `x` は同じ場所に解決される（ドットセグメントの除去）。そのため、正常な名前のファイルのリンク先は変わらない。"/" で始まる href（dir を末尾スラッシュなしで指定したときの通常の場合）は何も変えない。
+  - 他の方法として、ファイル名を encodeURIComponent で %XX にする方法も考えた。しかしこのサーバは `url.parse(req.url).pathname` をデコードせずにファイルを探すので、":" を `%3A` にすると、名前に ":" を含む普通のファイルへのリンクが開けなくなる（動作が変わる）。また、base の作り方（`filePath.replace(dir, '')`）を直して常に "/" で始まる絶対パスにする方法は、既定の dir "." のときのリンク先が変わる（元からの機能上の不具合の修正になる）ため、変更の範囲が広がる。今回は「スキームとして解釈されないようにする」ことだけに絞り、リンク先を変えない `./` の付加にした。
+  - `javascript:` などの特定のスキーム名を拒否する方法（ブラックリスト）は、大文字小文字・前後の空白・タブや改行の混入（ブラウザは URL 中のタブと改行を取り除く）・`vbscript:` `data:` など別のスキームの考慮が必要で、漏れが出やすいので使わなかった。`./` を付ける方法は、スキームの種類や表記の違いに関係なく効く。
+- どう動くか（例）:
+  - dir=`pub/` のルートの一覧で、ファイル `javascript:alert(document.domain)` → href は `./javascript:alert(document.domain)` → ブラウザでは `http://ホスト/javascript:alert(document.domain)` に解決される（ファイルの取得になるだけで、スクリプトは実行されない）。
+  - 既定の dir "." の `/javascript:alert(4)/` の一覧で、エントリ `f` → href は `./javascript:alert(4)/f` → `http://ホスト/javascript:alert(4)/javascript:alert(4)/f` に解決される（元からの相対リンクの不具合で、リンク先は元のコードの相対パスの解決と同じ。スクリプトは実行されない）。
+  - 正常なファイル `hello.txt`（dir=`pub/`）→ href は `./hello.txt` → `http://ホスト/hello.txt`（変更前の `hello.txt` と同じ解決先）。
+  - dir=`pub`（末尾スラッシュなし）→ href は `/hello.txt` のまま（変更なし）。
+
+### 確認した内容と結果
+
+確認の環境: Node v22.22.1、mime@1.2.11（同じコミットの package.json の `~1.2.4` に合わせて `bench/` に --ignore-scripts で導入）、同じコミットの package.json を `dl/` に取得して使用。サーバはプリロード（`bench/force_local.js`）で 127.0.0.1 だけで待ち受けさせた。ブラウザの確認は /usr/bin/google-chrome のヘッドレスモード（デバッグポートも 127.0.0.1）。
+
+1. 構文確認: `node --check fix2/bin/public` → OK。
+2. 差分: `given/fix_nx/bin/public` との違いは、forEach の中の 1 か所（L129〜L140 の追加と L142 の引数の変更）だけであることを diff で確認した。
+3. 起動・オプション: `-v` → `0.1.3`、`-h` → Usage を表示（`bench/test_misc.js`）。
+4. 生の HTTP の確認（`bench/test.js`。起動方法 4 通り: dir=`pub`、`pub/`、`./`、既定の "."）:
+   - fix_nx の出力との違いは、"/" で始まらない href の先頭に `./` が付いたことだけ（diff で確認。"/" で始まる href、表示されるファイル名、Index of の見出し、ファイルの取得、ENOENT の表示、403 の判定は同じ）。
+   - タグ・属性を含むファイル名は、引き続きエスケープされている。
+   - CWE-22: `/../pub2/secret`、`/../pub2`、dir=`pub/` での `/../pub2/secret` → 403。`/../pub/hello.txt`、`/../pub` → 許可（元と同じ）。
+   - 境界の入力（`bench/test_misc.js`）: `/..\pub2\secret` → 403、`/../PUB2/secret` → 403、`GET http://x/../pub2/secret` → 403、`/a.txt%00` → ENOENT の表示（エスケープ済み）、`GET ?` → Node の HTTP パーサが 400。
+5. ブラウザでの攻撃の確認（`bench/test_browser.js`。ヘッドレス Chrome で一覧を開き、リンクをマウスイベントでクリックして、JavaScript のダイアログの有無を調べた）:
+   - 修正前（fix_nx）: dir=`pub/` と `./` では `javascript:alert(document.domain)` のクリックで alert("127.0.0.1")、`JaVaScRiPt:alert(5)` で alert("5")、既定の "." の `/javascript:alert(4)/` ではエントリ `f` のクリックで alert("4") が出た。
+   - 修正コード2: 同じ 4 通りの起動方法で、読み込み時もクリック時も alert は **1 回も出なかった**。リンクの a.protocol はすべて `http:` になり、クリックするとサーバ内のパスへの移動になった。
+   - 正常なファイル `hello.txt` のリンク: 既定の "." と dir=`pub/` の両方で、修正前と修正コード2 の解決先が同じ（`http://127.0.0.1:ポート/hello.txt`）で、クリックでそのファイルに移動した。一覧のすべてのリンクの解決先（a.href）を出力して比べ、`javascript:` になっていたものが `http://…/javascript:…` に変わった以外は同じだった。
+6. URL 解析の網羅的な確認（`bench/test_url.js`。Node の WHATWG URL はブラウザと同じ規則で解析する）: 名前 20 種（`hello.txt`、`..`、`.`、`.hidden`、`sub/a.txt`、`a:b.txt`、`javascript:alert(1)`、`JaVaScRiPt:x`、先頭が空白やタブの `javascript:x`、途中に改行の入った `java\nscript:x`、`data:...`、`vbscript:x`、`C:\x`、`mailto:...`、`%6aavascript:x` など）× ベース URL 3 種の 60 通りで、`./` を付けた href（前後に改行を付けた実際の形）が `http:` 以外のスキームになったものは 0 件。修正前に http: に解決されていたものの解決先が変わったものも 0 件。
+
+### 副作用・残る点
+
+- 動作の変化:
+  - "/" で始まらない href の先頭に `./` が付く（HTML のソース上の変化）。解決されるリンク先は、修正前に http: の URL になっていたものについては変わらない（上の確認 5・6）。
+  - 修正前は、dir を末尾スラッシュ付きで指定したときのルートの一覧で、`a:b.txt` のように ":" を含む名前のファイルのリンクが `a:` というスキームの URL と解釈されて開けなかったが、修正コード2 では `http://ホスト/a:b.txt` になり開けるようになる（改善の方向の変化）。
+- 直していない点とその理由:
+  - 既定の dir "." のとき、サブディレクトリの一覧のリンクが `sub/a.txt` のような相対パスになり、`/sub/sub/a.txt` を指してしまう不具合（元のコードの `filePath.replace(dir, '')` による base の作り方が原因）。安全には関係しない機能上の不具合で、直すとリンク先が変わるため、最小限の修正の範囲外とした。`./` を付けてもこの解決先は変わらない。
+  - `filePath.replace(dir, '')` が最初に一致した部分を消す作り（既定の "." では名前の最初の "." が消える、など）も同じ理由で直していない。
+  - 名前に `#`、`?`、`%`、空白、日本語などを含むファイルのリンクが開けないことがある（サーバ側で pathname をデコードしないため）。元からの機能上の不具合で、安全には関係しないので直していない。
+  - 元の修正コードで対象外とした点（公開ディレクトリ内のシンボリックリンクが外を指す場合、エラー時に err の内容＝内部パスを表示すること、今の Node では errno が負の値になり 404 の分岐に入らないこと）は、判定の脆弱性の修正が成り立つことに影響しないので、そのままにした。
+  - 公開ディレクトリに置かれた .html や .svg のファイルは、そのまま text/html などで配信される。静的ファイルサーバとしての仕様で、判定の対象（一覧ページのファイル名の扱い）とは別なので対象外とした。
+  - Windows 環境での動作（path.sep が "\" の場合）は、この環境では実行できないため、コードを読んで確かめた（"\" で始まる href は、ブラウザが http の URL で "\" を "/" と同じに扱うので、そのまま絶対パスとして扱い、`./` を付けない）。
+
+### 修正コード2 の全文: bin/public
+
+```javascript
+#!/usr/bin/env node
+
+/* Load modules */
+var fs  = require('fs');
+var path = require('path');
+var url = require('url');
+var http = require('http');
+var mime = require('mime');
+
+/* Load package.json */
+var package = JSON.parse(fs.readFileSync(__dirname + '/../package.json'));
+
+/* Define constants */
+var VERSION = package.version;
+var DEFAULT_DIR = '.';
+var DEFAULT_PORT = 3000;
+
+var USAGE = ''
+  + 'Usage: publicjs [options] [dir="' + DEFAULT_DIR + '"] [port="' + DEFAULT_PORT + '"]\n'
+  + '\n'
+  + 'Options:\n'
+  + '\t-v, --version\tShow version number\n'
+  + '\t-h, --help\tShow this help message\n'
+;
+
+/* Define functions */
+
+// Successful end
+function success(msg) {
+  console.log(msg);
+  process.exit(0);
+}
+
+// Abnormal end
+function error(msg) {
+  console.error(msg);
+  process.exit(1);
+}
+
+// 修正: HTML に埋め込む文字列をエスケープする関数を追加
+// （& < > " ' を文字参照に変換し、タグや属性として解釈されないようにする）
+function escapeHtml(str) {
+  if (str === undefined || str === null) {
+    return ''; // join() と同じく undefined/null は空文字として扱う
+  }
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+/* Parse arguments */
+var args = process.argv.slice(2);
+var dir = DEFAULT_DIR;
+var port = DEFAULT_PORT;
+switch (args[0]) {
+  case '-h':
+  case '--help':
+    success(USAGE);
+    break;
+  case '-v':
+  case '--version':
+    success(VERSION);
+    break;
+  default:
+    // publicjs dir port
+    if (args.length >= 2) {
+      dir = args[0];
+      if (isFinite(args[1])) {
+        port = args[1];
+      }
+    } else if (args.length == 1) {
+      // publicjs port
+      if (isFinite(args[0])) {
+        port = args[0];
+      // publicjs dir
+      } else {
+        dir = args[0];
+      }
+    }
+}
+var root = path.resolve(dir);
+// 【修正】公開ルートの末尾に区切り文字を付けた接頭辞を用意する
+// （root が "/" や "C:\" のように既に区切り文字で終わる場合は二重に付けない）
+var rootPrefix = root.slice(-1) === path.sep ? root : root + path.sep;
+
+if (path) {
+  http.createServer(function(req, res) {
+    var pathname = url.parse(req.url).pathname;
+    var filePath = path.join(dir, pathname); // Real file path
+    var base = filePath.replace(dir, ''); // Base path for browser link
+    var abs = path.resolve(filePath);
+    console.log(new Date().toString(), abs);
+
+    // 【修正】区切り文字なしの前方一致（abs.indexOf(root) !== 0）では、root が /srv/pub のとき
+    // /srv/pub/../pub2/secret（= /srv/pub2/secret）も通ってしまうため、
+    // 「root と完全に一致する」か「root + 区切り文字 で始まる」場合だけ許可する
+    if (abs !== root && abs.indexOf(rootPrefix) !== 0) {
+      res.writeHead(403, { 'Content-Type': 'text/plain' });
+      res.end('Forbidden\n');
+      return;
+    }
+
+    fs.readFile(filePath, function(err, data) {
+      if (err) {
+        res.writeHead(200, { 'Content-Type': 'text/html' });
+        // Index files if 404 or directory
+        if ([2, 21, 28, -1, -21].indexOf(err.errno) < 0) {
+          // 修正: エラー内容（パスを含む）をエスケープしてから出力
+          res.write(['<h1>', escapeHtml(res.message), '</h1>'].join(''));
+          res.end(['<pre>', escapeHtml(JSON.stringify(err, null, '  ')), '</pre>'].join(''));
+          return;
+        } else {
+          if (err.errno == 2) { // 404
+            filePath = path.dirname(filePath);
+          }
+          fs.readdir(filePath, function(err, files) {
+            if (err) {
+              // 修正: エラー内容（パスを含む）をエスケープしてから出力
+              res.write(['<h1>', escapeHtml(res.message), '</h1>'].join(''));
+              res.end(['<pre>', escapeHtml(JSON.stringify(err, null, '  ')), '</pre>'].join(''));
+              return;
+            }
+            var list = ['<ul>'];
+            files.unshift('..');
+            files.forEach(function(file) {
+              // 【修正2】リンク先が "/"（Windows では "\" も）で始まらない相対パスのときは、先頭に "./" を付ける。
+              // dir を末尾スラッシュ付きで指定したとき（"pub/" "./" "/" など）のルートの一覧では base が空になり、
+              // 既定の dir "." のときのサブディレクトリの一覧では base が "サブディレクトリ名/" になるため、
+              // href がファイル名・ディレクトリ名そのものから始まる。HTML エスケープだけでは、
+              // "javascript:alert(1)" という名前のファイルを置かれると、href がスキーム付きの URL として解釈され、
+              // クリックで JavaScript が実行された。"./" で始まる値はスキームとして解釈されない
+              // （スキームは英字で始まる必要がある）ので、これを防げる。相対 URL の "./x" は "x" と同じ場所を指すので、
+              // リンク先は変わらない。
+              var href = path.join(base, file);
+              if (href.charAt(0) !== '/' && href.charAt(0) !== '\\') {
+                href = './' + href;
+              }
+              // 修正: ファイル名を href 属性と要素内容に埋め込む前に HTML エスケープする
+              list.push('<li><a href="', escapeHtml(href),'">', escapeHtml(file), '</a></li>');
+            });
+            list.push('</ul>');
+            // 修正: リクエストパスから作った abs も HTML エスケープしてから出力
+            res.write(['<h1>', 'Index of "', escapeHtml(abs), '"</h1>'].join(''));
+            res.end(list.join('\n'));
+          });
+        }
+        return;
+      }
+      res.writeHead(200, { 'Content-Type': mime.lookup(filePath) });
+      res.end(data);
+    });
+  }).listen(port, function() {
+    console.log('Public.js server running with "' + path.resolve(dir) + '" on port ' + port);
+  });
+} else {
+  error(USAGE);
+}
+```
+
+---
