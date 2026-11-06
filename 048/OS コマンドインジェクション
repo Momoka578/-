@@ -1,0 +1,75 @@
+## No.48 CVE-2017-16100 skoranga/node-dns-sync lib/dns-sync.js（prePatch b748fe7）
+
+- 修正した脆弱性: OS コマンドインジェクション（CWE-78）
+- 修正対象ファイル: lib/dns-sync.js
+- 修正の内容:
+  - require の後に、ホスト名の正規表現 VALID_HOSTNAME と関数 isValidHostname() を加えた。許すのは英数字・"-"・"." だけ（各ラベルは 1〜63 文字、先頭と末尾は英数字、末尾の "." は可）。文字列以外・空文字・255 文字以上は拒否する。IPv6 アドレスは net.isIPv6() が真で、16 進数・":"・"." だけでできている場合に限って許す。
+  - 元の 19 行目: cmd の組み立てを変数宣言の外へ移し、その前に isValidHostname(hostname) で検証する。不正な値なら shell.exec を呼ばずに null を返す（元のコードも解決に失敗すると null を返すので、戻り値の決まりは同じ）。
+  - 防げること: hostname に `;` `&&` `|` `$( )` バッククォート・空白・引用符・改行などを入れて、/bin/sh 経由で任意のコマンドを実行すること。"-" で始まる引数、配列、toString を書き換えたオブジェクトも弾く。
+- 副作用・直さなかった点（エージェントの報告）:
+  - "_" を含む名前、文字列以外の引数、Unicode のままの国際化ドメイン名は null になる（punycode に変換すれば通る）。
+  - shell.exec（シェル経由）と util.format の使い方は変えていない。execFileSync／spawnSync に変えると、shelljs の応答（response.code／response.output）に頼る後の処理まで変える必要があり、修正が大きくなるため。入力の検証だけで、シェルに渡る文字は安全なものに限られる。
+- 確認:
+  - 親: 元ファイルとの差分が上の修正箇所とファイル末尾の改行だけであること、node --check で構文エラーがないことを確認した。
+  - エージェント（MARK END の後）: shelljs と debug をスタブにし、実際のシェルは起動せずに shell.exec に渡るコマンド文字列を記録した。修正版は 26 ケースすべて期待どおりで、正常な 7 件（www.example.com、localhost、127.0.0.1、::1 など）は shell.exec まで届き、攻撃・不正な入力 19 件は shell.exec が呼ばれずに null が返った。元のコードでは 19 件すべてがそのままコマンド文字列に連結された。最長 19997 文字の入力でも検証は数 ms で、ReDoS は起きない。
+  - 修正ファイルは、書き出した後に直していない。
+- 使用トークン量（修正）: 新規 5,364（入力 4 ／ キャッシュ作成 2,308 ／ 出力〔推定〕 3,052）、キャッシュ読込 30,848、総処理 36,212、リクエスト 2 回
+
+```javascript
+'use strict';
+
+var net = require('net'),
+    util = require('util'),
+    path = require('path'),
+    shell = require('shelljs'),
+    debug = require('debug')('dns-sync');
+
+// 【修正】ホスト名として許す形式（英数字・"-"・"." のみ。各ラベルは 1〜63 文字で、先頭と末尾は英数字。末尾の "." は可）。
+// シェルのメタ文字（; & | $ ` ( ) < > 空白 引用符 改行 など）は一切含まれないため、シェルに渡しても安全になる。
+var VALID_HOSTNAME = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*\.?$/;
+
+// 【修正】ホスト名（または IP アドレス）として正しい文字列かを検証する
+function isValidHostname(hostname) {
+    if (typeof hostname !== 'string' || hostname.length === 0 || hostname.length > 254) {
+        return false;
+    }
+    // 【修正】IPv6 アドレスは 16 進数・":"・"." だけで構成されるものに限って許可する
+    if (net.isIPv6(hostname)) {
+        return /^[0-9A-Fa-f:.]+$/.test(hostname);
+    }
+    return VALID_HOSTNAME.test(hostname);
+}
+
+/**
+ * Resolve hostname to IP address,
+ * returns null in case of error
+ */
+module.exports = {
+    resolve: function resolve(hostname) {
+        var output,
+            nodeBinary = process.execPath,
+            scriptPath = path.join(__dirname, "../scripts/dns-lookup-script"),
+            response,
+            cmd;
+
+        // 【修正】コマンド文字列を組み立てる前にホスト名を検証し、不正な値はシェルに渡さず null を返す
+        if (!isValidHostname(hostname)) {
+            debug('hostname', "invalid hostname " + hostname);
+            return null;
+        }
+        cmd = util.format('"%s" "%s" %s', nodeBinary, scriptPath, hostname);
+
+        response = shell.exec(cmd, {silent: true});
+        if (response && response.code === 0) {
+            output = response.output;
+            if (output && net.isIP(output)) {
+                return output;
+            }
+        }
+        debug('hostname', "fail to resolve hostname " + hostname);
+        return null;
+    }
+};
+```
+
+---
