@@ -1,0 +1,352 @@
+## No.92 CVE-2020-11059 aegir（ipfs/aegir, src/config/webpack.config.js）
+
+- 検証した修正コード: "xss以外の修正コード"
+- 検証結果: **不備あり** — 環境変数をまるごとバンドルに埋め込む問題は、参照の形 10 通り×production・development・解析モード・karma 用のバンドルとソースマップのすべてで直った（元は秘密値 10 か所、修正後 0。実行時の process.env は {}）。ただし修正で加えた DefinePlugin の 'process.env.NODE_ENV' の固定値が、webpack 4 では先に登録したものが勝つため、利用者設定の DefinePlugin や mode: 'production' の NODE_ENV を上書きしてしまう動作の不具合が入った（'staging'・'production' → 'development'。説明では「衝突しない」とし副作用にも記載なし）。修正コード2: NODE_ENV の固定定義と不要になった require('webpack') を削除し、NODE_ENV は mode に従う webpack の optimization.nodeEnv に任せる。既定の設定の出力は元の修正とバイト単位で同じ、秘密値 0、利用者の上書きは元と同じく効く（webpack-cli・実際の karma は未起動）
+- 修正コード2 のファイル: src/config/webpack.config.js
+- 親の確認: src/config/webpack.config.js: node --check で構文エラーなし。エージェントが読み取り専用の材料（orig・given）を変えていないこと、読まない範囲のファイルを読んでいないことを、記録で確認した。
+- 使用トークン量（検証）: 新規 69,108（入力 36 ／ キャッシュ作成 41,462 ／ 出力〔推定〕 27,610）、キャッシュ読込 691,249、総処理 760,357、リクエスト 18 回
+- 使用トークン量（再修正）: 新規 31,398（入力 22 ／ キャッシュ作成 16,859 ／ 出力〔推定〕 14,517）、キャッシュ読込 754,512、総処理 785,910、リクエスト 11 回
+
+- 対象: "xss以外の修正コード" の No.92（`$R/given/fix_nx/src/config/webpack.config.js`）
+- 修正コード2: `$R/fix2/src/config/webpack.config.js`（直したのはこのファイルだけ）
+- 検証結果: **不備あり**。環境変数をバンドルに埋め込む脆弱性は、すべての経路で直っていた。ただし、修正で `process.env.NODE_ENV` を最優先の固定値として定義したため、利用者の webpack 設定で NODE_ENV や mode を指定しても効かなくなった。正常な設定での動作が、意図せず変わっていた。
+
+### 元の修正コードの不備
+
+#### 不備1: `process.env.NODE_ENV` を固定値で最優先に定義したため、利用者設定（DefinePlugin・mode・optimization.nodeEnv）による指定が効かなくなった（動作の不具合。脆弱性ではない）
+
+- 場所: `src/config/webpack.config.js` 119〜121 行目（元の修正コードの行番号）
+
+  ```js
+  plugins: [
+    // 【修正】…（111〜118 行目のコメント）
+    new webpack.DefinePlugin({
+      'process.env.NODE_ENV': JSON.stringify(isProduction ? 'production' : 'development')
+    })
+  ],
+  ```
+
+  116 行目のコメントには「webpack の optimization.nodeEnv の既定値と一致するので、定義が衝突しない」とある。修正の説明にも同じことが書いてある。
+
+- 問題の原因:
+  - webpack 4 では、同じキーの DefinePlugin が複数あると、**先に登録したもの**の値が使われる。DefinePlugin は parser の `expression` フック（SyncBailHook）に登録する。最初に値を返したものだけが使われ、後のものは呼ばれない。
+  - aegir は `merge(base(env, argv), {...}, external)` の順に設定を merge する。webpack-merge は plugins の配列を連結するので、base の plugins（この DefinePlugin）は利用者設定（`userConfig.webpack`、つまり `.aegir.js` の `webpack`）の plugins より前に並ぶ。
+  - webpack が mode から自動で入れる `optimization.nodeEnv` の DefinePlugin は、`WebpackOptionsApply` で、設定の plugins をすべて登録した後に登録される。
+  - そのため、修正コードが定義した固定値（`isProduction` だけで決まる 'production' / 'development'）がいつも最優先になる。利用者は、自分の設定で `process.env.NODE_ENV` を変えられなくなった。
+  - 元のコードは `'process.env'`（オブジェクト全体）しか定義していなかった。`process.env.NODE_ENV` というキーそのものには、利用者の DefinePlugin か optimization.nodeEnv（mode に従う）の定義が使われていた。aegir は利用者設定を最後に merge して上書きできるようにしているので、これは利用者が使える正常な機能だった。
+- 問題になる入力・条件（webpack 4.43.0 で、元のコードと修正コードを同じ設定でビルドし、バンドルを実行して確かめた。結果は「元 → 修正コード」）:
+
+  | 利用者設定（`userConfig.webpack`） | NODE_ENV | 元のコード | 元の修正コード |
+  |---|---|---|---|
+  | `plugins: [new DefinePlugin({'process.env.NODE_ENV': '"staging"'})]` | development | 'staging' | 'development'（利用者の定義が黙って無視される） |
+  | 同上 | production | 'staging' | 'production' |
+  | `mode: 'production'` | development | 'production' | 'development'（mode は production なのに NODE_ENV が development で、食い違う） |
+  | `optimization: { nodeEnv: false }` | staging | 'staging' | 'development' |
+  | なし（既定） | production / development / test（karma） | 'production' / 'development' / 'development' | 同じ |
+  | `DefinePlugin({'process.env.MY_PUBLIC': ...})`（NODE_ENV 以外のキー） | development | 効く | 効く |
+
+  - 例: 利用者が、ブラウザテスト用に `.aegir.js` の webpack で `process.env.NODE_ENV` を 'test' にしても、'development' のままになる。
+  - 例: 利用者設定で mode を 'production' にした場合、`if (process.env.NODE_ENV !== 'production') { … }` の開発用コードが、本番 mode のバンドルに残る。
+  - 修正の説明は「ほかに必要な値がある場合は、利用者が自分の webpack 設定で明示的に追加する」と案内している。しかし NODE_ENV だけは、利用者が定義しても効かない。この点は説明の「副作用」にも書かれていない。
+
+#### 確かめたが不備ではなかった点（参考）
+
+- 環境変数の埋め込み（判定の脆弱性）は直っていた。`process.env.X`・`process.env['X']`・`process.env[変数]`・`process.env` 全体・`Object.keys(process.env)`・`JSON.stringify(process.env)`・`const {env} = process`・`p = process; p.env.X`・依存（debug）の中の参照を含むコードをビルドした。production の index.js・index.min.js・両方のソースマップ、development の index.js、AEGIR_BUILD_ANALYZE=true の経路、AEGIR_NODE=false の経路、karma.conf.js と同じ merge のブラウザテスト用バンドルを調べた。どこにも秘密値（テスト用の SECRET_TOKEN_VF・NPM_TOKEN・PATH）は入っていなかった。元のコードでは、どれにも入っていた。
+- 同じコミットの babelrc.js（環境変数を埋め込む babel プラグインはない）と karma.conf.js（DefinePlugin はパスの 2 値だけ）にも、環境変数をまとめて埋め込む経路はなかった。
+- 修正の説明で対象外とした「devtoolModuleFilenameTemplate によるソースマップへの絶対パスの埋め込み」は、判定の根拠とは別の箇所・別の原因で、根拠の修正の成立に関係しない。対象外とした理由は妥当。
+
+### 再修正の内容
+
+修正コード2（`$R/fix2/src/config/webpack.config.js`）は、元の修正コードを `cp` でコピーし、次の 2 か所だけを変えた。ほかの行は元の修正コードと同じ。
+
+#### 変更1: aegir 側の `process.env.NODE_ENV` の定義を外した（111〜125 行目）
+
+```js
+    plugins: [
+      // 【修正】以前は `'process.env': JSON.stringify(process.env)` で、ビルドしたマシンの
+      // 環境変数すべて（GH_TOKEN や NPM トークン、クラウドの認証情報など）をバンドルに
+      // 埋め込んでいた。そのため、dist/index.js やソースマップに平文で残っていた。
+      // 【修正2】元の修正では、ここで 'process.env.NODE_ENV' を mode と同じ固定値
+      // （…中略。理由と方針を説明するコメント）
+      // それ以外の process.env.XXX は、node.process の polyfill（空の env）により undefined になる。
+      // ほかに必要な値がある場合は、利用者が自分の webpack 設定で明示的に追加する。
+    ],
+```
+
+- 何を変えたか: `new webpack.DefinePlugin({ 'process.env.NODE_ENV': JSON.stringify(isProduction ? 'production' : 'development') })` を削除した。base の `plugins` は空の配列になった。元のコードの `'process.env': JSON.stringify(process.env)` も、元の修正どおり無いままである。
+- なぜこの方法にしたか:
+  - base の `mode` は `isProduction ? 'production' : 'development'` である。webpack 4 の `optimization.nodeEnv` の既定値は mode と同じなので、webpack が自動で `DefinePlugin({'process.env.NODE_ENV': '"production"'})`（または `"development"`）を入れる。元の修正が定義していた値とまったく同じである。aegir 側で同じものを重ねて定義する必要はなかった。
+  - webpack が入れるこの定義は、設定の plugins より後に登録される。そのため、利用者が自分の設定の DefinePlugin で NODE_ENV を定義すれば、利用者の値が使われる。mode を変えれば、nodeEnv も mode に従う。どちらも元のコードと同じ動作に戻る。
+  - 固定値の DefinePlugin を merge の後ろへ移す方法も考えた。しかし、その方法では mode の上書きと食い違ううえ、`module.exports` の 3 か所の merge を変えることになる。定義を外すだけなら変更は 1 か所で済み、既定の動作は変わらない。
+- どう動くか:
+  - バンドルの中の `process.env.NODE_ENV` は、webpack の optimization.nodeEnv（利用者が定義した場合は利用者の値）に置き換わる。
+  - それ以外の `process.env.XXX`・`process.env` 全体は、元の修正と同じく `node.process: true` の polyfill（`env` は `{}`）を参照する。値は undefined、`process.env` は `{}` になる。環境変数の値がバンドルに入る経路はない。
+
+#### 変更2: 使われなくなった `const webpack = require('webpack')` を外した（4〜5 行目）
+
+```js
+const path = require('path')
+// 【修正2】このファイルで webpack.DefinePlugin を使わなくなったので、使われない
+// `const webpack = require('webpack')` を外した（standard の no-unused-vars に当たるため）。
+const merge = require('webpack-merge')
+```
+
+- 何を変えたか: このファイルで `webpack` を参照していたのは DefinePlugin だけだった。変更1でそれが無くなったので、require も外した。
+- なぜ: aegir は自分のコードを standard（eslint）で lint している。使わない変数を残すと `no-unused-vars` のエラーになる。
+
+### 確認した内容と結果
+
+確認環境: `$R/bench` に webpack@4.43.0（aegir の package.json の ^4.43.0）、webpack-merge@4.2.2、terser-webpack-plugin@2.3.6、babel-loader@8、@babel/core・@babel/runtime@7.9.6、debug@4、standard@14 を `npm install --ignore-scripts` で入れた。aegir 本体は入れていない。webpack-bundle-analyzer・stats-webpack-plugin はサーバを起動しないスタブにした。aegir の utils.js・user.js・babelrc.js は、必要な部分だけのスタブにした。元のコード・元の修正コード・修正コード2 を同じ構成（`$R/bench/run/{orig,given,fix2}`）に置いた。同じ利用者プロジェクト（`$R/bench/proj`）を、秘密の環境変数（SECRET_TOKEN_VF=ghp_LEAKME123456、NPM_TOKEN=npm_LEAKME987）を付けてビルドした。
+
+1. 構文・lint
+   - `node --check`: OK。
+   - standard@14（aegir と同じ lint）: 元のコード・元の修正コード・修正コード2 のどれもエラーなし。
+2. 脆弱性（環境変数の埋め込み）
+   - 修正コード2 では、production の index.js・index.js.map・index.min.js・index.min.js.map と、development の index.js のすべてで、秘密値・NPM トークン・"PATH" は 0 か所だった。元のコードでは、index.js に 10 か所、index.min.js にも 10 か所あった。
+   - バンドルを vm で実行した。`process.env.SECRET_TOKEN_VF`・`['…']`・`[変数]` は undefined、`process.env` は `{}`、`Object.keys(process.env)` は `[]` だった。
+   - AEGIR_BUILD_ANALYZE=true の経路、AEGIR_NODE=false の経路（production・development）、karma.conf.js 20〜28 行目と同じ merge（NODE_ENV=test、TEST_DIR などの DefinePlugin を足す）でも、秘密値は 0 か所だった。karma の TEST_DIR は元どおり置き換わった。
+3. 既定の動作（元の修正コードとの比較）
+   - 既定の設定（利用者設定なし）で、production（index.js・index.min.js・2 つのソースマップ）と development（index.js）のバンドルは、元の修正コードのものとバイト単位で同じだった（ソースマップはディレクトリ名の違いだけを揃えて比較）。
+   - `process.env.NODE_ENV` は、production で 'production'、development で 'development'、karma（NODE_ENV=test）で 'development' だった。元のコードとも同じである。
+4. 不備の入力での確認（元 → 元の修正 → 修正コード2）
+   - 利用者の DefinePlugin で NODE_ENV='staging'（NODE_ENV=development）: 'staging' → 'development' → **'staging'**
+   - 同（NODE_ENV=production）: 'staging' → 'production' → **'staging'**
+   - 利用者設定で mode: 'production'（NODE_ENV=development）: 'production' → 'development' → **'production'**
+   - 利用者の DefinePlugin で `process.env.MY_PUBLIC`: どれも 'pub-value'（元のコードでは秘密値も入っていた）
+   - 修正コード2 では、利用者設定による NODE_ENV と mode の指定が、元のコードと同じく効くようになった。
+
+### 副作用・残る点
+
+- 利用者設定で `optimization: { nodeEnv: false }`（または `mode: 'none'`）にした場合、`process.env.NODE_ENV` は undefined（polyfill の空の env）になる。元のコードでは環境変数全体の埋め込みにより実際の NODE_ENV（例 'staging'）が入り、元の修正コードでは 'development' が入っていた。nodeEnv を無効にするのは「webpack に NODE_ENV を定義させない」という利用者の指定なので、undefined は webpack 本来の動作と考え、そのままにした。必要なら、利用者が自分の DefinePlugin で定義できる（修正コード2 では利用者の定義が効く）。
+- `process.env.NODE_ENV` 以外の `process.env.XXX` は undefined になる。これは元の修正コードと同じ副作用である（ビルド時の環境変数をブラウザ側で読んでいた利用者は、自分の webpack 設定の DefinePlugin で、必要なキーだけを明示して追加する）。
+- 33 行目の `devtoolModuleFilenameTemplate` により、ソースマップにビルドしたマシンの絶対パスが入る点は、元の修正と同じく変えていない（判定の根拠の環境変数の埋め込みとは別の問題）。
+- 確認は webpack 4.43.0 で行った。webpack-cli 経由のビルドや実際の karma の起動は行っていない。どちらも同じ webpack の設定オブジェクトを webpack に渡すだけなので、harness.js と karma_like.js で同じ設定を渡して確かめた。
+
+### 修正コード2 の全文: src/config/webpack.config.js
+
+```javascript
+'use strict'
+
+const path = require('path')
+// 【修正2】このファイルで webpack.DefinePlugin を使わなくなったので、使われない
+// `const webpack = require('webpack')` を外した（standard の no-unused-vars に当たるため）。
+const merge = require('webpack-merge')
+const { BundleAnalyzerPlugin } = require('webpack-bundle-analyzer')
+const StatsPlugin = require('stats-webpack-plugin')
+const TerserPlugin = require('terser-webpack-plugin')
+const { fromRoot, pkg, paths, getLibraryName } = require('../utils')
+const userConfig = require('./user')()
+const isProduction = process.env.NODE_ENV === 'production'
+
+const base = (env, argv) => {
+  const filename = [
+    'index',
+    isProduction ? '.min' : null,
+    '.js'
+  ]
+    .filter(Boolean)
+    .join('')
+
+  return {
+    bail: Boolean(isProduction),
+    mode: isProduction ? 'production' : 'development',
+    devtool: isProduction ? 'source-map' : undefined,
+    entry: [userConfig.entry],
+    output: {
+      path: fromRoot(paths.dist),
+      filename: filename,
+      sourceMapFilename: filename + '.map',
+      library: getLibraryName(pkg.name),
+      libraryTarget: 'umd',
+      devtoolModuleFilenameTemplate: info => 'file:' + encodeURI(info.absoluteResourcePath)
+    },
+    module: {
+      rules: [
+        {
+          oneOf: [
+            {
+              test: /\.js$/,
+              include: fromRoot(paths.src),
+              use: {
+                loader: require.resolve('babel-loader'),
+                options: {
+                  presets: [require('./babelrc')()],
+                  babelrc: false,
+                  cacheDirectory: true
+                }
+              }
+            },
+            {
+              test: /\.js$/,
+              exclude: /@babel(?:\/|\\{1,2})runtime/,
+              use: {
+                loader: require.resolve('babel-loader'),
+                options: {
+                  presets: [require('./babelrc')()],
+                  babelrc: false,
+                  cacheDirectory: true,
+                  sourceMaps: false
+                }
+              }
+            }
+          ]
+        }
+      ]
+    },
+    resolve: {
+      alias: {
+        '@babel/runtime': path.dirname(
+          require.resolve('@babel/runtime/package.json')
+        )
+      }
+    },
+    optimization: {
+      minimize: isProduction,
+      minimizer: [
+        // This is only used in production mode
+        new TerserPlugin({
+          terserOptions: {
+            parse: {
+              // we want terser to parse ecma 8 code. However, we don't want it
+              // to apply any minfication steps that turns valid ecma 5 code
+              // into invalid ecma 5 code. This is why the 'compress' and 'output'
+              // sections only apply transformations that are ecma 5 safe
+              // https://github.com/facebook/create-react-app/pull/4234
+              ecma: 8
+            },
+            compress: {
+              ecma: 5,
+              warnings: false
+            },
+            mangle: {
+              safari10: true
+            },
+            output: {
+              ecma: 5,
+              comments: false
+            }
+          },
+          // Use multi-process parallel running to improve the build speed
+          // Default number of concurrent runs: os.cpus().length - 1
+          parallel: true,
+          // Enable file caching
+          cache: true,
+          sourceMap: true
+        })
+      ]
+    },
+    plugins: [
+      // 【修正】以前は `'process.env': JSON.stringify(process.env)` で、ビルドしたマシンの
+      // 環境変数すべて（GH_TOKEN や NPM トークン、クラウドの認証情報など）をバンドルに
+      // 埋め込んでいた。そのため、dist/index.js やソースマップに平文で残っていた。
+      // 【修正2】元の修正では、ここで 'process.env.NODE_ENV' を mode と同じ固定値
+      // （'production' / 'development'）で定義していた。webpack 4 では、同じキーの DefinePlugin は
+      // 先に登録したものが勝つ。この base の plugins は、merge で利用者設定（userConfig.webpack）より前に並び、
+      // optimization.nodeEnv の定義（webpack が後から登録する）よりも前になる。そのため、利用者が自分の設定の
+      // DefinePlugin・mode・optimization.nodeEnv で NODE_ENV を指定しても、黙って無視されていた。
+      // aegir 側では NODE_ENV も定義せず、webpack 4 が mode に合わせて自動で定義する optimization.nodeEnv
+      // （既定は mode と同じ 'production' / 'development'）に任せる。既定の値は元の修正と同じで、
+      // 利用者設定による上書きは元のコードと同じく効く。環境変数の値はバンドルに一切入らない。
+      // それ以外の process.env.XXX は、node.process の polyfill（空の env）により undefined になる。
+      // ほかに必要な値がある場合は、利用者が自分の webpack 設定で明示的に追加する。
+    ],
+    target: 'web',
+    node: process.env.AEGIR_NODE === 'false' ? {
+      global: true,
+      __filename: 'mock',
+      __dirname: 'mock',
+      dgram: false,
+      fs: false,
+      net: false,
+      tls: false,
+      child_process: false,
+      console: false,
+      process: true, // TODO remove this once readable-stream is fixed
+      Buffer: false,
+      setImmediate: false,
+      os: false,
+      assert: false,
+      constants: false,
+      events: false,
+      http: false,
+      path: false,
+      querystring: false,
+      stream: false,
+      string_decoder: false,
+      timers: false,
+      url: false,
+      util: false,
+      crypto: false
+    } : {
+      dgram: 'empty',
+      fs: 'empty',
+      net: 'empty',
+      tls: 'empty',
+      child_process: 'empty',
+      console: false,
+      global: true,
+      process: true,
+      __filename: 'mock',
+      __dirname: 'mock',
+      Buffer: true,
+      setImmediate: true
+    }
+  }
+}
+
+module.exports = (env, argv) => {
+  const external = typeof userConfig.webpack === 'function'
+    ? userConfig.webpack(env, argv)
+    : userConfig.webpack
+  if (process.env.AEGIR_BUILD_ANALYZE === 'true') {
+    return merge(
+      base(env, argv),
+      {
+        plugins: [
+          new BundleAnalyzerPlugin(),
+          new StatsPlugin('stats.json')
+        ],
+        profile: true
+      },
+      external
+    )
+  }
+  if (isProduction) {
+    return [
+      merge(
+        base(env, argv),
+        {
+          output: {
+            filename: 'index.js',
+            sourceMapFilename: 'index.js.map'
+          },
+          optimization: {
+            minimize: false
+          }
+        },
+        external
+      ),
+      merge(
+        base(env, argv),
+        external
+      )
+    ]
+  }
+
+  return merge(
+    base(env, argv),
+    {
+      output: {
+        filename: 'index.js',
+        sourceMapFilename: 'index.js.map'
+      },
+      optimization: {
+        minimize: false
+      }
+    },
+    external
+  )
+}
+```
+
+---
