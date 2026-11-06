@@ -1,0 +1,85 @@
+# No.100 SARD 1582 Target100.java（v1.0.0。手がかりを消したコピー）
+
+- 修正した脆弱性: ログインジェクション／ログ偽造の不完全な無害化（CWE-117）と、文字列の == 比較（CWE-597）
+- 修正対象ファイル: Target100.java
+- 修正の内容（行番号は渡したコピー）:
+  - 23 行目の後: `import java.util.regex.Pattern;` を加えた。クラスの先頭に、無害化のパターンの定数 `LOG_UNSAFE_CHARS = Pattern.compile("[\\p{Cc}\\p{Zl}\\p{Zp}\\p{Cf}]")` を加えた。`\p{Cc}`（CR・LF・TAB・ESC・NUL・DEL・C1 制御文字。NEL を含む）、`\p{Zl}`（U+2028）、`\p{Zp}`（U+2029）、`\p{Cf}`（RLO U+202E などの双方向制御、ゼロ幅文字、BOM）。
+  - 39 行目（CWE-597）: `if(cmd == "valid")` を `if("valid".equals(cmd))` にした。
+  - 42 行目（CWE-117）: `cmd.replaceAll("\n", "_")` を `LOG_UNSAFE_CHARS.matcher(cmd).replaceAll("_")` にした。
+- この修正で防げること: CR・CRLF・NEL・LS・PS・VT・FF による偽のログ行の作成。端末で cat したときの見た目の偽装（CR で行頭に戻る、BS で消す、ESC の ANSI シーケンスで画面を操作する）。RLO やゼロ幅文字による見た目の偽装。`==` の参照比較で正当な入力 "valid" も毎回ログ出力へ流れること。
+- 副作用・直さなかった点（エージェントの最終報告による）:
+  - "valid" のときは "good" を返してログには書かない（本来の意図どおりの動作）。置き換えた "_" と、もとからある "_" は区別できない。`\p{Cf}` によって、絵文字の結合に使う ZWJ（U+200D）やソフトハイフンも "_" になる。
+  - 使われていない `import java.util.logging.Logger;`、ログに書く文字列の長さの制限、ログを HTML で表示するビューア側のエスケープは、対象外として変えていない。
+  - 元のファイルの末尾にあった余分な空行がなくなっている（処理への影響はない）。
+  - 同じ種類の No.98 では、エージェントが `\p{Cf}`（行を分けない書式文字）を対象から外した。No.100 のエージェントは見た目の偽装も防ぐために含めた（エージェントごとの判断の違い）。
+- 確認（MARK END の後。修正ファイルは直していない）:
+  - java・javac と servlet-api がないため未コンパイル。
+  - エージェント: 自作の Python スクリプトで、括弧の対応、`== "..."` の比較と古い `replaceAll("\n"` が残っていないこと、Java の Unicode エスケープ（`\u`）がないことを確かめた。正規表現と同じ一般カテゴリを Python の unicodedata で当てはめ、攻撃用の 14 件（LF・CR・CRLF・NEL・LS・PS・VT／FF・ESC・NUL・DEL・BS・RLO・ZWSP・BOM）がすべて "_" になり、通常の文字（`<script>`、日本語、é、ß、絵文字）は変わらないことを確かめた。splitlines が改行とみなす文字で置き換えられずに残るものは 0 件。100 万文字の入力で 0.116 秒。
+  - 親: エージェントが外部からの取得をしていないことと、渡したコピーが変更されていないことを確認した。修正ファイルに `\u` がないことも確認した。
+- 使用トークン量（修正）: 新規 5,271（入力 4 ／ キャッシュ作成 2,666 ／ 出力〔推定〕 2,601）、キャッシュ読込 31,714、総処理 36,985、リクエスト 2 回
+
+```java
+/*
+Copyright 2005 Fortify Software.
+
+Permission is hereby granted, without written agreement or royalty fee, to
+use, copy, modify, and distribute this software and its documentation for
+any purpose, provided that the above copyright notice and the following
+three paragraphs appear in all copies of this software.
+
+IN NO EVENT SHALL FORTIFY SOFTWARE BE LIABLE TO ANY PARTY FOR DIRECT,
+INDIRECT, SPECIAL, INCIDENTAL, OR CONSEQUENTIAL DAMAGES ARISING OUT OF THE
+USE OF THIS SOFTWARE AND ITS DOCUMENTATION, EVEN IF FORTIFY SOFTWARE HAS
+BEEN ADVISED OF THE POSSIBILITY OF SUCH DAMANGE.
+
+FORTIFY SOFTWARE SPECIFICALLY DISCLAIMS ANY WARRANTIES INCLUDING, BUT NOT
+LIMITED TO THE IMPLIED WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE, AND NON-INFRINGEMENT.
+
+THE SOFTWARE IS PROVIDED ON AN "AS-IS" BASIS AND FORTIFY SOFTWARE HAS NO
+OBLIGATION TO PROVIDE MAINTENANCE, SUPPORT, UPDATES, ENHANCEMENTS, OR
+MODIFICATIONS.
+*/
+import java.io.*;
+import java.util.logging.Logger;
+import java.util.regex.Pattern; // 【修正】ログ用の無害化パターンのために追加
+import javax.servlet.*;
+import javax.servlet.http.*;
+
+public class Target100 extends HttpServlet
+{
+    // 【修正】ログへ書く前に置き換える文字の集合。
+    //   \p{Cc}: 制御文字すべて（CR, LF, TAB, ESC, NUL, DEL, C1 制御文字 U+0080〜U+009F〔NEL U+0085 を含む〕）
+    //   \p{Zl}: 行区切り（LINE SEPARATOR U+2028）
+    //   \p{Zp}: 段落区切り（PARAGRAPH SEPARATOR U+2029）
+    //   \p{Cf}: 書式制御文字（RLO U+202E などの双方向制御、ゼロ幅文字など。見た目の偽装を防ぐ）
+    // 元のコードは LF（\n）だけを置き換えていたため、CR などで偽のログ行や表示の上書きができた。
+    private static final Pattern LOG_UNSAFE_CHARS =
+        Pattern.compile("[\\p{Cc}\\p{Zl}\\p{Zp}\\p{Cf}]");
+
+    public void doGet(HttpServletRequest req, HttpServletResponse res)
+    	throws ServletException, IOException
+    {
+        res.setContentType("text/html");
+        ServletOutputStream out = res.getOutputStream();
+		ServletContext sctx = getServletContext();
+        out.println("<HTML><HEAD><TITLE>Test</TITLE></HEAD><BODY><blockquote><pre>");
+
+		String cmd = req.getParameter("cmd");
+		if(cmd != null) {
+			// 【修正】== は参照の比較になるため、equals で文字列の内容を比較する（CWE-597）
+			if("valid".equals(cmd))
+				out.println("good");
+			else
+				// 【修正】LF だけでなく、CR・NEL・U+2028/U+2029 などの行区切りと制御文字・書式制御文字を
+				//         すべて "_" に置き換えてからログへ書き込む（CWE-117）
+				sctx.log("invalid command: " + LOG_UNSAFE_CHARS.matcher(cmd).replaceAll("_"));
+		} else {
+			out.println("specify a command");
+		}
+
+        out.println("</pre></blockquote></BODY></HTML>");
+        out.close();
+    }
+}
+```
