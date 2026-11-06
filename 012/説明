@@ -1,0 +1,167 @@
+# No.12 adamdoupe/WackoPicko website/test.php
+
+- XSS の種別: 反射型（GET パラメータが保存されずに、そのリクエストの応答にそのまま出力される）
+- source（ユーザーの入力）: `$_GET['head']`・`$_GET['title']`・`$_GET['href']`・`$_GET['script']`（L2〜5）
+- sink（出力先）: L8 の `echo $head`（head 要素の中）・`echo $title`（title 要素の中）、L10 の `echo $href`（href 属性の値の中）、L12 の `echo $script`（script 要素の中）
+- 修正したファイル: website/test.php
+- 検証（プロンプトファイル2）の結果: 問題なし
+
+### 1. 元のコードの問題
+
+website/test.php（元のコード。ファイル全体が 18 行）:
+```php
+2	$head = $_GET['head'];
+3	$title = $_GET['title'];
+4	$href = $_GET['href'];
+5	$script = $_GET['script'];
+6	?>
+7	<html>
+8	<head><?php echo $head; ?> <title><?php echo $title; ?></title></head>
+9	<body>
+10	<a href="http://<?php echo $href; ?>">text</a>
+11	<script>
+12	   <?php echo $script; ?>
+13	</script>
+```
+
+値の流れは次のとおり。
+
+1. L2〜5 で、URL のパラメータ（`?head=…&title=…` の部分）を 4 つの変数に入れる。
+2. 検証もエスケープ（特別な意味を持つ文字を、ただの文字として扱われる書き方に変えること）もしない。
+3. L8・L10・L12 の `echo` で、HTML の中にそのまま出力する。
+
+4 か所の sink は、HTML の中の位置（文脈）がそれぞれ違う。
+
+- L8 `head`: head 要素の中にそのまま出る。`<script>…</script>` などのタグを直接書ける。
+- L8 `title`: title 要素の中に出る。`</title>` で要素を閉じれば、その後ろに任意のタグを書ける。
+- L10 `href`: `"` で囲まれた属性値の中に出る。値に `"` を入れると属性値の囲みが閉じ、その後ろにイベントハンドラ属性（クリックや読み込みのときに中の JavaScript を実行する属性。`onerror` など）やタグを追加できる。
+- L12 `script`: script 要素の中に出る。値がそのまま JavaScript のプログラムとして実行される。ここは HTML のエスケープだけでは防げない文脈である（"脆弱性の詳細" の判定）。判定は、これを CWE-95 相当の JavaScript コード注入（入力がプログラムとして実行される問題）とも記録した。
+
+攻撃の例（検証で元のコードに送った入力の一部。すべてヘッドレス Chrome（画面を出さずに動かす Chrome）で実際に実行された）:
+
+- `?head=<script>…</script>`: head 要素の中に script 要素ができ、実行される。
+- `?title=</title><script>…</script>`: `</title>` で title を閉じ、その後ろの script 要素が実行される。
+- `?href=x"><img src=x onerror=…>`: `"` で href の値が閉じ、`>` でタグが閉じる。その後ろの img 要素の画像読み込みが失敗し、`onerror` の JavaScript が実行される。
+- `?script=document.documentElement.dataset.pwn=…`: 値が JavaScript の文としてそのまま実行される。
+
+### 2. 修正の内容
+
+#### 修正 1: HTML 用のエスケープ関数 h() を追加した（元のコード L5〜6 の間 → 修正コード L6〜10）
+
+修正前:
+```php
+5	$script = $_GET['script'];
+6	?>
+```
+
+修正後:
+```php
+5	$script = $_GET['script'];
+6	
+7	// 【修正】HTML 出力用のエスケープ関数（< > & " ' をすべて実体参照に変換する）
+8	function h($s) {
+9	    return htmlspecialchars((string)$s, ENT_QUOTES, 'UTF-8');
+10	}
+11	?>
+```
+
+- L8 `function h($s)`: 値を 1 つ受け取り、HTML 用にエスケープした文字列を返す関数を定義する。この関数は、出力の 3 か所（head・title・href）で使う。
+- L9 `(string)$s`: 値を文字列に変える。パラメータが配列（`?head[]=…`）で来た場合も、文字列 `"Array"` になる（検証では、PHP の警告が出るだけで、警告に入力は入らないことを確かめた）。
+- L9 `htmlspecialchars(…, ENT_QUOTES, 'UTF-8')`: PHP の関数で、HTML で特別な意味を持つ文字を実体参照（`&lt;` のように、文字を別の書き方で表したもの。ブラウザは `<` という文字として表示するが、タグの始まりとは見なさない）に変える。
+  - `&` → `&amp;`、`<` → `&lt;`、`>` → `&gt;`、`"` → `&quot;`
+  - `ENT_QUOTES` を付けると、`'` も `&#039;` に変える（付けないと `'` は変わらない）。
+  - `'UTF-8'` は、入力の文字コードを UTF-8 として扱う指定である。正しくない UTF-8 のバイト列が来たときは、空文字列を返す（検証の記録）。
+
+#### 修正 2: head・title の値をエスケープして出力した（元のコード L8 → 修正コード L13〜14）
+
+修正前:
+```php
+8	<head><?php echo $head; ?> <title><?php echo $title; ?></title></head>
+```
+
+修正後:
+```php
+13	<!-- 【修正】head・title の値は HTML エスケープしてから出力し、タグとして解釈されないようにする -->
+14	<head><?php echo h($head); ?> <title><?php echo h($title); ?></title></head>
+```
+
+- L13: HTML のコメント（ブラウザには表示されない）。修正の理由を書いただけで、動作には関係しない。
+- L14: `$head` と `$title` を、`h()` を通してから出力する。
+- 値の中の `<` `>` は `&lt;` `&gt;` になる。ブラウザはそれを文字として表示するだけで、タグとは見なさない。そのため、`<script>` を書いても、`</title>` で閉じようとしても、新しい要素はできない。
+
+#### 修正 3: href の値をエスケープして出力した（元のコード L10 → 修正コード L16〜17）
+
+修正前:
+```php
+10	<a href="http://<?php echo $href; ?>">text</a>
+```
+
+修正後:
+```php
+16	<!-- 【修正】href の値も ENT_QUOTES でエスケープし、" で属性から抜け出せないようにする（スキームは http:// 固定のまま） -->
+17	<a href="http://<?php echo h($href); ?>">text</a>
+```
+
+- L17: `$href` を `h()` を通してから出力する。
+- 値の中の `"` は `&quot;` になる。ブラウザは属性値を読むときに `"` という文字に戻すが、囲みを閉じる記号とは見なさない。そのため、属性値の外に抜け出せない。
+- `&` も `&amp;` になる。入力に `&quot;` と書いても `&amp;quot;` になり、`"` には戻らない。
+- スキーム（`http:` や `javascript:` のような、URL の先頭の種類を表す部分）は、元のコードと同じく `http://` で固定している。入力は `http://` の後ろに付くだけなので、`javascript:` を入れても `http://javascript:…` になり、スクリプトとしては実行されない。
+
+#### 修正 4: script の値を、JavaScript の文字列データとして埋め込んだ（元のコード L12 → 修正コード L19〜21）
+
+修正前:
+```php
+12	   <?php echo $script; ?>
+```
+
+修正後:
+```php
+19	   <?php /* 【修正】入力をコードとして直接埋め込まず、json_encode で JavaScript の文字列リテラル（データ）として埋め込む。
+20	            JSON_HEX_* で < > & ' " を \uXXXX にし、</script> による脱出も防ぐ */ ?>
+21	   var script = <?php echo json_encode((string)$script, JSON_HEX_TAG | JSON_HEX_AMP | JSON_HEX_APOS | JSON_HEX_QUOT); ?>;
+```
+
+- L19〜20: PHP のコメント。ブラウザには送られない。
+- L21 `var script = …;`: 入力を、JavaScript の変数 `script` に入れる文字列として埋め込む。入力はプログラムではなく、データ（文字列の値）として扱われる。
+- `json_encode((string)$script, …)`: PHP の関数で、値を JSON（JavaScript と同じ書き方のデータ形式）に変える。文字列なら、前後を `"` で囲み、中の特別な文字を `\` を使った書き方（エスケープシーケンス）に変える。結果は、JavaScript の文字列リテラル（プログラムの中に直接書いた文字列の値）として、そのまま使える。
+- 付けたフラグ（`|` は、複数の指定を組み合わせる演算子）:
+  - `JSON_HEX_TAG`: `<` `>` を `<` `>` にする。`</script>` という文字の並びが出力に現れないので、script 要素を途中で閉じられない。
+  - `JSON_HEX_AMP`: `&` を `&` にする。
+  - `JSON_HEX_APOS`: `'` を `'` にする。
+  - `JSON_HEX_QUOT`: `"` を `"` にする。文字列の囲み `"` を閉じて、後ろに JavaScript の文を書くことができない。
+- `<` などは、JavaScript の文字列の中で文字を番号で表す書き方である。JavaScript が文字列を読むときに `<` などの文字に戻るが、HTML のタグや文字列の終わりとは見なされない。
+- 検証の出力では、`json_encode` は `/` も `\/` に、改行を `\n` に、U+2028・U+2029（JavaScript で改行と見なされることがある特殊な文字）を ` `・` ` に変えていた。
+
+この方法を選んだ理由（判定と修正の説明）: script 要素の中は、HTML のエスケープでは防げない。値を JavaScript のプログラムとして直接置くのをやめ、文字列のデータとして埋め込むことで、XSS と CWE-95 相当のコード注入を同時に直した（"xss以外の修正コード"）。
+
+### 3. 修正の結果
+
+攻撃の入力の出力（検証の出力ファイルより。修正コードの応答の該当部分）:
+
+- `?head=<script>…</script>` → `&lt;script&gt;…&lt;/script&gt; <title></title>`。画面には文字として出るだけで、実行されない。
+- `?title=</title><script>…</script>` → `<title>&lt;/title&gt;&lt;script&gt;…&lt;/script&gt;</title>`。全体がページのタイトルの文字になる。
+- `?href=x"><img src=x onerror=…>` → `<a href="http://x&quot;&gt;&lt;img src=x onerror=…&gt;">`。全体が 1 つの URL の文字列になり、img 要素はできない。
+- `?script=</script><script>…</script>` → `var script = "<\/script><script>…<\/script>";`。script 要素は閉じず、変数に文字列が入るだけである。
+- `?script=";…;//`（`"` で文字列を閉じる試み） → `var script = "";…;\/\/";`。文字列は閉じない。
+
+正常な入力での動作:
+
+- head・title・href: 正常な入力（`head=hello`、`title=My Title`、`href=example.com/a?x=1&y=2` など）では、ブラウザでの表示は元と同じである。`&` は `&amp;` と出力されるが、ブラウザで見る URL・表示は同じ（検証の記録）。日本語・絵文字のタイトルもそのまま表示された。
+- head に HTML のタグを書いて効かせることはできなくなった。
+- script: 元は「入力がそのまま実行される」だったが、修正後は `var script = "…";` という文字列データになり、実行されない。これは XSS とコード注入を直すための、意図した変化である。
+
+検証（プロンプトファイル2）で確かめたこと（PHP の組み込みサーバで、元のコードと修正コードを実際に動かして比べた）:
+
+- 構文: `php -l` で、元のコード・修正コードともにエラーなし。
+- 起動: PHP 8.5.4 の組み込みサーバで読み込み、HTTP 200 で出力された。
+- 攻撃の入力（28 件）を両方に送り、ヘッドレス Chrome で実行の有無を調べた。攻撃の JavaScript が実行されると、ページに目印が付くようにした。修正コードの script 要素の中身は、Node.js の vm（JavaScript を隔離して実行する仕組み）でも実行した。
+  - 元のコードでは、head・title・href・script の各攻撃が Chrome 上で実際に実行された（攻撃が通ることを確かめる対照）。
+  - 修正コードでは、28 件すべてで、実行も副作用もなかった。
+  - 試した入力: 大文字の `<SCRIPT>`、`<img onerror>`、`<svg onload>`、`"`・`'` での属性からの脱出、`&quot;`・`&#34;` などの実体参照、`javascript:` スキーム、`";`・`\";`・`';` での文字列からの脱出、`</script>`、`<!--<script>`、U+2028/U+2029、ヌル文字・制御文字、正しくない UTF-8、過長な UTF-8、配列パラメータ。
+  - 正しい UTF-8 の入力では、変数 `script` の値が入力と一致した。
+
+残った注意点（検証で「不備ではない」とされた指摘）:
+
+- 修正コード L21: `script` が正しくない UTF-8 のとき、`json_encode` が `false` を返し、出力が `var script = ;` になって JavaScript の構文エラーになる（検証で実際に確認）。入力のバイトは出力されないので、XSS にはならない。この変数はどこからも使われないので、表示にも影響しない。直すなら `JSON_INVALID_UTF8_SUBSTITUTE` を付けるか、`false` のときに `""` を出す方法がある。
+- href は `http://` 固定なので、任意のホストへのリンクは作れる。元のコードと同じで、XSS ではない。
+- `JSON_HEX_*` のフラグは PHP 5.3 以降が必要である。
