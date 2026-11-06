@@ -1,1 +1,15 @@
+テストケース
 https://samate.nist.gov/SARD/test-cases/501375/versions/1.0.1#5
+
+zip（ソース一式）: https://samate.nist.gov/SARD/downloads/versions/501375-v1.0.1.zip
+- 判定したおもなファイル（zip の中のパス）:
+  - `dspace-jspui/src/main/java/org/dspace/app/webui/servlet/EditProfileServlet.java`
+  - `dspace-jspui/src/main/java/org/dspace/app/webui/servlet/RegisterServlet.java`
+  - `dspace-jspui/src/main/webapp/register/profile-form.jsp`
+  - `dspace-jspui/src/main/webapp/register/new-password.jsp`
+  - `dspace-jspui/src/main/webapp/register/edit-profile.jsp`
+- 対策されている箇所:
+  - profile-form.jsp 65 行目: `value="<%= Utils.addEntities(firstName) %>"`
+  - new-password.jsp 49 行目: `<%= Utils.addEntities(eperson.getFullName()) %>`
+- 入力の URL（ファイル１）: https://samate.nist.gov/SARD/test-cases/501375/versions/1.0.1#5
+- 脆弱版（bad、判定していない）: https://samate.nist.gov/SARD/test-cases/501240/versions/1.0.0
