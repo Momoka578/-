@@ -1,0 +1,73 @@
+# No.101 CVE-2021-23344 totaljs/framework utils.js（prePatch b3f9015）
+
+- 修正した脆弱性: U.set・U.get のコードインジェクション（CWE-94）
+- 修正対象ファイル: utils.js（パッチ形式）
+- 形式: utils.js は約 7,000 行・約 160KB あるので、元のファイルに対する unified diff 形式のパッチ（4 ハンク）を載せる。`patch -F0`（fuzz なし）で、prePatch の utils.js にずれなく当たることを親が確認した。
+- 修正の方針: new Function によるコード生成とキャッシュの仕組みは残し、path をソースコードに連結する前にホワイトリストで検証する。U.set と U.get はどちらも parsepath() を通るので、検証は parsepath() の 1 か所にまとめた。
+- 修正の内容（行番号は元のファイル）:
+  - 90 行目の後: 定数 `REGSAFEPATH = /^(?:[a-zA-Z0-9_$-]+(?:\[\d*\])*|(?:\[\d*\])+)$/` を加えた。ドット区切りの 1 セグメントに使えるのは「英数字・`_`・`$`・`-` からなる名前の後に、数値の添字か `[]`」または「数値の添字か `[]` だけ」。
+  - parsepath()（6652 行目〜）: path が文字列でなければ `throw new Error('Invalid path')`。`path.split('.')` の後、すべてのセグメントを REGSAFEPATH で検証し、1 つでも合わなければ同じ例外を投げる。
+  - exports.set（6612 行目）と exports.get（6640 行目）: `var arr = parsepath(path);` の前に説明のコメントを加えただけ（コードは変えていない）。
+  - `-` を含む名前は、parsepath が元から `['…']` の文字列の添字に包んでいる。引用符はホワイトリストで禁止しているので、文字列から抜け出すことはできない（親が parsepath のコードで確認した）。
+- この修正で防げること: path に引用符・括弧・セミコロン・`=`・`||`・空白・改行・バックスラッシュ・コメント記号などを入れて、new Function に任意の JavaScript を混ぜ込むこと（RCE）。U.set と U.get の両方で防げる。検証は F.temporary.other のキャッシュの確認より後、new Function より前で行うので、不正な path は関数として登録されない。エスケープ表記が使えなくなるので、既存の `/__proto__|constructor|prototype/` の照合を文字の書き換えですり抜けることもできなくなる。
+- 副作用・直さなかった点（エージェントの最終報告による）:
+  - `a['key']` のような引用符付きの添字と、空白や ASCII 以外の文字（日本語など）を含むキーは例外になる（安全側に倒すため ASCII に限った）。utils.js の中に U.get・U.set の呼び出しはない（framework のほかのファイルは調べていない）。
+  - 判定時のメモにある「new Function をやめて 1 段ずつたどる実装に置き換える」案ではなく、性能のためのコード生成とキャッシュを活かして変更を最小にするため、ホワイトリストの検証を選んだ。
+  - U.get には `__proto__` などのキーの拒否を加えていない（読み出しだけでは汚染にならず、既存の挙動を変えないため）。U.set の既存の照合はそのまま残っている。
+  - utils.js のほかの new Function（3307 行目の日時の書式、4124 行目の設定値の解析）と、元からある不具合（`m[1][2]` のような多重の添字の set、`a(U.get(b))` の引数の誤りなど）は、今回の脆弱性とは別の問題なので直していない。
+- 確認（MARK END の後。パッチは直していない）:
+  - 親とエージェント: 元のファイルのコピーにパッチを当て、適用後のファイルで node --check に問題なし（.patch は node --check にかけられないため）。
+  - 親: エージェントが取得した元のファイルが、前回親が取得した prePatch のファイルと同じであることを確認した。
+  - エージェント: 定数と set・get・parsepath の部分だけを取り出して vm の上で動かした。通常の使い方（`a.b.c`、`arr[0].x`、`list[]` の push、`a.b-c`、`$x_1.y`、`[0].x` の get、キャッシュからの get など）は修正の前後で同じ結果。注入は、修正前は 4 件（`a;PWNED_S1=1;//`、`x=PWNED_S2=1,y`、`a[(PWNED_S3=1)]`、get の `a||(PWNED_G1=1)`）が実際にコードを実行し、修正後は 9 件すべてが「Invalid path」で止まった。`__proto__.polluted` などは修正の前後とも「Prototype pollution」で拒否された。
+  - エージェント: 計算時間は、キャッシュ済みの get 100 万回が約 451ms → 約 450ms、キャッシュなしの get 2,000 回が約 89ms → 約 96ms（検証のコストは初回だけ）。
+- 使用トークン量（修正）: 新規 33,313（入力 12 ／ キャッシュ作成 18,959 ／ 出力〔推定〕 14,342）、キャッシュ読込 121,542、総処理 154,855、リクエスト 6 回
+
+```diff
+--- a/utils.js
++++ b/utils.js
+@@ -89,4 +89,7 @@
+ const REGISARR = /\[\d+\]|\[\]$/;
+ const REGREPLACEARR = /\[\]/g;
++// 【修正】U.set()/U.get() の path に使える文字のホワイトリスト（CWE-94 対策）。
++// ドット区切りの各セグメントは「英数字・_・$・- からなる名前 + 数値添字/[]」または「数値添字/[] だけ」に限る。
++const REGSAFEPATH = /^(?:[a-zA-Z0-9_$-]+(?:\[\d*\])*|(?:\[\d*\])+)$/;
+ const PROXYBLACKLIST = { 'localhost': 1, '127.0.0.1': 1, '0.0.0.0': 1 };
+ const PROXYOPTIONS = { headers: {}, method: 'CONNECT', agent: false };
+@@ -6609,6 +6612,8 @@
+ 	if (F.temporary.other[cachekey])
+ 		return F.temporary.other[cachekey](obj, value);
+
++	// 【修正】parsepath() の中で path をホワイトリスト検証する。コード片を含む不正な path は new Function() に
++	// 渡る前に例外になり、キャッシュにも登録されない（キャッシュにあるのは検証済みの path だけになる）。
+ 	var arr = parsepath(path);
+ 	var builder = [];
+
+@@ -6637,6 +6642,7 @@
+ 	if (F.temporary.other[cachekey])
+ 		return F.temporary.other[cachekey](obj);
+
++	// 【修正】U.set() と同じく、parsepath() で path をホワイトリスト検証してから new Function() に渡す。
+ 	var arr = parsepath(path);
+ 	var builder = [];
+
+@@ -6651,7 +6657,20 @@
+
+ function parsepath(path) {
+
++	// 【修正】path が文字列でない場合は検証できないため拒否する。
++	if (typeof(path) !== 'string')
++		throw new Error('Invalid path');
++
+ 	var arr = path.split('.');
++
++	// 【修正】各セグメントを REGSAFEPATH で検証する。parsepath() の結果は U.set()/U.get() で JavaScript の
++	// ソースコードに連結され new Function() でコンパイルされるため、引用符・括弧・セミコロン・空白・
++	// 改行・バックスラッシュ・コメント記号などを含む path はここで拒否する。
++	for (var j = 0; j < arr.length; j++) {
++		if (!REGSAFEPATH.test(arr[j]))
++			throw new Error('Invalid path');
++	}
++
+ 	var builder = [];
+ 	var all = [];
+```
