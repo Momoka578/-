@@ -1,0 +1,104 @@
+## No.52 OWASP BenchmarkJava BenchmarkTest00015.java
+
+- 修正した脆弱性: OS コマンドインジェクション（CWE-78）
+- 修正対象ファイル: src/main/java/org/owasp/benchmark/testcode/BenchmarkTest00015.java
+- 修正の内容（行番号は元のファイル）:
+  - クラスの定数として、許可する文字の一覧 `SAFE_PARAM = Pattern.compile("^[A-Za-z0-9 _.,]{0,100}$")` を加えた（英数字・空白・`_` `.` `,` だけ、100 文字まで）。
+  - 52 行目の URL デコードの直後: `SAFE_PARAM.matcher(param).matches()` が成り立たなければ、状態コード 400 と固定の文字列 "Invalid input." を返し、コマンドを実行せずに終わる（応答に入力値は含めない）。
+  - 61〜64 行目（Unix 側）: `["sh", "-c", "echo " + param]` を `["echo", param]` に変え、シェルを経由せず param を 1 つの独立した引数として渡す。
+  - Windows 側: echo は cmd.exe の内部コマンドなので `cmd.exe /c "echo " + param` の形は残し、安全性は上の検証に頼る。
+  - 防げること: `;` `&&` `|` `$( )` バッククォート・リダイレクト・改行などで echo 以外のコマンドをつなげること。cmd.exe の `&` `^` `%VAR%` も防ぐ。検証は URL デコードの後なので、`%3B` のように符号化しても通らない。先頭の `-` や `/?` も許可しないので、echo のオプションとして渡すこともできない。
+- 副作用・直さなかった点（エージェントの報告）:
+  - 許可外の文字（日本語、記号、`-` など）を含む入力や 101 文字以上の入力は、これまで echo されていたが、400 で拒否される。
+  - Unix 側はシェルを通らないので、`a  b` のように続く空白は詰められずにそのまま出力される。
+  - 不正な `%` の並びで URLDecoder.decode が例外を出す点は、元と同じ動きで今回の脆弱性とは関係ないため変えていない。出力側の Utils.printOSCommandResults も変えていない。
+- 確認:
+  - 親: 元ファイルとの差分が、ライセンスヘッダの省略と上の修正箇所だけであることを確認した。この環境に javac がないため未コンパイル。
+  - エージェント（MARK END の後）: 修正ファイルから正規表現を取り出して Python で全体一致を試し、`FOO`、`hello world`、100 文字ちょうどなどは許可、101 文字、`foo; id`、`$(id)`、バッククォート、改行、`%PATH%`、`-n`、`/?`、引用符、日本語などは拒否されることを確かめた。シェルを通さずに `["echo", p]` で実行すると、`foo; id` や `$(id)` は文字列のまま出力されることも確かめた。元のコードは実行していない。
+  - 修正ファイルは、書き出した後に直していない。
+- 使用トークン量（修正）: 新規 6,822（入力 4 ／ キャッシュ作成 3,462 ／ 出力〔推定〕 3,356）、キャッシュ読込 31,264、総処理 38,086、リクエスト 2 回
+
+```java
+package org.owasp.benchmark.testcode;
+
+import java.io.IOException;
+import javax.servlet.ServletException;
+import javax.servlet.annotation.WebServlet;
+import javax.servlet.http.HttpServlet;
+import javax.servlet.http.HttpServletRequest;
+import javax.servlet.http.HttpServletResponse;
+
+@WebServlet(value = "/cmdi-00/BenchmarkTest00015")
+public class BenchmarkTest00015 extends HttpServlet {
+
+    private static final long serialVersionUID = 1L;
+
+    // 【修正】echo に渡してよい文字のホワイトリスト（英数字・空白・"_" "." "," のみ、100 文字まで）。
+    // シェル（sh / cmd.exe）のメタ文字 ; & | $ ` ( ) < > % ^ " ' や改行、
+    // オプションと解釈されうる "-" "/" は許可しない。
+    private static final java.util.regex.Pattern SAFE_PARAM =
+            java.util.regex.Pattern.compile("^[A-Za-z0-9 _.,]{0,100}$");
+
+    @Override
+    public void doGet(HttpServletRequest request, HttpServletResponse response)
+            throws ServletException, IOException {
+        doPost(request, response);
+    }
+
+    @Override
+    public void doPost(HttpServletRequest request, HttpServletResponse response)
+            throws ServletException, IOException {
+        // some code
+        response.setContentType("text/html;charset=UTF-8");
+
+        String param = "";
+        java.util.Enumeration<String> headers = request.getHeaders("BenchmarkTest00015");
+
+        if (headers != null && headers.hasMoreElements()) {
+            param = headers.nextElement(); // just grab first element
+        }
+
+        // URL Decode the header value since req.getHeaders() doesn't. Unlike req.getParameters().
+        param = java.net.URLDecoder.decode(param, "UTF-8");
+
+        // 【修正】URL デコード後の値をホワイトリストで検証し、許可外の文字を含む場合はコマンドを実行しない。
+        // （エラー応答には入力値を含めない）
+        if (!SAFE_PARAM.matcher(param).matches()) {
+            response.setStatus(HttpServletResponse.SC_BAD_REQUEST);
+            response.getWriter().println("Invalid input.");
+            return;
+        }
+
+        java.util.List<String> argList = new java.util.ArrayList<String>();
+
+        String osName = System.getProperty("os.name");
+        if (osName.indexOf("Windows") != -1) {
+            argList.add("cmd.exe");
+            argList.add("/c");
+            // 【修正】Windows の echo は cmd.exe の内部コマンドのためシェル経由が必要。
+            // 上のホワイトリスト検証によりメタ文字は入らない。
+            argList.add("echo " + param);
+        } else {
+            // 【修正】sh -c を使わず echo を直接実行し、param を 1 つの独立した引数として渡す
+            // （シェルによる解釈が起きないため、コマンドの連結・置換ができない）。
+            argList.add("echo");
+            argList.add(param);
+        }
+
+        ProcessBuilder pb = new ProcessBuilder();
+
+        pb.command(argList);
+
+        try {
+            Process p = pb.start();
+            org.owasp.benchmark.helpers.Utils.printOSCommandResults(p, response);
+        } catch (IOException e) {
+            System.out.println(
+                    "Problem executing cmdi - java.lang.ProcessBuilder(java.util.List) Test Case");
+            throw new ServletException(e);
+        }
+    }
+}
+```
+
+---
