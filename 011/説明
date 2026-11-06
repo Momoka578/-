@@ -1,0 +1,172 @@
+## No.11 leizongmin/js-xss（master, package.json v1.0.15, lib/xss.js・lib/default.js・lib/parser.js）
+
+- XSS の種別: その他（HTML サニタイザ（危ないタグや属性を取り除いて、安全な HTML だけを残す処理）のライブラリ自体の、出力エンコードの不備。被害が反射型になるかストア型になるかは、ライブラリを使うアプリしだい）
+- source（ユーザーの入力）: `FilterXSS.prototype.process(html)` の引数 `html`（利用アプリが渡す、ユーザー投稿の HTML など）
+- sink（出力先）: lib/xss.js L201 で組み立てる属性の文字列 `name + '=' + attributeWrapSign + value + attributeWrapSign`（`attributeWrapSign` が `'` のとき）。その戻り値の HTML を利用アプリがページに出力する
+- 修正したファイル: lib/xss.js
+- 検証（プロンプトファイル2）の結果: 問題なし
+
+### 1. 元のコードの問題
+
+js-xss は、ユーザーが書いた HTML から危ない部分を取り除くライブラリである。許可したタグ・属性（ホワイトリスト）だけを残し、属性は作り直して出力する。属性値を囲む記号は、既定ではダブルクォート `"` である。オプション `singleQuotedAttributeValue: true` を付けると、シングルクォート `'` で囲む。
+
+lib/xss.js（元のコード）:
+```javascript
+108	  this.attributeWrapSign = Object.prototype.hasOwnProperty.call(options, 'singleQuotedAttributeValue') && options.singleQuotedAttributeValue === true ? "'" : DEFAULT.attributeWrapSign;
+…
+147	  var attributeWrapSign = me.attributeWrapSign;
+…
+191	        var attrsHtml = parseAttr(attrs.html, function (name, value) {
+192	          // call `onTagAttr()`
+193	          var isWhiteAttr = _.indexOf(whiteAttrList, name) !== -1;
+…
+197	          if (isWhiteAttr) {
+198	            // call `safeAttrValue()`
+199	            value = safeAttrValue(tag, name, value, cssFilter);
+200	            if (value) {
+201	              return name + '=' + attributeWrapSign + value + attributeWrapSign;
+```
+
+lib/default.js（元のコード。修正していない）:
+```javascript
+159	function escapeHtml(html) {
+160	  return html.replace(REGEXP_LT, "&lt;").replace(REGEXP_GT, "&gt;");
+161	}
+…
+224	  // escape `<>"` before returns
+225	  value = escapeAttrValue(value);
+…
+252	function escapeQuote(str) {
+253	  return str.replace(REGEXP_QUOTE, "&quot;");
+254	}
+…
+326	function escapeAttrValue(str) {
+327	  str = escapeQuote(str);
+328	  str = escapeHtml(str);
+329	  return str;
+330	}
+```
+
+値の流れは次のとおり。
+
+1. 利用アプリが、ユーザーの HTML を `process(html)`（xss.js L132）に渡す。
+2. タグを切り出し、属性の部分を lib/parser.js の `parseAttr`（L125〜208）で 1 つずつ取り出す。ダブルクォートで囲まれた値は、次の `"` までをそのまま値にする（L149〜161）。値の中の `'` は残る。
+3. 許可された属性なら、`safeAttrValue`（default.js L172〜227）で値を整える。最後に `escapeAttrValue`（L326〜330）を呼ぶ。
+4. `escapeAttrValue` は、`"` を `&quot;` に、`<` `>` を `&lt;` `&gt;` に変える。`'` は変えない。
+5. xss.js L201 で、`属性名='値'` の形に組み立てる（`attributeWrapSign` が `'` のとき）。
+
+なぜ危ないか。
+
+- 囲み記号を `'` に変えたのに、値の中の `'` をエスケープ（特別な意味を持つ文字を、ただの文字として扱われる書き方に変えること）していない。
+- そのため、値の中の `'` で属性値の囲みが閉じる。その後ろの文字列は、新しい属性としてブラウザに解釈される。
+- 本来、許可されていない属性（`onclick` などのイベントハンドラ属性。クリックなどのときに中の JavaScript を実行する属性）は、xss.js L205〜210 で取り除かれる。この経路では、その仕組みを素通りする。
+
+攻撃の例（判定の攻撃例。検証の記録にある入力と出力）:
+
+- 入力: `<a title="x' onclick='alert(1)">t</a>`
+- `title` は `a` タグで許可された属性である。値は `x' onclick='alert(1)` になる。`"` も `<` `>` も含まないので、`escapeAttrValue` を通っても変わらない。
+- 元のコードの出力: `<a title='x' onclick='alert(1)'>t</a>`
+- ブラウザは `title='x'` と `onclick='alert(1)'` の 2 つの属性として読む。リンクをクリックすると `alert(1)` が実行される。サニタイザを通した後なのに、スクリプトが動く。
+
+既定の設定（ダブルクォートで囲む）では、値の中の `"` が `&quot;` になるので、この問題は起きない（"脆弱性の詳細" の判定）。
+
+### 2. 修正の内容
+
+#### 修正 1: シングルクォートを探す正規表現を用意した（元のコード L12〜13 の後 → 修正コード L14〜15）
+
+修正前:
+```javascript
+12	var _ = require("./util");
+13	
+```
+
+修正後:
+```javascript
+12	var _ = require("./util");
+13	
+14	// 【修正】シングルクォートで属性値を囲む場合に、値の中の ' をエスケープするための正規表現
+15	var REGEXP_SINGLE_QUOTE = /'/g;
+```
+
+- L15 `/'/g` は、文字 `'` に一致する正規表現（文字列のパターンを表す書き方）である。
+- 末尾の `g`（global）フラグは、「最初の 1 つだけでなく、文字列の中のすべての `'` に一致させる」という意味である。`replace` と組み合わせると、すべての `'` を置き換えられる。
+- ファイルの先頭で 1 回だけ作っておき、属性を処理するたびに使い回す。default.js の `REGEXP_QUOTE = /"/g`（L232）と同じ書き方である。
+- 検証では、`g` フラグ付きでも `String.prototype.replace` で使うので、前回の位置（`lastIndex`）が次の呼び出しに持ち越される問題はないことを確かめた（同じ `FilterXSS` を続けて使うケースで確認）。
+
+#### 修正 2: シングルクォートで囲むときだけ、値の `'` を `&#39;` に変えた（元のコード L199〜200 → 修正コード L202〜208）
+
+修正前:
+```javascript
+199	            value = safeAttrValue(tag, name, value, cssFilter);
+200	            if (value) {
+201	              return name + '=' + attributeWrapSign + value + attributeWrapSign;
+```
+
+修正後:
+```javascript
+202	            value = safeAttrValue(tag, name, value, cssFilter);
+203	            // 【修正】属性値をシングルクォートで囲む設定のとき、escapeAttrValue は ' をエスケープしないため、
+204	            // 値の中の ' が囲みを閉じて新しい属性（イベントハンドラ等）を作れてしまう。ここで ' を &#39; に変換する。
+205	            if (value && attributeWrapSign === "'") {
+206	              value = String(value).replace(REGEXP_SINGLE_QUOTE, "&#39;");
+207	            }
+208	            if (value) {
+209	              return name + '=' + attributeWrapSign + value + attributeWrapSign;
+```
+
+- L202: 元のままの行。`safeAttrValue` で値を整える（`href` のスキーム（`http:` や `javascript:` のような、URL の先頭の種類を表す部分）の制限、`"` `<` `>` のエスケープなど）。
+- L205 `if (value && attributeWrapSign === "'")`:
+  - `value` が空でないこと（空なら L211 で属性名だけを出すので、置き換えは要らない）。
+  - 囲み記号が `'` であること。つまり `singleQuotedAttributeValue: true` のときだけ置き換える。既定（`"` で囲む）のときは何もしない。
+- L206 `String(value).replace(REGEXP_SINGLE_QUOTE, "&#39;")`:
+  - `String(value)` は、値を文字列に変える。コードの上では、利用者が独自の `safeAttrValue` を渡して文字列以外（数値など）を返した場合にも、`replace` を呼べる。
+  - `.replace(REGEXP_SINGLE_QUOTE, "&#39;")` は、値の中のすべての `'` を `&#39;` に置き換える。
+  - `&#39;` は数値文字参照（文字を番号で表す書き方。39 は `'` の文字番号）である。ブラウザは属性値を読むときに `'` という文字に戻すが、囲みを閉じる記号とは見なさない。
+- L208〜209: 元のままの行。置き換えた値を `'` で囲んで出力する。
+
+なぜこれで XSS が防げるか。
+
+- `'` で囲んだ属性値の中で、囲みを閉じられる文字は `'` だけである。
+- `"` `<` `>` は元から `escapeAttrValue` でエスケープされている。属性名は `parseAttr` で使える文字が限られ、さらにホワイトリストで絞られる。
+- したがって、出力の直前に値の `'` を `&#39;` にすれば、属性値の外へ抜け出す方法がなくなる（検証の記録の説明）。
+
+この方法（この位置）を選んだ理由。
+
+- 判定の修正方針は「`escapeAttrValue` で `'` もエスケープする、または `attributeWrapSign` が `'` のときにエスケープする」であった。修正は後者を選んだ。
+- 置き換えを `safeAttrValue` の後、出力を組み立てる直前に入れたので、既定の `safeAttrValue` にも、利用者が自分で渡した `safeAttrValue` の戻り値にも効く（検証の記録）。
+- `escapeAttrValue` 自体を変えると、既定の `"` 囲みの出力まで変わる。今回の修正は `'` 囲みのときだけ働くので、既定の動作は変わらない。
+
+XSS 以外の脆弱性: 判定の CWE-116（出力エンコードの不備）は、XSS の原因そのもの（`'` 囲みなのに `'` をエスケープしないこと）を指している。別の脆弱性ではなく、この修正で直っている（"xss以外の修正コード"）。
+
+### 3. 修正の結果
+
+攻撃の入力の出力（検証の記録より）:
+
+- 入力: `<a title="x' onclick='alert(1)">t</a>`（`singleQuotedAttributeValue: true`）
+- 修正後の出力: `<a title='x&#39; onclick=&#39;alert(1)'>t</a>`
+- ブラウザは `title` 属性 1 つだけを作る。その値は `x' onclick='alert(1)` という文字列で、マウスを乗せたときのヒントに文字として出るだけである。`onclick` 属性はできず、スクリプトは実行されない。
+
+正常な入力での動作:
+
+- 既定の設定（`"` で囲む）: 修正は働かないので、出力は元と同じである。
+- `'` で囲む設定: 値に `'` を含む属性（例: `title="It's a 'test'"`、`alt="Don't"`）は、元のコードでは属性が壊れていた（`title="It"`、`s=""`、`a=""` などに分かれる）。修正後は `&#39;` でエスケープされ、ブラウザが読む値は `It's a 'test'`、`Don't` と入力どおりになる。正常な入力の動作は、むしろ正しくなった。
+- タグの外（本文）の `'` は、これまでどおりエスケープされない。
+
+検証（プロンプトファイル2）で確かめたこと（元のコードと修正コードを、Node.js で実際に動かして比べた）:
+
+- 構文: `node --check` で lib の 5 ファイルすべて問題なし。`require` での読み込みも問題なし（Node v22）。
+- 既存のテスト: 同じコミットの mocha（JavaScript のテストツール）のテスト 35 件が、元のコード・修正コードともにすべて通った。
+- 攻撃の入力（23 件）: 出力を parse5（HTML の仕様どおりに HTML を読むライブラリ）で解析し、許可されていない属性ができていないかを調べた。
+  - 入力の種類: 判定の攻撃例、`&#39;`・`&#x27;`・`&#0039`（先頭ゼロ・セミコロンなし）・`&apos;` で `'` を書いたもの、引用符なしの値、`href`/`src`/`alt`、大文字、改行・タブ、自己終了タグ、`style`（CSS のフィルタあり／なし）、独自の `safeAttrValue`、`allowList`、`filterXSSWithResult` 経由、インスタンスの再利用。
+  - 元のコードでは、`'` 囲みの設定の 21 件すべてで `onclick` などが出力に残った。修正コードでは 0 件だった。
+- ファズ（ランダムな入力を大量に与えて試す方法）: 20 万入力 × 3 設定で試した。
+  - `'` 囲みの設定で許可外の属性が出た件数は、元のコードが 3728／3246／3887 件、修正コードが 0 件だった。
+  - 既定の設定（`"` 囲み）では、元と修正版の出力が完全に一致した。
+  - `'` 囲みの設定では、修正版の出力の `&#39;` を `'` に戻すと、元の出力と完全に一致した。変わったのは属性値の `'` のエスケープだけである。
+- 正常な入力: 上の `It's`・`Don't` の例を確かめた。
+
+残った注意点（検証で「不備ではない」とされた指摘）:
+
+- lib/default.js の `escapeAttrValue`（利用者も呼べる公開の関数）は、今も `'` をエスケープしない。利用者が自分で `'` 囲みの属性を組み立てるときは注意が必要である。ただし利用者のコードの問題で、今回の脆弱性の修正には影響しない。
+- 同じコミットに、ブラウザ用にまとめたファイル `dist/xss.js` がある。修正は lib だけなので、配布するときは作り直し（再ビルド）が必要である。
+- 依存ライブラリ cssfilter@0.0.10 には、`style` の値の判定が呼び出しごとに交互に変わる、元からの性質がある。修正とは関係がない。
