@@ -1,0 +1,59 @@
+## No.86 CVE-2019-10750 alexindigo/deeply lib/reduce_object.js（prePatch d9f59ee）
+
+- 修正した脆弱性: プロトタイプ汚染（CWE-915・CWE-1321）
+- 修正対象ファイル: lib/reduce_object.js
+- 修正の内容（行番号は元のファイル）: 19 行目 `acc[key] = merge(acc[key], source[key]);` を次の 2 つに置き換えた。
+  - `if (key === '__proto__') { return acc; }` を加え、このキーは読みも書きもしない（`acc["__proto__"]` の読み出しが Object.prototype を返して再帰で書き込まれる経路と、`__proto__` への代入が setter としてマージ先のプロトタイプを差し替える経路を防ぐ）。
+  - `var current = Object.prototype.hasOwnProperty.call(acc, key) ? acc[key] : undefined;` とし、`merge(current, source[key])` を呼ぶ。継承したプロパティ（`acc.constructor` の Object 関数やその prototype など）を経由して、組み込みのプロトタイプまで再帰することを防ぐ。自身のプロパティでなければ undefined を渡すので、新しい値（クローン）が作られる。
+- この修正で防げること: mutable・immutable のどちらでも、入れ子の位置でも、`__proto__` による Object.prototype の書き換え。既定の typeof では function と object の型の違いで `constructor.prototype` の経路はたまたま防がれているが、利用者が独自の typeof（useCustomTypeOf）を使うと通るので、その経路も防ぐ。
+- 副作用・直さなかった点（エージェントの最終報告による）:
+  - mutable モードで、マージ先が継承しているプロパティ（クラスのプロトタイプに置いた共有オブジェクトなど）には書き込まず、マージ先自身のプロパティとしてクローンを作る。入力データの `__proto__` キーは結果に残らない。
+  - `"constructor"`・`"prototype"` は一律には除外していない（上の hasOwnProperty の確認で安全になり、正当なデータのキーとして残せるため）。
+  - 判定時のメモにあった「マージ先が Object.prototype / Function.prototype なら書き込みを拒否する」ガードは、修正を最小限にするため入れていない（再帰で組み込みのプロトタイプに届く経路はなくなる。ただし、利用者が自分で Object.prototype をマージ先に渡した場合は防げない）。
+- 確認（MARK END の後）:
+  - 親とエージェント: node --check で問題なし。元ファイルとの差分は 19 行目の置き換えだけ。
+  - エージェント: 動作確認のため、同じ prePatch コミット（d9f59ee）のソース一式を codeload の tar.gz で取得した（指示で許可した「同じ prePatch コミットの他のファイル」の範囲で、トークン量の区間の外）。依存の precise-typeof と fulcon は簡易なスタブで代用した。元のコードでは、immutable・mutable・入れ子の `a.__proto__`・マージ先のプロトタイプの差し替え・独自 typeof での `constructor.prototype` の 5 件で汚染が起き、修正後はすべて防げた。通常の機能 7 件（Date を含む深いマージ、immutable で参照を共有しないこと、mutable でマージ先が書き換わること、正当なデータのキー constructor・prototype、null プロトタイプのマージ先、functionsClone と arraysCombine のアダプタ）は、元と修正後で同じ結果になった。20 万キーのマージ 5 回の時間は、元が 8,155ms、修正後が 8,275ms。
+- 使用トークン量（修正）: 新規 5,807（入力 4 ／ キャッシュ作成 2,215 ／ 出力〔推定〕 3,588）、キャッシュ読込 31,895、総処理 37,702、リクエスト 2 回
+
+```javascript
+// Public API
+module.exports = reduceObject;
+
+/**
+ * Iterates over own properties of the provided object
+ * and copies then over to the target object.
+ * While recursively running merge on the elements.
+ *
+ * @param   {mixed} target - target object to modify
+ * @param   {mixed} source - source object to read from
+ * @param   {function} merge - iterator to merge sub elements
+ * @returns {mixed} - modified target object
+ */
+function reduceObject(target, source, merge)
+{
+  // clone exposed properties
+  Object.keys(source).reduce(function(acc, key)
+  {
+    // 【修正】"__proto__" キーは読み書きともに行わない。
+    // acc["__proto__"] の読み出しは Object.prototype（プロトタイプ）を返し、
+    // 書き込みはプロトタイプの差し替え（setter）になるため、
+    // プロトタイプ汚染（CWE-915 / CWE-1321）の入口になる。
+    if (key === '__proto__')
+    {
+      return acc;
+    }
+
+    // 【修正】マージ先の値は acc 自身のプロパティ（own property）のときだけ読む。
+    // 継承したプロパティ（例: acc.constructor = Object 関数、その .prototype）を
+    // マージ先として再帰すると、組み込みのプロトタイプに書き込めてしまうため、
+    // 自身のプロパティでない場合は undefined を渡して新しい値（クローン）を作らせる。
+    var current = Object.prototype.hasOwnProperty.call(acc, key) ? acc[key] : undefined;
+
+    acc[key] = merge(current, source[key]);
+
+    return acc;
+  }, target);
+
+  return target;
+}
+```
