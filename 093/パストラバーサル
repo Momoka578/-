@@ -1,0 +1,236 @@
+## No.93 CVE-2020-12265 kevva/decompress index.js（prePatch 74a462a）
+
+- 修正した脆弱性: Zip Slip によるパストラバーサル・任意ファイルの書き込み（CWE-22）と、symlink・hard link を経由したトラバーサル
+- 修正対象ファイル: index.js
+- **注意: 成果物のコードは、MARK END の後にエージェントが直した最終版。** MARK END の時点の版には、symlink を連ねると出力先の外へ書き込める穴があった（下の「MARK END の後の手直し」）。手直しに使ったトークン量は表の区間に入っていない（参考値は「トークン量の計測方法」）。
+- 修正の内容（行番号は元のファイル）:
+  - 出力先の基準: 最初に `makeDir(output)` で出力先を作り、その実パス `realOutput`（output 自体が symlink でも解決したもの）を判定の基準にした。
+  - 45 行目（Zip Slip）: `dest = path.join(realOutput, x.path)` とし、`isInside(realOutput, dest)`（`path.relative` で判定し、`..`・`../〜`・別ドライブを外とみなす。`..foo` のような名前は配下）を満たさないエントリを reject する。
+  - 50・55 行目の前（既存の symlink を経由した書き込み）: `checkDest` で、dest か、存在する最も近い祖先の実パスが出力先の配下にあるかを、`makeDir` より前に確かめる。リンク先がない symlink を経由する書き込みは拒否する。`makeDir` の後で、親ディレクトリの実パスももう一度確かめる。
+  - 58 行目（hard link）: linkname を process.cwd() 基準ではなく出力先基準で解決し、文字列の上と実パスの両方で配下にあるものだけ `fs.link` する。62 行目（win32 で symlink を link として作る分岐）は、リンク先をリンク自身の親ディレクトリ基準で解決し、同じ確認をする。
+  - 66 行目（symlink）: 親ディレクトリの実パスを基準に解決したリンク先が外を指すものは拒否する。作った symlink は記録しておき、展開の最後に `removeEscapingSymlinks` で OS と同じ方法で解決し直し、外を指すもの（`x -> .` と `s -> x/..` のような連鎖を含む）と確認できないものは削除して reject する（成功時・失敗時の両方で行う）。
+  - 実パスは `fs.realpath.native`（ない古い Node では fs.realpath）で求める。
+  - 44 行目（`Promise.all`）: エントリを 1 つずつ順に処理する `runSequentially` に替えた。並列のままだと、symlink の作成とそのリンクを経由した書き込みが競合し、確認と書き込みの間に状態が変わりうる（TOCTOU）。
+- この修正で防げること: `../` を含むエントリ名による出力先の外へのファイル書き込み・ディレクトリ作成・リンク作成。出力先の外を指す symlink（絶対パス・相対パス・連鎖）と、出力先にもともとある外向きの symlink を経由した書き込み。出力先の外の既存ファイル（/etc/passwd など）への hard link。
+- 副作用・直さなかった点（エージェントの最終報告による）:
+  - 逐次処理と確認を加えたため遅くなる（スタブ環境で 2,020 エントリの展開が、約 110〜150ms から約 840〜990ms）。途中で拒否したとき、それより前のエントリは展開されたまま残る。ファイルが 0 件でも出力先を作る。hard link の基準が cwd から出力先に変わる。
+  - リンク先がない symlink を経由した書き込み、リンク先がない symlink の連鎖、ループする symlink は、正当なアーカイブでも拒否される。`fs.realpath.native` がない Node 9.2 未満では、symlink の連鎖と `..` を組み合わせた手口は防げない。
+  - setuid・setgid のビットが mode に残ること（46 行目）と、`opts.strip` を linkname に適用しないことは、判定の記録の対象外なので直していない。
+- MARK END の後の手直し（エージェントが行った。トークン量の区間には含めていない）:
+  - エージェントが MARK END の後に作ったテスト（23 ケース）で、MARK END の時点の版は `x -> .` と `s -> x/..` の symlink の連鎖（ケース 12・13）で、出力先の外に pwned.txt を書き込めた。Node の JS 版の `fs.realpath`（graceful-fs 経由の `fsP.realpath`）が、symlink の先に続く `..` を文字列の上で処理し、実際とは違うパスを返していたため。
+  - エージェントが Edit（8 回）で、実パスの解決をすべて `fs.realpath.native` を使う `realpath` 関数に替え、symlink を作った直後の確認を、最後にまとめて確認する `removeEscapingSymlinks` に置き換えた。
+  - 親が、Write の内容（MARK END の時点の版）と最終版の差がこの 2 点（追加 2 つの関数と、呼び出し箇所の置き換え）だけであることを確認した（Write の内容は scratchpad の parent_f7/nx93_write_content.js に取り出した）。
+- 確認（MARK END の後）:
+  - 親とエージェント: 最終版で node --check に問題なし。
+  - 親: エージェントが取得した元のファイルが、前回親が取得した prePatch のファイルと同じであることを確認した。
+  - エージェント: 依存モジュール（graceful-fs、pify、make-dir、strip-dirs、decompress-*）を簡単なスタブにして、23 ケースで確かめた。最終版では、Zip Slip（ファイル・深い `../`・ディレクトリ）、外を指す symlink、出力先にもともとある外向きの symlink を経由した書き込み・上書き、外への hard link、symlink の連鎖のすべてで、出力先の外に何も作られなかった。通常のアーカイブ、正当な symlink を経由したファイル、`../` を含む正当な相対 symlink、output 自体が symlink の場合は正しく展開された。元のファイルでは、Zip Slip（ケース 2〜4）と外部ファイルへの hard link（ケース 11）が再現した。
+  - 親: エージェントのテストを、最終版と MARK END の時点の版の両方で、親の作業用ディレクトリで実行し直した。MARK END の時点の版ではケース 12・13 で出力先の外に pwned.txt が作られ、最終版では作られなかった（ケース 17 の pwned.txt は strip の結果として出力先の中にできるもので、正しい動作）。
+  - 補足: エージェントは、Node のモジュール解決が余計なものを拾わないことを確かめるため、`ls -d /tmp/node_modules /tmp/claude-1002/node_modules /node_modules` を実行した（どれも存在しない）。読むことを禁止した範囲の外で、ほかのセッションの記録は読んでいない。
+- 使用トークン量（修正）: 新規 22,049（入力 4 ／ キャッシュ作成 3,149 ／ 出力〔推定〕 18,896）、キャッシュ読込 31,984、総処理 54,033、リクエスト 2 回
+
+```javascript
+'use strict';
+const path = require('path');
+const fs = require('graceful-fs');
+const decompressTar = require('decompress-tar');
+const decompressTarbz2 = require('decompress-tarbz2');
+const decompressTargz = require('decompress-targz');
+const decompressUnzip = require('decompress-unzip');
+const makeDir = require('make-dir');
+const pify = require('pify');
+const stripDirs = require('strip-dirs');
+
+const fsP = pify(fs);
+
+// 【修正】OS（カーネル）と同じ方法で実パスを求める。fs.realpath（JS 実装）は symlink の先に続く `..` を
+// 文字列上で処理するため、`x -> .` と `s -> x/..` のようなリンクの連鎖で実際とは違うパスを返す。
+// fs.realpath.native がない古い Node では fs.realpath で代用する
+const realpathFn = require('fs').realpath.native || fs.realpath;
+const realpath = p => new Promise((resolve, reject) => {
+	realpathFn(p, (err, res) => err ? reject(err) : resolve(res));
+});
+
+// 【修正】p が root（出力先ディレクトリの実パス）と同じか、その配下にあるかを判定する
+// （`..foo` のような名前は配下とみなし、`..` そのものと `../` で始まるもの、別ドライブは外とみなす）
+const isInside = (root, p) => {
+	const rel = path.relative(root, p);
+	return rel === '' || (rel !== '..' && !rel.startsWith('..' + path.sep) && !path.isAbsolute(rel));
+};
+
+// 【修正】p が出力先の外を指していたら例外を投げる
+const assertInside = (root, p, name) => {
+	if (!isInside(root, p)) {
+		throw new Error(`Refusing to extract "${name}" outside of the output directory`);
+	}
+};
+
+// 【修正】p が存在すればその実パス（途中の symlink をすべて解決したパス）を返し、
+// 存在しなければ、存在する最も近い祖先の実パスを返す。
+// リンク先が存在しない symlink を経由する書き込み（後でリンク先が作られうる）は拒否する
+const realpathOfExisting = p => realpath(p).catch(err => {
+	if (err.code !== 'ENOENT') {
+		throw err;
+	}
+
+	return fsP.lstat(p).then(() => {
+		throw new Error(`Refusing to extract through a dangling symlink: ${p}`);
+	}, () => {
+		const parent = path.dirname(p);
+		if (parent === p) {
+			throw err;
+		}
+
+		return realpathOfExisting(parent);
+	});
+});
+
+// 【修正】エントリを 1 つずつ順番に処理する（Promise.all の並列処理だと、symlink の作成と
+// そのリンクを経由する書き込みが競合し、確認と書き込みの間に状況が変わりうるため）
+const runSequentially = tasks => tasks.reduce((prev, task) => prev.then(results => task().then(result => {
+	results.push(result);
+	return results;
+})), Promise.resolve([]));
+
+// 【修正】展開中に作った symlink を最後にすべて確認し、OS が解決したときに出力先の外を指すもの
+// （作成時はリンク先がなく、後のエントリで外を指すようになったものを含む）と、確認できないものを削除する
+const removeEscapingSymlinks = (root, links) => runSequentially(links.map(p => () => fsP.readlink(p)
+	// リンク先は、リンクがあるディレクトリを基準に正規化せずに連結し、OS と同じ方法で解決する
+	.then(target => realpathOfExisting(path.isAbsolute(target) ? target : path.dirname(p) + path.sep + target))
+	.then(real => isInside(root, real), () => false)
+	.then(ok => ok ? false : fsP.unlink(p).then(() => true))))
+	.then(removed => {
+		if (removed.some(Boolean)) {
+			throw new Error('Refusing to extract symlinks pointing outside of the output directory');
+		}
+	});
+
+const runPlugins = (input, opts) => {
+	if (opts.plugins.length === 0) {
+		return Promise.resolve([]);
+	}
+
+	return Promise.all(opts.plugins.map(x => x(input, opts))).then(files => files.reduce((a, b) => a.concat(b)));
+};
+
+const extractFile = (input, output, opts) => runPlugins(input, opts).then(files => {
+	if (opts.strip > 0) {
+		files = files
+			.map(x => {
+				x.path = stripDirs(x.path, opts.strip);
+				return x;
+			})
+			.filter(x => x.path !== '.');
+	}
+
+	if (typeof opts.filter === 'function') {
+		files = files.filter(opts.filter);
+	}
+
+	if (typeof opts.map === 'function') {
+		files = files.map(opts.map);
+	}
+
+	if (!output) {
+		return files;
+	}
+
+	// 【修正】出力先ディレクトリを先に作り、その実パス（output 自体が symlink の場合も解決したもの）を
+	// 判定の基準にする。エントリは並列ではなく順番に処理する
+	const symlinks = [];
+	return makeDir(output)
+		.then(() => realpath(output))
+		.then(realOutput => runSequentially(files.map(x => () => {
+			// 【修正】基準を出力先の実パスにし、エントリ名の `../` などで出力先の外に出るものを拒否する
+			const dest = path.join(realOutput, x.path);
+			const mode = x.mode & ~process.umask();
+			const now = new Date();
+
+			if (!isInside(realOutput, dest)) {
+				return Promise.reject(new Error(`Refusing to extract "${x.path}" outside of the output directory`));
+			}
+
+			// 【修正】makeDir や書き込みの前に、dest（またはその存在する祖先）の実パスが出力先の配下かを確認する。
+			// 出力先の中に外部を指す symlink がある場合に、それを経由して外へ書き込むのを防ぐ
+			const checkDest = () => realpathOfExisting(dest).then(real => assertInside(realOutput, real, x.path));
+
+			if (x.type === 'directory') {
+				return checkDest()
+					.then(() => makeDir(dest))
+					.then(() => fsP.utimes(dest, now, x.mtime))
+					.then(() => x);
+			}
+
+			return checkDest()
+				.then(() => makeDir(path.dirname(dest)))
+				// 【修正】作成後の親ディレクトリの実パスも確認し、リンク先の解決の基準に使う
+				.then(() => realpath(path.dirname(dest)))
+				.then(realParent => {
+					assertInside(realOutput, realParent, x.path);
+
+					// 【修正】hard link のリンク先（target）が出力先の配下にあるかを、文字列上と実パスの両方で確認してから作る
+					const linkInside = target => {
+						assertInside(realOutput, target, x.path);
+						return realpath(target)
+							.then(realTarget => assertInside(realOutput, realTarget, x.path))
+							.then(() => fsP.link(target, dest));
+					};
+
+					if (x.type === 'link') {
+						// 【修正】linkname を process.cwd() 基準ではなく出力先基準で解決し、出力先の外の既存ファイルへの
+						// hard link を作らせない
+						return linkInside(path.resolve(realOutput, x.linkname));
+					}
+
+					if (x.type === 'symlink' && process.platform === 'win32') {
+						// 【修正】symlink のリンク先は、リンク自身の親ディレクトリ基準で解決して確認する
+						return linkInside(path.resolve(realParent, x.linkname));
+					}
+
+					if (x.type === 'symlink') {
+						// 【修正】リンク先（親ディレクトリ基準で解決したもの）が出力先の外を指す symlink を拒否する
+						assertInside(realOutput, path.resolve(realParent, x.linkname), x.path);
+						// 【修正】symlink を連ねた `..` などで実際には外を指すものは、最後に removeEscapingSymlinks で確認する
+						// （展開中にそのリンクを経由する書き込みは checkDest で確認される）
+						return fsP.symlink(x.linkname, dest).then(() => symlinks.push(dest));
+					}
+
+					return fsP.writeFile(dest, x.data, {mode});
+				})
+				.then(() => x.type === 'file' && fsP.utimes(dest, now, x.mtime))
+				.then(() => x);
+		}))
+			// 【修正】成功・失敗のどちらでも、最後に作った symlink を確認する
+			.then(
+				results => removeEscapingSymlinks(realOutput, symlinks).then(() => results),
+				err => removeEscapingSymlinks(realOutput, symlinks).then(() => {
+					throw err;
+				}, () => {
+					throw err;
+				})
+			));
+});
+
+module.exports = (input, output, opts) => {
+	if (typeof input !== 'string' && !Buffer.isBuffer(input)) {
+		return Promise.reject(new TypeError('Input file required'));
+	}
+
+	if (typeof output === 'object') {
+		opts = output;
+		output = null;
+	}
+
+	opts = Object.assign({plugins: [
+		decompressTar(),
+		decompressTarbz2(),
+		decompressTargz(),
+		decompressUnzip()
+	]}, opts);
+
+	const read = typeof input === 'string' ? fsP.readFile(input) : Promise.resolve(input);
+
+	return read.then(buf => extractFile(buf, output, opts));
+};
+```
+
+---
