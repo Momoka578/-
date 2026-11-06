@@ -1,0 +1,239 @@
+## No.16 google/firing-range src/tests/dom/EventTriggering.java
+
+- 検証した修正コード: "修正版コード"
+- 検証結果: **不備あり** — sink は SAFE_SINK に固定したが、パスの source 部分が無制限で、data/sources/ にある ToxicDom 用の危険なテンプレート（postMessage/eval.tmpl の eval(msg.data) など）を選べ、XSS が残る（jsdom で確認）。修正コード2: source/accessType を一覧ページで使う 2 つ（document/formSubmission・document/inputTyping）の許可リストに限定し、それ以外は 400。log の指摘 (b) は誤りで、説明.md で訂正
+- 修正コード2 のファイル: src/tests/dom/EventTriggering.java
+- 親の確認: src/tests/dom/EventTriggering.java: 構文確認なし（この環境に Java の実行環境がないため。エージェントも Java は実行していない）。エージェントが読み取り専用の材料（orig・given）を変えていないこと、読まない範囲のファイルを読んでいないことを、記録で確認した。
+- 使用トークン量（検証）: 新規 75,785（入力 48 ／ キャッシュ作成 45,239 ／ 出力〔推定〕 30,498）、キャッシュ読込 985,868、総処理 1,061,653、リクエスト 24 回
+- 使用トークン量（再修正）: 新規 43,208（入力 20 ／ キャッシュ作成 29,673 ／ 出力〔推定〕 13,515）、キャッシュ読込 803,566、総処理 846,774、リクエスト 10 回
+
+- 検証した修正コード: `given/fix_xss/src/tests/dom/EventTriggering.java`（"修正版コード"）
+- 修正コード2: `fix2/src/tests/dom/EventTriggering.java`（直したのはこのファイルだけ）
+- 検証結果: **不備あり**（判定の脆弱性が一部の経路で残る）
+
+### 元の修正コードの不備
+
+#### 不備1: パスの source 部分から「sink を含むテンプレート」を選べるため、修正後も DOM XSS が残る
+
+- 場所: `EventTriggering.java`（修正コード）L61-64 `generateTemplate()`
+
+  ```java
+  private String generateTemplate(String source, String accessType, String sink)
+      throws IOException {
+    String sourcePath = "sources/" + source + "/" + accessType + ".tmpl";
+    String sourceTemplate = Templates.getTemplate(sourcePath, EventTriggering.class);
+  ```
+
+  `source` と `accessType` は、L51-52 の `pathInfo.split("/")[0]`・`[1]`（リクエストのパス）そのままで、制限がない。元の修正は L65-67 で sink テンプレートだけを固定の `SAFE_SINK`（`div.textContent = payload`）に置き換えた。source 側は元のコードのままで、パスで指定したテンプレートを読み込み、応答の `<script>` にそのまま入れる。
+
+- 問題: source テンプレートは `data/sources/` から読み込まれる。このディレクトリは ToxicDom サーブレットと共用で、ToxicDom の「アクセス種別なし」の URL（`ToxicDom.generateAccesslessTemplate()` が `sources/<source>/<sink>.tmpl` を単独で使う）用に、**テンプレートの中に sink を持つ自己完結型のテンプレート**がある（同じコミットで確認）。
+  - `sources/postMessage/eval.tmpl` L2-3: `var content = msg.data; var msgObj = eval(content);`（origin の確認なし）
+  - `sources/postMessage/innerHtml.tmpl` L2-4: `div.innerHTML = JSON.parse(msg.data).html;`
+  - `sources/postMessage/documentWrite.tmpl` L3: `document.write('<scr' + 'ipt src="' + content.url + '"></scr' + 'ipt>');`
+  - `sources/postMessage/complexMessageDocumentWriteEval.tmpl` L4・L6・L8: `eval(msg.data.payload)`、`document.write(...)`
+  - `sources/postMessage/improperOriginValidationWithPartialStringComparison.tmpl`・`improperOriginValidationWithRegExp.tmpl`: 不十分な origin 確認の後で `eval(msg.data)`
+
+  accessType にこれらのファイル名を指定すると、EventTriggering の source として読み込まれ、応答にそのまま入る。`Templates.getTemplate` の `..` 禁止（Templates.java L61）は、同じ `data/` の中のテンプレートを選ぶことは止めない。sink を `SAFE_SINK` にしても、source テンプレートの中の eval / innerHTML / document.write は残る。
+
+- 問題になる入力・条件:
+  - `GET /dom/eventtriggering/postMessage/eval/<任意の文字列>`（修正コードは sink 部分を読まないので、`eval` でも `x` でもよい）。攻撃者のページがこの URL を iframe か window.open で開き、`postMessage("任意の JavaScript", "*")` を送ると、firing-range のオリジンで eval される。
+  - `GET /dom/eventtriggering/postMessage/innerHtml/<任意>` に `{"html":"<img src=x onerror=...>"}` を送ると、innerHTML で HTML として解釈される。
+  - documentWrite・complexMessageDocumentWriteEval・improperOrigin 系も同じ。
+
+- 実際に確かめたか: 確かめた。javac が無いので `generateTemplate`／`doGet` を Python で再現する `bench/gen.py` で修正コードの応答 HTML を作り、jsdom で読み込んで `window.postMessage` を送った。
+  - `/postMessage/eval/eval` と `/postMessage/eval/nonexistent` に `window.__pwned=1` を送ると、eval が実行された（pwned=true）。
+  - `/postMessage/innerHtml/innerHtml` に `{"html":"<img src=x onerror=\"window.__pwned=1\"><b>pm</b>"}` を送ると、img と b の要素が DOM に作られた（HTML として解釈された）。
+  - 結果は元のコードと同じだった。postMessage 系のテンプレートは `payload` を宣言しないので、最上位の `SAFE_SINK` の `div.textContent = payload;` で ReferenceError になる。ただし、その前に `addEventListener('message', ...)` が実行されているので、攻撃は成り立つ。
+  - documentWrite・complexMessageDocumentWriteEval・improperOrigin 系は、コードを読んで sink があることを確かめた（実行はしていない）。
+
+- 判定との関係: 判定の記録は、「パスで選んだ source テンプレートと sink テンプレートを連結して `<script>` に入れること」を脆弱性の仕組みとしている。そのうえで「他の source も同じ仕組みで組み合わせ可能」としている。修正の説明は「危険な sink テンプレート（eval / innerHTML / document.write）は読み込まず」としている。しかし、同じ `generateTemplate()` の source 側から eval / innerHTML / document.write を含むコードを応答に入れられるので、修正を回り込める。判定の経路（formSubmission・inputTyping）は直っているが、同じ箇所・同じ原因（パスによる無制限なテンプレート選択）の経路が残るため、不備とした。
+
+### 再修正の内容
+
+変更したのは `fix2/src/tests/dom/EventTriggering.java` だけ。元の修正（`SAFE_SINK` と `sendNormalPage`）はそのまま残し、source の選び方に許可リストを足した。
+
+#### 変更1: import の追加（L4-5）
+
+```java
+// 【修正2】source の許可リストに使う（Guava はこのプロジェクトで既に使っている）
+import com.google.common.collect.ImmutableSet;
+```
+
+- 許可リストを変更できない集合として持つため、Guava の `ImmutableSet` を使う。
+- Guava はこのファイルでも既に `CharMatcher` を使っている。build.xml では guava-18.0 を WEB-INF/lib に入れている。`ImmutableSet.of(E, E)` と `contains(Object)` は Guava 18 にあるので、依存は増えない。
+
+#### 変更2: source の許可リスト `ALLOWED_SOURCES`（L44-50）
+
+```java
+private static final ImmutableSet<String> ALLOWED_SOURCES =
+    ImmutableSet.of("document/formSubmission", "document/inputTyping");
+```
+
+- 許可するのは `"<source>/<accessType>"` の 2 つだけ。どちらも次の動きしかしないテンプレートで、それ自体に sink はない。
+  - `formSubmission.tmpl`: フォーム送信時に入力欄の値を `payload` に入れて `deferredPayload()` を呼ぶ。
+  - `inputTyping.tmpl`: keyup・change 時に `payload = e.target.value` として `deferredPayload()` を呼ぶ。
+- この 2 つにした理由:
+  - このサーブレットは Javadoc のとおり「イベント発火後に起きる XSS」用。一覧ページ（`src/pages/dom/index.html` L74-82）からのリンクも、`/dom/eventtriggering/document/{formSubmission,inputTyping}/{eval,innerHtml,documentWrite}` の 6 つだけ。
+  - 「危ないものを禁止する」形（禁止リスト）では、postMessage 系の 6 つを並べても、同じディレクトリに今後足されるテンプレートや見落としを防げない。そこで、確かめたものだけを通す許可リストにした（許可リストに無いものは拒否する）。
+- 文字列の完全一致で比べる。大文字・小文字の違い（`Document/FormSubmission`）、拡張子付き（`formSubmission.tmpl`）、空白付き、存在しない名前はすべて一致せず拒否される。パスが `/` で 3 つに分かれていることは doGet の `countIn(pathInfo) != 2` で確かめ済みなので、`source` と `accessType` に `/` は入らない。
+
+#### 変更3: generateTemplate 冒頭の確認（L73-77）
+
+```java
+if (!ALLOWED_SOURCES.contains(source + "/" + accessType)) {
+  throw new IllegalArgumentException("Unsupported source");
+}
+```
+
+- テンプレートを読み込む前に、`source + "/" + accessType` が許可リストにあるかを確かめる。無ければ `IllegalArgumentException` を投げる。
+- 例外は、元のコードからある doGet の `catch (IllegalArgumentException | IOException e)`（L65-66）で受けて、`Responses.sendError(response, e.getMessage(), 400)` で 400 を返す。新しいエラー処理は作らず、既存の経路に乗せた。
+- エラーメッセージは固定の `"Unsupported source"` にして、リクエストの値を入れない。`sendError` は `Escaper.escapeHtml` と `text/plain` で返すので、値を入れても XSS にはならない。それでも、入力を応答に反射しない形にした。
+- 許可された場合の動作は、元の修正コードと 1 文字も変わらない（生成した HTML が一致することを確認した）。
+
+### 確認した内容と結果
+
+javac も java もこの環境に無い。そのため Java はコードを読んで確かめ、応答は Python の再現（`bench/gen.py`）で作り、JavaScript は node と jsdom で実際に動かした。
+
+1. Java のコードの確認（読んで確認）
+   - 差分は、import 1 行、定数 1 つ、if 文 1 つだけ（diff で確認）。
+   - 文字列・コメントを除いた括弧 `(` `[` `{` の対応をスクリプトで数え、対応が取れていることを確認した。
+   - `ImmutableSet<String>`・`ImmutableSet.of(String, String)`・`contains(Object)` の型は合っている。`IllegalArgumentException` は非チェック例外なので、`throws` の変更はいらない。
+   - 既存の import（CharMatcher, Responses, Templates, IOException, HttpServlet, HttpServletRequest, HttpServletResponse）はすべて使われている。
+   - `Responses.sendNormalPage(HttpServletResponse, String)` は Responses.java L36 にある。
+2. 応答の再現と構文確認
+   - `bench/gen.py` は、Java ファイルから `SAFE_SINK` の文字列リテラル連結と `ALLOWED_SOURCES` の値を読み取って、doGet・generateTemplate を再現する。これで修正コード2 の応答を作った。
+   - 許可される 7 通り（formSubmission と inputTyping × eval・innerHtml・documentWrite、および formSubmission/nonexistent）は 200 になった。`<script>` 部分を `node --check` にかけ、すべて構文 OK だった。
+   - `/document/formSubmission/eval` と `/document/inputTyping/eval` の応答 HTML は、元の修正コードの応答と完全に一致した（cmp）。
+3. 回り込みの経路が塞がったこと
+   - 次のパスは、すべてテンプレートを読み込まずに 400（`Unsupported source`）になった。
+     - `/postMessage/eval/eval`・`/postMessage/eval/x`・`/postMessage/innerHtml/innerHtml`・`/postMessage/documentWrite/x`・`/postMessage/complexMessageDocumentWriteEval/x`・`/postMessage/improperOriginValidationWithRegExp/x`・`/postMessage/improperOriginValidationWithPartialStringComparison/x`
+     - `/window/name/eval`・`/document/cookie/eval`・`/document/referrer/eval`・`/sessionStorage/property/eval`
+     - `/Document/FormSubmission/eval`・`/document/formsubmission/eval`・`/document/formSubmission.tmpl/eval`・`/document/formSubmission /eval`・`/document/nonexistent/eval`
+   - 応答ページが返らないので、postMessage を受ける eval・innerHTML・document.write のコードは配信されない。
+4. 攻撃の入力（jsdom、修正コード2 の応答で実行）
+   - formSubmission と inputTyping の両方で、sink 指定 eval・innerHtml・documentWrite のそれぞれに次の入力を与えた。
+     - `window.__pwned=1`
+     - `<img src=x onerror="window.__pwned=1"><b>bold</b>`
+   - 追加で次の入力も試した。
+     - `</script><script>window.__pwned=1</script>`
+     - `javascript:window.__pwned=1`
+   - すべて pwned=false で、注入した要素は 0 個だった。入力は div の textContent に文字列のまま入った（innerHTML で見ると `&lt;img ...` のようにエスケープされている）。
+   - 比較のため元のコードで同じことをすると、eval では pwned=true、innerHTML では img と b の要素が作られた。検査の仕組み自体が攻撃を検出できることは確かめてある。
+5. 正常な入力（jsdom）
+   - formSubmission/eval に `hello world`、inputTyping/innerHtml に `abc` を入れた。エラーは出ず、入力した文字列がそのまま div に表示された。
+   - フォーム送信は onsubmit の `return false` で止まった（defaultPrevented=true）。元の修正コードと同じ動作だった。
+6. 検証ログの訂正
+   - log.txt の検証記録の「指摘 (b)」は誤りだった。そこでは「`sources/sessionStorage/property.tmpl` は `}, 10)` で終わり改行が無いので、`SAFE_SINK` と連結すると構文エラーになる」と書いた。
+   - その後 `od -c` で確かめると、このファイルの末尾には改行があった。元のコードと元の修正コードで連結した応答（eval・innerHtml）を `node --check` にかけても、構文 OK だった。この指摘は取り消す。
+   - 修正コード2 では、この source は許可リストの外なので 400 になる。
+
+### 副作用・残る点
+
+- **source の制限による動作の変化**: 一覧ページに無い組み合わせは 400（`Unsupported source`）になる。具体的には、`/dom/eventtriggering/window/name/eval`、`/document/cookie/...`、`/document/referrer/...`、`/localStorage/...`、`/sessionStorage/...`、`/postMessage/...` など。
+  - 元のコードと元の修正コードでは、これらも 200 でページを返していた。ただし、イベント発火を使わない ToxicDom 用の source が、たまたま読み込めていただけで、このサーブレットの用途（イベント発火後の XSS）に合わない。
+  - 一覧ページの 6 つの URL の動作は、元の修正コードと変わらない。
+  - 将来イベント発火型の source を足すときは、そのテンプレートに sink が無いことを確かめてから `ALLOWED_SOURCES` に足す必要がある。
+- **Javadoc の例が古いまま**: クラスの Javadoc（修正コード2 の L24-25）の例 `/dom/eventtriggering/document/cookie/eval` は、元のコードの説明文のまま残した。修正コード2 ではこのパスは 400 になる。コードの動作には影響しないので、変更を最小にするため直していない。
+- **sink 部分は引き続き無視される（元の修正コードのまま）**: パスの 3 つ目（sink）は読まれない。そのため、`/document/formSubmission/nonexistent` のような存在しない sink 名でも、元のコードの 400 ではなく 200 で、安全な sink のページを返す。値はどこにも使われないので脆弱性にはならず、今回は直していない。
+- **X-XSS-Protection**: 元の修正コードのまま `sendNormalPage` を使うので、`X-XSS-Protection: 0` は付かない。現在のブラウザの多くは XSS Auditor を持たないので、セキュリティ上の差は小さい。
+- **pathInfo が null の場合**: `/dom/eventtriggering`（末尾の `/` が無いもの）では `request.getPathInfo()` が null になり、L54 で NullPointerException（500）になる。元のコードからの動作で、XSS とは関係ないので直していない。
+- **ToxicDom 自体の XSS は対象外**: postMessage 系テンプレートの eval・innerHTML・document.write は、`/dom/toxicdom/postMessage/...`（ToxicDom.java、別の番号の対象）からは引き続き配信される。今回は EventTriggering の応答に入らないようにしただけ。
+- 実際の Java のコンパイル・サーブレットの起動はしていない（javac が無い）。応答は Python の再現で確かめた。
+
+### 修正コード2 の全文: src/tests/dom/EventTriggering.java
+
+```java
+package com.google.testing.security.firingrange.tests.dom;
+
+import com.google.common.base.CharMatcher;
+// 【修正2】source の許可リストに使う（Guava はこのプロジェクトで既に使っている）
+import com.google.common.collect.ImmutableSet;
+import com.google.testing.security.firingrange.utils.Responses;
+import com.google.testing.security.firingrange.utils.Templates;
+
+import java.io.IOException;
+
+import javax.servlet.http.HttpServlet;
+import javax.servlet.http.HttpServletRequest;
+import javax.servlet.http.HttpServletResponse;
+
+/**
+ * A servlet to provide XSSs that occur after event firing. It is mapped to the
+ * /dom/eventtriggering/ directory and maps paths as follows:
+ * <ul>
+ *     <li> Source object
+ *     <li> Source property
+ *     <li> Sink
+ * </ul>
+ *
+ * Thus, {@code /dom/eventtriggering/document/cookie/eval} will map to the document.cookie source,
+ * and the eval sink.
+ */
+public class EventTriggering extends HttpServlet {
+
+  private static final String TOXIC_TEMPLATE = "toxicdom.tmpl";
+  private static final String DEFERRED_TEMPLATE = "deferred.tmpl";
+
+  // 修正: eval / innerHTML / document.write の代わりに使う安全な sink。
+  // payload を textContent に代入するので、HTML や JavaScript として解釈されず文字列として表示される。
+  private static final String SAFE_SINK =
+      "var div = document.createElement('div');\n"
+      + "document.documentElement.appendChild(div);\n"
+      + "// Sync trigger.\n"
+      + "div.textContent = payload;\n"
+      + "// Async trigger.\n"
+      + "function trigger(payload) {\n"
+      + "  div.textContent = payload;\n"
+      + "}\n";
+
+  // 【修正2】source として読み込んでよいテンプレート（"<source>/<accessType>"）の許可リスト。
+  // data/sources/ には ToxicDom 用に、テンプレート自体に eval / innerHTML / document.write を含むもの
+  // （postMessage/eval.tmpl など）もあり、パスの source 部分でそれを選ぶと SAFE_SINK を使っても
+  // XSS が残る。そのため、イベント発火で入力欄の値を payload に入れて deferredPayload() を呼ぶだけの
+  // テンプレート（このサーブレットの一覧ページで使っているもの）に限る。
+  private static final ImmutableSet<String> ALLOWED_SOURCES =
+      ImmutableSet.of("document/formSubmission", "document/inputTyping");
+
+  @Override
+  public void doGet(HttpServletRequest request, HttpServletResponse response) throws IOException {
+    String pathInfo = request.getPathInfo().substring(1);
+    if (CharMatcher.is('/').countIn(pathInfo) != 2) {
+      String errorMsg = String.format("Missing sink, not enough sinks or too many sinks :(."
+          + "Got %d, expected 2", CharMatcher.is('/').countIn(pathInfo));
+      Responses.sendError(response, errorMsg, 400);
+    } else {
+      try {
+        String template = generateTemplate(
+            pathInfo.split("/")[0], pathInfo.split("/")[1], pathInfo.split("/")[2]);
+        // 修正: X-XSS-Protection: 0 を付ける sendXssed ではなく、通常ページ用の送信処理を使う
+        Responses.sendNormalPage(response, template);
+      } catch (IllegalArgumentException | IOException e) {
+        Responses.sendError(response, e.getMessage(), 400);
+      }
+    }
+  }
+
+  private String generateTemplate(String source, String accessType, String sink)
+      throws IOException {
+    // 【修正2】許可リストに無い source / accessType の組み合わせは、テンプレートを読み込まずに拒否する。
+    // doGet の catch (IllegalArgumentException) で 400 になる。メッセージにはリクエストの値を含めない。
+    if (!ALLOWED_SOURCES.contains(source + "/" + accessType)) {
+      throw new IllegalArgumentException("Unsupported source");
+    }
+    String sourcePath = "sources/" + source + "/" + accessType + ".tmpl";
+    String sourceTemplate = Templates.getTemplate(sourcePath, EventTriggering.class);
+    // 修正: リクエストで指定された危険な sink テンプレート（eval / innerHTML / document.write）は
+    // 読み込まず、payload を文字列として扱う安全な sink に置き換える
+    String sinkTemplate = SAFE_SINK;
+
+    String toxicTemplate = Templates.getTemplate(TOXIC_TEMPLATE, EventTriggering.class);
+    String deferredTemplate = Templates.getTemplate(DEFERRED_TEMPLATE, EventTriggering.class);
+    // Wrap each sink with code to defer its execution.
+    String deferredPayload = Templates.replacePayload(deferredTemplate, sinkTemplate);
+    return Templates.replacePayload(toxicTemplate, deferredPayload + sourceTemplate + sinkTemplate);
+  }
+
+}
+```
+
+---
