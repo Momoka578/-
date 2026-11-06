@@ -1,0 +1,307 @@
+## No.21 CVE-2017-0931 guardian/html-janitor src/html-janitor.js（prePatch 8c99e65）
+
+- 検証した修正コード: "修正版コード"
+- 検証結果: **不備あり** — 根拠の「clean() だけで onerror が動く」は直った（Chrome で 43 件 0 発火）。ただし inert な文書（スクリプト無効）で解析するようにしたため、noscript の中身の解析が描画時と食い違う mutation XSS が新しく入った（noscript と style などを許可した設定で 8 件発火）。修正コード2: 許可した noscript の中身に </noscript があれば noscript ごと削除
+- 修正コード2 のファイル: src/html-janitor.js
+- 親の確認: src/html-janitor.js: node --check で構文エラーなし。エージェントが読み取り専用の材料（orig・given）を変えていないこと、読まない範囲のファイルを読んでいないことを、記録で確認した。
+- 使用トークン量（検証）: 新規 113,935（入力 24 ／ キャッシュ作成 61,750 ／ 出力〔推定〕 52,161）、キャッシュ読込 557,559、総処理 671,494、リクエスト 12 回
+- 使用トークン量（再修正）: 新規 22,733（入力 14 ／ キャッシュ作成 13,701 ／ 出力〔推定〕 9,018）、キャッシュ読込 614,753、総処理 637,486、リクエスト 7 回
+
+- 修正コード2: `fix2/src/html-janitor.js`（元の修正コード `given/fix_xss/src/html-janitor.js` をコピーし、1 か所だけ追加した）
+- 判定の根拠の脆弱性（サニタイズ前の HTML を表示中の document で解析し、その時点で読み込みやイベントハンドラが動く）は、元の修正コードで直っている。今回直したのは、その修正によって新しく入った問題である。
+
+### 元の修正コードの不備
+
+#### 不備1: `<noscript>` の解析の違いによる mutation XSS（修正で新しく入った問題）
+
+- 場所: `given/fix_xss/src/html-janitor.js`
+  - L46-48（clean）
+    ```js
+    var sandboxDocument = document.implementation.createHTMLDocument('');
+    var sandbox = sandboxDocument.createElement('div');
+    sandbox.innerHTML = html;
+    ```
+  - L52 `return sandbox.innerHTML;`
+  - L121-133: 許可された要素は、属性を削った後に中身ごと残す（`this._sanitize(node);` で子だけをサニタイズする）。`noscript` を特別に扱う処理はない。
+- 問題:
+  - `document.implementation.createHTMLDocument('')` で作った文書には閲覧コンテキストがないので、「スクリプト無効」の文書になる。そのため、HTML パーサの scripting フラグがオフになり、`<noscript>` の中身が普通のマークアップ（要素）として解析される。
+  - 一方、clean() の返り値を実際に入れる表示中のページは「スクリプト有効」である。このページでは、`<noscript>` の中身は `</noscript` が出てくるまでの生テキスト（RAWTEXT）として解析される。
+  - サニタイズするときと使うときとで、木の形が変わる。サニタイズ時には、`style`・`iframe`・`xmp`・`noembed`・`noframes` の中身は「テキスト」なので、サニタイザは調べない。ところが、使うときには `</noscript>` で noscript が閉じ、その後ろの `<img src=x onerror=...>` が本物の要素になる。
+  - このため、設定で許可していない `img` と `onerror` が出力から生まれる。サニタイザの許可リストの保証が破れている。
+  - 元のコード（orig）は表示中の文書（スクリプト有効）で解析していたので、この食い違いはなかった。同じ設定・同じ入力で、orig の返り値は `<noscript><style></noscript>` となり、ページに入れても発火しない。この問題は修正で新しく入ったものである。
+- 問題になる入力・条件（headless Chrome 156 で、返り値を接続済みの要素に innerHTML で入れて確認。標準モード・互換モードとも同じ結果）:
+  - 設定 `{tags: {noscript: {}, style: {}, p: {}}}`、入力 `<noscript><style></noscript><img src=x onerror=…></style></noscript>`
+    - 返り値は `<noscript><style></noscript><img src=x onerror=…></style></noscript>` で、入力がそのまま残る。ページに入れると onerror が実行された。
+  - `style` の代わりに `iframe`・`xmp`・`noembed`・`noframes` を許可した場合も同じく実行された。
+  - 次の変形でも実行された:
+    - 大文字と、終了タグの後の空白（`<NOSCRIPT><STYLE></NoScRiPt ><img …>`）
+    - `</noscript/>` と書き、`<p>` の中に置いた場合
+    - noscript を入れ子にした場合
+  - 属性値を使う経路（`<noscript><p title="</noscript><img …>">`、`a` の href。`^https?://` を検査する関数を設定しても通る）は、Chrome 156 では発火しなかった。シリアライズのときに属性値の `<` `>` が `&lt;` `&gt;` になるためである。属性値の `<` `>` をエスケープしない古いブラウザでは、`noscript` と、`title` などを素通しする属性さえ許可すれば同じ形で成立するはずである（この環境にそのブラウザはないため未確認）。
+  - 前提: 設定で `noscript` を許可していること。Chrome 156 では、加えて style・iframe・xmp・noembed・noframes のどれかを許可していること。`noscript` を許可しない設定では、noscript が外されて中身は通常どおりサニタイズされるので、発火しない（確認済み）。
+
+### 再修正の内容
+
+変更は `fix2/src/html-janitor.js` の `_sanitize` の 1 か所だけである（L135-149 に追加）。clean() の変更（inert な文書で解析する）、createTreeWalker の変更、元の【修正】コメントは、そのまま残した。
+
+```js
+      // Sanitize children
+      this._sanitize(node);
+
+      // 【修正2】noscript の解析の違いによる mutation XSS を防ぐ。
+      // …（説明のコメント）…
+      if (nodeName === 'noscript' && /<\/noscript/i.test(node.innerHTML)) {
+        parentNode.removeChild(node);
+
+        this._sanitize(parentNode);
+        break;
+      }
+```
+
+- 何をしているか
+  - 許可された要素の子をサニタイズし終えた直後に、その要素が `noscript` かどうかを見る。`nodeName` は直前（L99）で小文字にした変数である。`noscript` なら、その中身を `node.innerHTML` で実際にシリアライズし、`</noscript` が含まれるかどうかを大文字小文字を区別せずに調べる。
+  - 含まれていれば、`noscript` を中身ごと削除する。その後、既存のノード削除の処理と同じ書き方（`this._sanitize(parentNode); break;`）で、親をもう一度たどり直す。
+- なぜこの方法にしたか
+  - 表示中のページ（スクリプト有効）で `<noscript>` の生テキストが終わるのは、`</noscript` に続いて空白・`/`・`>` が来たときだけである。中身のシリアライズ結果に `</noscript` が一度も出てこなければ、使うときに中身はすべて noscript の生テキストになる。つまり、中身のどこからも要素は生まれない。条件を `</noscript` だけにしたのは、後ろに続く文字を問わずに広めに検出するためである。
+  - `node.innerHTML` は、最後に clean() が返す `sandbox.innerHTML` の中で、この noscript の中身として出力される文字列と同じものである。シリアライズは同じ文書・同じノードについて同じ規則で行われる。そのため、ブラウザの違いにも、実際の出力に合わせて対応できる。例えば、属性値の `<` `>` をエスケープしない古いブラウザでは `</noscript` がそのまま出るので検出され、削除される。Chrome 156 では `&lt;/noscript&gt;` になるので残すが、これは無害である。
+  - 調べるのは子をサニタイズした後である。コメントの削除などで消える部分は誤検出しない。サニタイズで中身が変わった後の、最終的な文字列で判定できる。
+  - 中身を親に移す（外す）のではなく、中身ごと削除した。理由は 2 つある。noscript の中身は、スクリプト有効のページでは表示されないので、削除しても見た目は変わらない。また、使うときの解析を正しくまねることはできないので、危険な中身は残さない方が確実である。
+  - `nodeName`（小文字）で比べるので、svg の中など、HTML 以外の名前空間の `noscript` も対象になる。再解析で名前空間が変わる場合に備えた、安全側の判定である。
+  - `noscript` を許可しない設定では、これまでどおり L107-119 で noscript が外され、中身は通常の要素としてサニタイズされる。この場合、出力に noscript は残らないので、変更はない。
+- どう動くか（例）
+  - `<noscript><style></noscript><img src=x onerror=…></style></noscript>`（noscript と style を許可）: 子の style は許可されているので残る。noscript の innerHTML は `<style></noscript><img …></style>` になり、`</noscript` を含むので noscript ごと削除され、返り値は `""` になる。
+  - `<noscript><p><noscript><style></noscript>…</style></noscript></p></noscript>`: 内側の noscript が先に削除される。外側の innerHTML は `<p></p>` で、`</noscript` を含まないので残り、返り値は `<noscript><p></p></noscript>` になる。
+  - 正常な `<noscript><style>p{color:red}</style><p>Enable JS</p></noscript>` や、テキストに `&lt;/noscript&gt;` を含む中身は、`</noscript` がそのまま出ないので、これまでどおり残る。
+
+### 確認した内容と結果
+
+- 構文: `node --check fix2/src/html-janitor.js` は OK。Node で require でき（module.exports）、コンストラクタ・clean・_sanitize が関数であること、不正な設定で例外を投げることを確認した（元のコードと同じ）。
+- ブラウザでの確認: headless Chrome 156 で `bench/harness_std.html`（標準モード）と `bench/harness_quirks.html`（互換モード）を開き、`bench/run.sh <対象js> <std|quirks> <結果>` で実行した。結果は `bench/res/fix2_std.json`・`bench/res/fix2_quirks.json`、比較は `bench/compare.js` で行った。
+  - 解析時（clean() を呼ぶだけ）の発火: 攻撃入力 43 件で 0 件（標準・互換とも）。元の修正コードと同じで、根拠の脆弱性は直ったままである。元のコードは 29 件が発火する。
+    - 攻撃入力に含めたもの: img の onerror・大文字・空白の変形・文字参照・srcset・onload、svg の image、math、details の ontoggle、input type=image、video、audio、config 関数の中で同期に error を投げる場合など
+  - 描画時（返り値を接続済みの要素に入れる）の発火:
+    - 元の修正コードは 9 件だった。設定の仕様による `{img: true}` の 1 件と、noscript の mXSS 8 件（m2, m3, m6, m7, m8, m11, m12, m13）である。
+    - 修正コード2 は `{img: true}` の 1 件だけになった。この 1 件は元のコードでも同じで、全属性を許可する設定の仕様である。
+  - noscript の mXSS の入力に対する修正コード2 の返り値:
+    - m2, m3, m6, m7, m8, m11, m15 は `""`、m12 は `<p></p>`、m13 は `<noscript><p></p></noscript>` になった。
+    - 無害な m1, m4, m5, m9, m14 は、元の修正コードと同じ返り値だった。
+  - 正常な入力 28 件の返り値は、元の修正コードと標準・互換モードとも全件一致した（noscript を許可した無害な入力 n20, n21, n27, n28 を含む）。
+- 未確認の点: 属性値の `<` `>` をエスケープしない古いブラウザでの動作は、環境にないため実行していない。判定が実際のシリアライズ結果を調べる仕組みなので、そのようなブラウザで `</noscript` が出れば削除される（コードを読んでの確認）。
+
+### 副作用・残る点
+
+- 動作の変化（修正コード2 で加えたもの）: 許可された `noscript` は、中身のシリアライズ結果に `</noscript` を含むときだけ、中身ごと出力から消える。noscript の中身は、スクリプト有効のページでは表示されないので、見た目への影響はない。正常な入力の返り値は、元の修正コードと変わらない。
+- 元の修正コードから続いている動作の変化（直していない。危険ではないため）:
+  - noscript の中身の扱い: 元のコードは中身を生テキストとして扱っていた。元の修正コード以降は、中身を要素として扱う。
+    - 設定 `{noscript: {}}` の `<noscript><p>Enable <b>JS</b></p></noscript>` は、元のコードでは中身がそのまま残った。今は `<noscript>Enable JS</noscript>` になる。
+    - noscript を許可しない設定では、元のコードは `&lt;p&gt;Enable JS&lt;/p&gt;`（タグが文字として見える）だった。今は `<p>Enable JS</p>` になる。
+  - 互換モード（doctype なし）のページでは、`<p>a<table>…</table>c</p>` の結果が変わる。元のコードは p の中に table を置いた。今は p を閉じる。解析に使う文書が標準モードのためである。
+- 直していない点:
+  - 判定の付随の指摘（allowedAttrs === true で全属性を許可する点と、属性値（javascript: など）を検査しない点）。ライブラリの設定の仕様で、属性値は関数で検査できる設計になっている。根拠の脆弱性とは原因が別なので、対象外のままとした。
+  - svg・math の名前空間の混乱を使う一般的な mXSS。元のコードと同じ「解析→シリアライズ→再解析」の構造の問題で、修正で増えたものではないので、対象外とした。
+
+### 修正コード2 の全文: src/html-janitor.js
+
+```javascript
+(function (root, factory) {
+  if (typeof define === 'function' && define.amd) {
+    define('html-janitor', factory);
+  } else if (typeof exports === 'object') {
+    module.exports = factory();
+  } else {
+    root.HTMLJanitor = factory();
+  }
+}(this, function () {
+
+  /**
+   * @param {Object} config.tags Dictionary of allowed tags.
+   * @param {boolean} config.keepNestedBlockElements Default false.
+   */
+  function HTMLJanitor(config) {
+
+    var tagDefinitions = config['tags'];
+    var tags = Object.keys(tagDefinitions);
+
+    var validConfigValues = tags
+      .map(function(k) { return typeof tagDefinitions[k]; })
+      .every(function(type) { return type === 'object' || type === 'boolean' || type === 'function'; });
+
+    if(!validConfigValues) {
+      throw new Error("The configuration was invalid");
+    }
+
+    this.config = config;
+  }
+
+  // TODO: not exhaustive?
+  var blockElementNames = ['P', 'LI', 'TD', 'TH', 'DIV', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'PRE'];
+  function isBlockElement(node) {
+    return blockElementNames.indexOf(node.nodeName) !== -1;
+  }
+
+  var inlineElementNames = ['A', 'B', 'STRONG', 'I', 'EM', 'SUB', 'SUP', 'U', 'STRIKE'];
+  function isInlineElement(node) {
+    return inlineElementNames.indexOf(node.nodeName) !== -1;
+  }
+
+  HTMLJanitor.prototype.clean = function (html) {
+    // 修正: 現在表示中の document ではなく、閲覧コンテキストを持たない別文書（inert な文書）で解析する。
+    // この文書内では画像などの読み込みもイベントハンドラ（onerror 等）の実行も起きないため、
+    // サニタイズ前の HTML を innerHTML に入れてもスクリプトは動かない。
+    var sandboxDocument = document.implementation.createHTMLDocument('');
+    var sandbox = sandboxDocument.createElement('div');
+    sandbox.innerHTML = html;
+
+    this._sanitize(sandbox);
+
+    return sandbox.innerHTML;
+  };
+
+  HTMLJanitor.prototype._sanitize = function (parentNode) {
+    var treeWalker = createTreeWalker(parentNode);
+    var node = treeWalker.firstChild();
+    if (!node) { return; }
+
+    do {
+      if (node.nodeType === Node.TEXT_NODE) {
+        // If this text node is just whitespace and the previous or next element
+        // sibling is a block element, remove it
+        // N.B.: This heuristic could change. Very specific to a bug with
+        // `contenteditable` in Firefox: http://jsbin.com/EyuKase/1/edit?js,output
+        // FIXME: make this an option?
+        if (node.data.trim() === ''
+            && ((node.previousElementSibling && isBlockElement(node.previousElementSibling))
+                 || (node.nextElementSibling && isBlockElement(node.nextElementSibling)))) {
+          parentNode.removeChild(node);
+          this._sanitize(parentNode);
+          break;
+        } else {
+          continue;
+        }
+      }
+
+      // Remove all comments
+      if (node.nodeType === Node.COMMENT_NODE) {
+        parentNode.removeChild(node);
+        this._sanitize(parentNode);
+        break;
+      }
+
+      var isInline = isInlineElement(node);
+      var containsBlockElement;
+      if (isInline) {
+        containsBlockElement = Array.prototype.some.call(node.childNodes, isBlockElement);
+      }
+
+      // Block elements should not be nested (e.g. <li><p>...); if
+      // they are, we want to unwrap the inner block element.
+      var isNotTopContainer = !! parentNode.parentNode;
+      var isNestedBlockElement =
+            isBlockElement(parentNode) &&
+            isBlockElement(node) &&
+            isNotTopContainer;
+
+      var nodeName = node.nodeName.toLowerCase();
+
+      var allowedAttrs = getAllowedAttrs(this.config, nodeName, node);
+
+      var isInvalid = isInline && containsBlockElement;
+
+      // Drop tag entirely according to the whitelist *and* if the markup
+      // is invalid.
+      if (isInvalid || shouldRejectNode(node, allowedAttrs)
+          || (!this.config.keepNestedBlockElements && isNestedBlockElement)) {
+        // Do not keep the inner text of SCRIPT/STYLE elements.
+        if (! (node.nodeName === 'SCRIPT' || node.nodeName === 'STYLE')) {
+          while (node.childNodes.length > 0) {
+            parentNode.insertBefore(node.childNodes[0], node);
+          }
+        }
+        parentNode.removeChild(node);
+
+        this._sanitize(parentNode);
+        break;
+      }
+
+      // Sanitize attributes
+      for (var a = 0; a < node.attributes.length; a += 1) {
+        var attr = node.attributes[a];
+
+        if (shouldRejectAttr(attr, allowedAttrs, node)) {
+          node.removeAttribute(attr.name);
+          // Shift the array to continue looping.
+          a = a - 1;
+        }
+      }
+
+      // Sanitize children
+      this._sanitize(node);
+
+      // 【修正2】noscript の解析の違いによる mutation XSS を防ぐ。
+      // clean() は閲覧コンテキストのない文書（スクリプト無効）で解析するため、<noscript> の中身は
+      // 要素として解析・サニタイズされる。しかし返り値を入れる表示中のページはスクリプト有効で、
+      // そこでは <noscript> の中身は「</noscript までの生テキスト」として解析し直される。
+      // そのため中身のシリアライズ結果に </noscript があると（例: 許可した <style> のテキスト
+      // `</noscript><img src=x onerror=...>`）、使用時にそこで noscript が閉じ、残りが本物の要素になる。
+      // 中身を子のサニタイズ後に実際にシリアライズして調べ、</noscript（大文字小文字を問わない）が
+      // 含まれていれば noscript を中身ごと削除する。noscript の中身はスクリプト有効のページでは
+      // 表示されないので、削除しても見た目は変わらない。名前空間を問わず（svg 内なども）対象にする。
+      if (nodeName === 'noscript' && /<\/noscript/i.test(node.innerHTML)) {
+        parentNode.removeChild(node);
+
+        this._sanitize(parentNode);
+        break;
+      }
+
+    } while ((node = treeWalker.nextSibling()));
+  };
+
+  function createTreeWalker(node) {
+    // 修正: 解析対象のノードが属する文書（inert な文書）で TreeWalker を作る
+    return node.ownerDocument.createTreeWalker(node,
+                                     NodeFilter.SHOW_TEXT | NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_COMMENT,
+                                     null, false);
+  }
+
+  function getAllowedAttrs(config, nodeName, node){
+    if (typeof config.tags[nodeName] === 'function') {
+      return config.tags[nodeName](node);
+    } else {
+      return config.tags[nodeName];
+    }
+  }
+
+  function shouldRejectNode(node, allowedAttrs){
+    if (typeof allowedAttrs === 'undefined') {
+      return true;
+    } else if (typeof allowedAttrs === 'boolean') {
+      return !allowedAttrs;
+    }
+
+    return false;
+  }
+
+  function shouldRejectAttr(attr, allowedAttrs, node){
+    var attrName = attr.name.toLowerCase();
+
+    if (allowedAttrs === true){
+      return false;
+    } else if (typeof allowedAttrs[attrName] === 'function'){
+      return !allowedAttrs[attrName](attr.value, node);
+    } else if (typeof allowedAttrs[attrName] === 'undefined'){
+      return true;
+    } else if (allowedAttrs[attrName] === false) {
+      return true;
+    } else if (typeof allowedAttrs[attrName] === 'string') {
+      return (allowedAttrs[attrName] !== attr.value);
+    }
+
+    return false;
+  }
+
+  return HTMLJanitor;
+
+}));
+```
+
+---
