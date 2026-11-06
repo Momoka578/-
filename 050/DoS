@@ -1,0 +1,109 @@
+## No.50 CVE-2017-16118 jshttp/forwarded index.js（prePatch ad1efea）
+
+- 修正した脆弱性: 正規表現による DoS／ReDoS（CWE-400・CWE-1333）
+- 修正対象ファイル: index.js
+- 修正の内容:
+  - 元の 9〜14 行目: `var TOKEN_LIST_REGEXP = / *, */` とその JSDoc を削除し、理由を【修正】のコメントで残した。
+  - 元の 57〜61 行目: `header.trim().split(TOKEN_LIST_REGEXP).filter(Boolean).reverse()` を、正規表現を使わない処理に置き換えた。trim() の後の文字列を 1 文字ずつ走査してカンマ（0x2c）か終端でトークンを切り出し、前後の空白（0x20）を while ループで除き、空のトークンは捨て（元の filter(Boolean) に当たる）、最後に reverse() で逆順にする。
+  - 各文字を定数回しか見ないので、O(n^2) から O(n) になる。
+  - 防げること: X-Forwarded-For に「a＜大量の空白＞b」のようなカンマのない長い空白の並びを入れて、1 回のリクエストでイベントループを数秒止めること。
+- 副作用・直さなかった点（エージェントの報告）:
+  - 動作は元と同じ（除くのは前後の 0x20 だけで、タブなどはトークンに残る。両端の空白は元と同じく trim() で除く）。
+  - 線形時間になったので、ヘッダ長の上限は加えていない（Node の HTTP サーバのヘッダサイズの上限に任せる）。forwarded() 本体は変えていない。
+- 確認:
+  - 親: 元ファイルとの差分が上の修正箇所だけであること、node --check で構文エラーがないことを確認した。
+  - エージェント（MARK END の後）: 固定ケース 17 件（空文字、`,`、`,,a,,b,,`、タブ入り、IPv6 など）とランダム入力 200,000 件で、元と出力が一致した（不一致 0）。「a＜空白 n 個＞b」で、元は n=40,000 で 1696 ms、修正版は 0.17 ms。修正版は n=1000 万でも 47.7 ms だった。
+  - 修正ファイルは、書き出した後に直していない。
+- 使用トークン量（修正）: 新規 5,825（入力 4 ／ キャッシュ作成 2,732 ／ 出力〔推定〕 3,089）、キャッシュ読込 31,083、総処理 36,908、リクエスト 2 回
+
+```javascript
+/*!
+ * forwarded
+ * Copyright(c) 2014-2017 Douglas Christopher Wilson
+ * MIT Licensed
+ */
+
+'use strict'
+
+// 【修正】TOKEN_LIST_REGEXP（/ *, */）を削除した。
+// カンマを含まない長い空白の並びで O(n^2) のバックトラックが起きる（ReDoS）ため、
+// parse() では正規表現を使わずに 1 文字ずつ走査する。
+
+/**
+ * Module exports.
+ * @public
+ */
+
+module.exports = forwarded
+
+/**
+ * Get all addresses in the request, using the `X-Forwarded-For` header.
+ *
+ * @param {object} req
+ * @return {array}
+ * @public
+ */
+
+function forwarded (req) {
+  if (!req) {
+    throw new TypeError('argument req is required')
+  }
+
+  // simple header parsing
+  var proxyAddrs = parse(req.headers['x-forwarded-for'] || '')
+  var socketAddr = req.connection.remoteAddress
+  var addrs = [socketAddr].concat(proxyAddrs)
+
+  // return all addresses
+  return addrs
+}
+
+/**
+ * Parse the X-Forwarded-For header.
+ *
+ * @param {string} header
+ * @private
+ */
+
+function parse (header) {
+  if (!header) {
+    return []
+  }
+
+  // 【修正】split(/ *, */) をやめ、カンマ (0x2c) で区切りながら 1 回だけ走査する。
+  // 各トークンの前後の空白 (0x20) を取り除き、空のトークンは捨てる
+  // （元の .split(/ *, */).filter(Boolean) と同じ結果になる）。
+  // 各文字を定数回しか見ないので、入力長に対して線形時間で終わる。
+  var str = header.trim()
+  var list = []
+  var start = 0
+  var end = 0
+
+  for (var i = 0; i <= str.length; i++) {
+    if (i !== str.length && str.charCodeAt(i) !== 0x2c /* , */) {
+      continue
+    }
+
+    // 【修正】トークン [start, i) の前後の空白を除く
+    end = i
+    while (start < end && str.charCodeAt(start) === 0x20 /*   */) {
+      start++
+    }
+    while (end > start && str.charCodeAt(end - 1) === 0x20 /*   */) {
+      end--
+    }
+
+    // 【修正】空のトークンは追加しない（元の .filter(Boolean) に相当）
+    if (start < end) {
+      list.push(str.substring(start, end))
+    }
+
+    start = i + 1
+  }
+
+  // 【修正】元の .reverse() と同じく、近いプロキシのアドレスが先頭になるよう逆順にする
+  return list.reverse()
+}
+```
+
+---
