@@ -1,0 +1,26 @@
+### No.13 find-sec-bugs/juliet-test-suite CWE80_XSS__Servlet_PropertiesFile_01.java
+- 対象: https://github.com/find-sec-bugs/juliet-test-suite/blob/master/src/testcases/CWE80_XSS/s02/CWE80_XSS__Servlet_PropertiesFile_01.java（GitHub のコード（第1回で取得したときのコミットに固定））
+- 判定: **脆弱性あり**（クロスサイトスクリプティング XSS・CWE-80（CWE-79 の一種））
+- XSS に該当: 種別・source・sink は "第2回xssの詳細"、修正コードは "第2回修正版コード" を参照
+- 根拠（エージェントの判定記録から）:
+  - 根拠:
+  - 対象: src/testcases/CWE80_XSS/s02/CWE80_XSS__Servlet_PropertiesFile_01.java の bad() メソッド（コミット b2c6df3733e2176fe7097e4784895c6891632b4c）。
+  - 44〜45 行目で、相対パス "../common/config.properties"（サーブレットコンテナの作業ディレクトリ基準）を FileInputStream で開き Properties に読み込む。48 行目で properties.getProperty("data") の値をそのまま data に入れている。値の検証・無害化はどこにもない。
+  - 74 行目で response.getWriter().println("<br>bad(): data = " + data) とし、data を HTML エンコードせずに HTML 応答の本文に連結して出力している。
+  - このため、プロパティファイルの data に HTML タグや script 要素・イベントハンドラ属性などが入っていると、ブラウザはそれを文字列ではなく HTML/JavaScript として解釈する。このサーブレット（doGet/doPost → runTestSolo → runTest → bad）を開いた閲覧者全員のブラウザでスクリプトが動く。
+  - 同じコミットの src/testcases/common/config.properties の今の値は data=123456 で無害。しかし、ファイルはアプリの外部にあるデータで、相対パスなので作業ディレクトリ次第で別のファイルを読む。ファイルの内容が書き換えられた場合（設定ファイルの改ざん、配備ミス、別の機能や管理画面からの書き込みなど）の安全はコードで保証されていない。出力時のエンコードがないこと自体が欠陥なので「あり」と判定する。
+  - 参考: good()/goodG2B()（85〜98 行目）は固定文字列 "foo" を出力するだけなので問題なし。AbstractTestCaseServlet.runTest() が例外メッセージをエンコードせずに出力する点は、今回の data の流れとは関係がないので判定の対象外。
+- 使用トークン量（判定）: 新規 9,769（入力 8 ／ キャッシュ作成 6,493 ／ 出力〔推定〕 3,268）、キャッシュ読込 81,691、総処理 91,460、リクエスト 4 回（出力の記録値 3,573）
+
+---
+## No.13 find-sec-bugs/juliet-test-suite CWE80_XSS__Servlet_PropertiesFile_01.java
+- 対象: https://github.com/find-sec-bugs/juliet-test-suite/blob/master/src/testcases/CWE80_XSS/s02/CWE80_XSS__Servlet_PropertiesFile_01.java
+
+- **XSS 種別**: ストア型。攻撃者の入力がその場のリクエストで反射されるのではなく、サーバー側のファイル（.properties）に保存された値が、あとでページを開いたすべての閲覧者への応答に出力されるため。ただし、攻撃にはファイルを書き換える手段が要るという前提条件がある。
+- **source**: 48 行目 data = properties.getProperty("data");（44〜45 行目で ../common/config.properties を読み込んだ Properties から取得。サーバー上の外部ファイル＝保存されたデータ）
+- **伝播経路**: config.properties の data キー → 45 行目 properties.load(streamFileInput) → 48 行目 properties.getProperty("data") → ローカル変数 data → 71 行目 null チェックのみ（無害化なし）→ 74 行目 文字列連結 "<br>bad(): data = " + data → response.getWriter().println() で HTML 応答へ
+- **sink**: 74 行目 response.getWriter().println("<br>bad(): data = " + data);（HTML 本文への無エスケープ出力。ページは AbstractTestCaseServletBase.runTestSolo が "<html><body>" で開始する HTML）
+- **脆弱性の位置**: sink 側（74 行目で HTML エンコードせずに出力している点）が直接の原因。source 側（48 行目）も、外部ファイルの値を検証せずに信頼している点で寄与している。修正は sink 側の出力エンコードで行うのが妥当。
+- **攻撃例**: 攻撃者が何らかの手段（設定ファイルの改ざん、配備物のすり替え、作業ディレクトリの操作で別のファイルを読ませるなど）で config.properties の data キーに script 要素やイベントハンドラ付きの HTML を書き込む。その後、利用者がこのサーブレットのページを開くと bad() がその値をそのまま HTML に出力し、利用者のブラウザでスクリプトが実行される。Cookie などのセッション情報の窃取、画面の改ざん、利用者になりすました操作などが起こる。
+
+---
