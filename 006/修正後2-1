@@ -1,0 +1,132 @@
+## No.6 OWASP-Benchmark/BenchmarkJava BenchmarkTest00030.java
+- 対象: https://github.com/OWASP-Benchmark/BenchmarkJava/blob/master/src/main/java/org/owasp/benchmark/testcode/BenchmarkTest00030.java
+- XSS 種別: 反射型（source・sink は "第2回xssの詳細"）
+- 修正したファイル: BenchmarkTest00030.java
+
+### 修正コードの説明
+
+#### No.6 BenchmarkTest00030.java の XSS 修正の説明
+
+対象: OWASP-Benchmark/BenchmarkJava（コミット 8b67a88d73b2594570fc21150705283de884620b）
+`src/main/java/org/owasp/benchmark/testcode/BenchmarkTest00030.java`
+修正ファイル: `fix01_BenchmarkTest00030.java`（ライセンスヘッダ 17 行を省略しているため、行番号は元ファイルより 17 小さい）
+
+#### 1. 修正の方針
+
+- 防ぐ脆弱性: 反射型 XSS（CWE-79）
+  - source: 元 44〜48 行目 `request.getParameterMap()` → `map.get("BenchmarkTest00030")` → `param = values[0]`
+  - sink: 元 53 行目 `response.getWriter().printf(param, obj)`（42 行目で `text/html` と宣言したレスポンス本文）
+- 防ぐ場所: sink の直前（出力する時点）。
+- 方法: 出力する直前に、OWASP ESAPI の `ESAPI.encoder().encodeForHTML()` で `param` を HTML エンティティにエンコードし、エンコード済みの値を出力する。
+- この方法を選んだ理由:
+  - XSS の根本原因は「HTML 本文に、利用者の入力をエスケープせずに書き出していること」なので、出力先の文脈（HTML 本文）に合わせたエンコードを出力時に行うのが基本の対策である。
+  - ESAPI はこのプロジェクトの `pom.xml` に既に依存として入っており（`org.owasp.esapi:esapi:2.7.0.0`）、設定ファイル `src/main/resources/ESAPI.properties` もある。新しいライブラリを追加せずに、検証済みのエンコーダを使える。
+  - 自前でエスケープ関数を書くより漏れが起きにくい。
+  - 変更は sink の 1 か所だけで済み、元のコードの構造（パラメータの取り出し、ヘッダ設定、`printf` 呼び出し）はそのまま残せるため、修正が最小限になる。
+
+#### 2. 変更箇所ごとの説明
+
+##### 変更箇所: `BenchmarkTest00030.java` 元 53 行目 → 修正後 36〜41 行目
+
+修正前（元 53 行目）:
+
+```java
+        response.getWriter().printf(param, obj);
+```
+
+修正後（修正ファイル 36〜41 行目）:
+
+```java
+        // 【XSS 修正】利用者の入力 param を HTML レスポンスに出す前に、ESAPI（pom.xml の既存依存）で
+        // HTML エンティティにエンコードする。< > " ' & などが &lt; 等の文字参照に置き換わるため、
+        // 入力はタグや属性として解釈されず、ただの文字列として表示される。
+        String safeParam = org.owasp.esapi.ESAPI.encoder().encodeForHTML(param);
+        // 【XSS 修正】出力には生の param ではなく、エンコード済みの safeParam を使う。
+        response.getWriter().printf(safeParam, obj);
+```
+
+各行の説明:
+
+- 36〜38 行目（コメント）: 何をなぜ変えたかを日本語で示す。
+- 39 行目 `String safeParam = org.owasp.esapi.ESAPI.encoder().encodeForHTML(param);`
+  - `ESAPI.encoder()` で ESAPI の既定のエンコーダ（`DefaultEncoder`）を取得し、`encodeForHTML()` で `param` を HTML 本文用にエンコードする。
+  - `encodeForHTML()` は、英数字と一部の無害な文字（`,` `.` `-` `_` 空白）以外を文字参照に変換する。たとえば `<` → `&lt;`、`>` → `&gt;`、`"` → `&quot;`、`&` → `&amp;`、`'` → `&#x27;`、`/` → `&#x2f;` のようになる。
+  - これにより、入力に含まれる `<` や `>` がタグの開始・終了として解釈されなくなり、`<script>` 要素やイベントハンドラ属性を持つ要素をレスポンス HTML に注入できなくなる。
+  - `import` 文を追加せず、完全修飾名（`org.owasp.esapi.ESAPI`）で呼び出すことで、変更箇所をこの 1 か所にまとめている。
+- 40 行目（コメント）: 出力に使う変数を差し替えたことを示す。
+- 41 行目 `response.getWriter().printf(safeParam, obj);`
+  - 出力に使う値を、生の `param` からエンコード済みの `safeParam` に変える。呼び出しの形（`printf` と引数 `obj`）は元のまま残している。
+
+XSS が防げる理由:
+
+- sink（41 行目）に届く文字列には、HTML として意味を持つ特殊文字が文字参照の形でしか含まれない。ブラウザは文字参照を「その文字を表示する」と解釈するだけで、タグや属性、スクリプトとしては扱わない。
+- `printf` の書式処理で差し込まれるのは固定の `"a"` `"b"`（35 行目の `obj`）だけなので、書式処理によって HTML の特殊文字が新たに生まれることもない。
+
+#### 3. 修正の結果
+
+- 攻撃例の入力の扱い:
+  - 攻撃者がパラメータ `BenchmarkTest00030` にスクリプトタグやイベントハンドラ属性付きの `img` タグなどを入れて被害者にアクセスさせても、レスポンスでは `<` `>` `"` などが `&lt;` `&gt;` `&quot;` に置き換わって出力される。
+  - ブラウザ上では、入力した文字列がそのまま「文字」として表示されるだけで、スクリプトは実行されない。`X-XSS-Protection: 0` や `'unsafe-inline'` を許す CSP があっても、HTML としての注入そのものが起きないため影響しない。
+- 正常な入力での動作への影響:
+  - 変わらない点: 英数字・空白・`,` `.` `-` `_` だけの入力や日本語などの通常の文字は、画面上の見た目は元と同じに表示される（日本語などは文字参照に変換される場合があるが、ブラウザでの表示は同じ）。Content-Type、ヘッダ、URL、パラメータ名も元のまま。
+  - 変わる点（1）: `<` `&` `"` などを含む入力は、HTML として解釈されず、入力した文字どおりに表示されるようになる（これは意図した変化）。レスポンスの生のバイト列は文字参照を含むため、元より長くなる。
+  - 変わる点（2）: `encodeForHTML()` は `%` も文字参照（`&#x25;`）に変換するため、エンコード後の文字列には `%` が残らない。そのため、元のコードで起きていた「入力中の `%s` が `a` に置き換わる」などの書式指定子の解釈は行われなくなり、入力した `%s` はそのまま `%s` と表示される。
+
+#### 4. 注意点
+
+- 書式文字列の外部制御（CWE-134）について: XSS 以外の脆弱性なので、これ専用の修正はしていない。上記のとおり `encodeForHTML()` が `%` を変換する結果として、現状では書式指定子による例外（`%d` などによる `IllegalFormatException` → 500 エラー）は起きなくなる。ただし、これはエンコーダの仕様に依存した副次的な効果である。根本的には、利用者の入力を書式文字列に使わないこと（例: `response.getWriter().print(safeParam)` または `printf("%s", safeParam)` にする）が望ましい。
+- このエンコードは「HTML 本文（要素の中身）」に出力する場合の対策である。将来この値を JavaScript の中、URL、CSS、HTML 属性値などに出力するよう変更する場合は、それぞれの文脈に合ったエンコード（`encodeForJavaScript`、`encodeForURL`、`encodeForHTMLAttribute` など）が必要になる。
+- 二重エンコードに注意: 呼び出し元や別の層ですでにエンコード済みの値を渡すと、`&amp;lt;` のように二重に変換されて表示が崩れる。
+- `X-XSS-Protection: 0` の設定（元 51 行目）や、`'unsafe-inline'` `'unsafe-eval'` を許す CSP（`HTTPResponseHeaderFilter`）はそのまま残している。今回の修正で XSS 自体は防げるが、多層防御の観点では CSP を強めることも検討するとよい。
+- ESAPI は `ESAPI.properties` の設定に依存する。プロジェクトに設定ファイルがあることは確認したが、実行環境で読み込めない場合は `ESAPI.encoder()` の初期化に失敗する。
+- 入力値の検証（長さや文字種の制限）は追加していない。出力時のエンコードだけで XSS は防げるが、必要に応じて入力検証も併用するとよい。
+
+### 修正したコード: BenchmarkTest00030.java
+
+```java
+package org.owasp.benchmark.testcode;
+
+import java.io.IOException;
+import javax.servlet.ServletException;
+import javax.servlet.annotation.WebServlet;
+import javax.servlet.http.HttpServlet;
+import javax.servlet.http.HttpServletRequest;
+import javax.servlet.http.HttpServletResponse;
+
+@WebServlet(value = "/xss-00/BenchmarkTest00030")
+public class BenchmarkTest00030 extends HttpServlet {
+
+    private static final long serialVersionUID = 1L;
+
+    @Override
+    public void doGet(HttpServletRequest request, HttpServletResponse response)
+            throws ServletException, IOException {
+        doPost(request, response);
+    }
+
+    @Override
+    public void doPost(HttpServletRequest request, HttpServletResponse response)
+            throws ServletException, IOException {
+        // some code
+        response.setContentType("text/html;charset=UTF-8");
+
+        java.util.Map<String, String[]> map = request.getParameterMap();
+        String param = "";
+        if (!map.isEmpty()) {
+            String[] values = map.get("BenchmarkTest00030");
+            if (values != null) param = values[0];
+        }
+
+        response.setHeader("X-XSS-Protection", "0");
+        Object[] obj = {"a", "b"};
+        // 【XSS 修正】利用者の入力 param を HTML レスポンスに出す前に、ESAPI（pom.xml の既存依存）で
+        // HTML エンティティにエンコードする。< > " ' & などが &lt; 等の文字参照に置き換わるため、
+        // 入力はタグや属性として解釈されず、ただの文字列として表示される。
+        String safeParam = org.owasp.esapi.ESAPI.encoder().encodeForHTML(param);
+        // 【XSS 修正】出力には生の param ではなく、エンコード済みの safeParam を使う。
+        response.getWriter().printf(safeParam, obj);
+    }
+}
+```
+
+---
