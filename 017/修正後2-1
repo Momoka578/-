@@ -1,0 +1,376 @@
+## No.17 google/firing-range ToxicDom.java
+- 対象: https://github.com/google/firing-range/blob/master/src/tests/dom/ToxicDom.java
+- XSS 種別: DOM-base（source・sink は "第2回xssの詳細"）
+- 修正したファイル: ToxicDom.java
+
+### 修正コードの説明
+
+#### No.17 google/firing-range ToxicDom.java の修正説明（DOM-based XSS）
+
+対象コミット: `4f991a6418b07a66cd63006f4a2bec27c84b72f4`
+修正ファイル: `fix01_ToxicDom.java`（元ファイル `src/tests/dom/ToxicDom.java`）
+
+#### 1. 修正の方針
+
+##### 防ぐ脆弱性（source → sink）
+
+- source: 攻撃者が値を決められるブラウザ側の値。`window.name`（`sources/window/name.tmpl` 5・8行）、`document.referrer`（`sources/document/referrer.tmpl` 5・8行）、`document.cookie`（`sources/document/cookie.tmpl` 5・13行）、`localStorage`／`sessionStorage`（`sources/localStorage/property.tmpl` 4・7行 など）、`postMessage` のデータ（`sources/postMessage/eval.tmpl` 2行 など）。
+- sink: `eval(payload)`（`sinks/eval.tmpl` 2・6行）、`document.write(payload)`（`sinks/documentWrite.tmpl` 2・6行）、`div.innerHTML = payload`（`sinks/innerHtml.tmpl` 5・9行）、`eval(msg.data)`（`sources/postMessage/eval.tmpl` 3行、`improperOriginValidationWithRegExp.tmpl` 4行）、`div.innerHTML = content.html`（`sources/postMessage/innerHtml.tmpl` 4行）。
+- これらを組み合わせて `<script>` に入れ、防御なし（`X-XSS-Protection: 0`）で配信しているのが `ToxicDom.java` の `doGet`（元の 52・56・63行）。
+
+##### どこで、どう防ぐか
+
+`ToxicDom.java` の中で、すべての応答に **nonce 方式の Content-Security-Policy（CSP）ヘッダ**を付け、サーバーが自分で出力した外側テンプレートの `<script>` タグにだけ、その nonce を付ける。
+
+```
+Content-Security-Policy: script-src 'nonce-<応答ごとの乱数>'; object-src 'none'; base-uri 'none'; require-trusted-types-for 'script'
+```
+
+これにより、ブラウザは次のものを実行しなくなる。
+
+- `eval`／`new Function`／文字列を渡した `setTimeout`（`'unsafe-eval'` がないため）
+- `onerror=` などのインラインのイベントハンドラ、`javascript:` URL（`'unsafe-inline'` がないため）
+- `document.write`／`innerHTML` で後から差し込まれた `<script>`（正しい nonce を持たないため）
+- `<object>`／`<embed>` の差し込み（`object-src 'none'`）、`<base>` の差し込みによる読み込み先の変更（`base-uri 'none'`）
+
+さらに Trusted Types に対応したブラウザ（Chromium 系）では、`require-trusted-types-for 'script'` によって `innerHTML`／`document.write` に文字列を渡すこと自体が拒否される（HTML の差し込みも止める追加の防御）。
+
+##### この方法を選んだ理由
+
+- このサーブレットは「どの source とどの sink を組み合わせるか」を URL で選ぶ作りで、source／sink のテンプレートは十数個ある。さらに 1 区切りのパス（`/dom/toxicdom/postMessage/eval` など）では、source と sink が 1 つのテンプレートの中に入っている。テンプレートを 1 つずつ書き直すと修正が多数のファイルに広がり、直し漏れも起きやすい。
+- 攻撃者の値はブラウザの中（`window.name` や `postMessage`）から来るため、サーバー側の Java ではその値を見てエスケープすることができない。サーバーにできる確実な対策は、「どのスクリプトの実行を許すか」をブラウザに指示すること（CSP）である。
+- nonce 方式なら、すべての組み合わせ（2 区切り・1 区切り・3 区切りの外部スクリプト）を `ToxicDom.java` の 1 か所でまとめて守れる。テンプレートファイルや `Responses`／`Templates` などの共通クラスは変更しないので、修正が最小限で済む。
+- `'strict-dynamic'` は付けていない。付けると、許可されたスクリプトが `createElement('script')` で作ったスクリプトも信頼されてしまい、sink の書き方によっては攻撃に使われるため。
+
+#### 2. 変更箇所ごとの説明
+
+行番号は、修正前は元の `ToxicDom.java`、修正後は `fix01_ToxicDom.java` のもの。
+
+##### (1) import の追加（修正後 9行・14行）
+
+修正前（17・22行付近）:
+
+```java
+import com.google.common.base.CharMatcher;
+...
+import java.io.IOException;
+import java.util.regex.Pattern;
+```
+
+修正後:
+
+```java
+import com.google.common.base.CharMatcher;
+import com.google.common.io.BaseEncoding; // 修正: nonce を Base64 文字列にするため（Guava 18 に含まれる）
+...
+import java.io.IOException;
+import java.security.SecureRandom; // 修正: 推測されない nonce を作るため
+import java.util.regex.Pattern;
+```
+
+- `BaseEncoding`: 乱数のバイト列を Base64 文字列にする。プロジェクトは `build.xml` で Guava 18 を使っているので、新しいライブラリは不要。Java 8 の `java.util.Base64` を使わないのは、古い Java でもそのままコンパイルできるようにするため。
+- `SecureRandom`: 攻撃者に推測されない乱数を作る。
+
+##### (2) 乱数生成器の追加（修正後 40-41行）
+
+```java
+// 修正: CSP の nonce を作るための、暗号論的に安全な乱数生成器
+private static final SecureRandom NONCE_RANDOM = new SecureRandom();
+```
+
+- nonce は推測されると意味がないので、`java.util.Random` ではなく `SecureRandom` を使う。`SecureRandom` はスレッドセーフなので、サーブレットで 1 つを共有してよい。
+
+##### (3) doGet で CSP ヘッダを付ける（修正後 47-52行）
+
+修正前（49-51行）:
+
+```java
+String pathInfo = request.getPathInfo().substring(1);
+
+if (CharMatcher.is('/').countIn(pathInfo) == 1) {
+```
+
+修正後:
+
+```java
+String pathInfo = request.getPathInfo().substring(1);
+
+// 修正: 応答ごとに新しい nonce を作り、Content-Security-Policy ヘッダを付ける。
+// （コメント略）
+String nonce = generateNonce();
+response.setHeader("Content-Security-Policy", contentSecurityPolicy(nonce));
+
+if (CharMatcher.is('/').countIn(pathInfo) == 1) {
+```
+
+- 51行: リクエストごとに新しい nonce を作る。毎回変わるので、攻撃者が前もって知ることはできない。
+- 52行: 分岐の前でヘッダを付けるので、1 区切り・2 区切り・3 区切りのどの応答にも必ず CSP が付く。`Responses.sendXssed` は `X-XSS-Protection` や `Content-Type` などの別の名前のヘッダしか設定しないので、ここで付けた CSP は上書きされない（エラー応答は `text/plain` なので CSP が付いても影響はない）。
+
+##### (4) 各 generate メソッドへの nonce の受け渡し（修正後 56行・60-61行・68-69行）
+
+修正前（53行・57行・64行）:
+
+```java
+pathInfo.split("/")[0], pathInfo.split("/")[1]));
+pathInfo.split("/")[0], pathInfo.split("/")[1], pathInfo.split("/")[2]));
+pathInfo.split("/")[1], pathInfo.split("/")[2], pathInfo.split("/")[3]));
+```
+
+修正後:
+
+```java
+pathInfo.split("/")[0], pathInfo.split("/")[1], nonce)); // 修正: nonce を渡す
+pathInfo.split("/")[0], pathInfo.split("/")[1], pathInfo.split("/")[2],
+    nonce)); // 修正: nonce を渡す
+pathInfo.split("/")[1], pathInfo.split("/")[2], pathInfo.split("/")[3],
+    nonce)); // 修正: nonce を渡す
+```
+
+- ヘッダに書いた nonce と同じ値を `<script>` タグに付けるため、各メソッドに渡す。パスの分け方や例外処理は元のまま。
+
+##### (5) generateAccesslessTemplate／generateTemplate（修正後 80-89行・91-102行）
+
+修正前（79行・90行）:
+
+```java
+String toxicTemplate = Templates.getTemplate(TOXIC_TEMPLATE, ToxicDom.class);
+return Templates.replacePayload(toxicTemplate, payload);   // generateTemplate では sourceTemplate + sinkTemplate
+```
+
+修正後（87行・100行）:
+
+```java
+String toxicTemplate = addNonce(Templates.getTemplate(TOXIC_TEMPLATE, ToxicDom.class), nonce);
+return Templates.replacePayload(toxicTemplate, payload);   // generateTemplate では sourceTemplate + sinkTemplate
+```
+
+- 引数に `String nonce` を追加（81行・92行）。
+- `toxicdom.tmpl` の `<script>` を `<script nonce="…">` にしてから、`%%PAYLOAD%%` に source／sink テンプレートを入れる。順番が大切で、**ペイロードを入れる前**に nonce を付けるので、ペイロード側の文字列に `<script` が含まれていても（例: `sinks/js_html_sanitize_eval.tmpl` には `<script>` がある）そこには nonce が付かない。
+- これで、サーバーが用意した外側の `<script>` だけが実行を許され、その中で `eval(payload)` が呼ばれても CSP によって `EvalError` で止まり、`document.write`／`innerHTML` で差し込まれた `<script>` やイベントハンドラも実行されない。
+
+##### (6) generateExternalTemplate（修正後 104-120行）
+
+修正前（103行）:
+
+```java
+String toxicTemplate = Templates.getTemplate(TOXIC_EXTERNAL_TEMPLATE, ToxicDom.class);
+```
+
+修正後（116-117行）:
+
+```java
+String toxicTemplate = addNonce(
+    Templates.getTemplate(TOXIC_EXTERNAL_TEMPLATE, ToxicDom.class), nonce);
+```
+
+- 引数に `String nonce` を追加（105-106行）。
+- `toxicdomexternal.tmpl` の `<script type="text/javascript" src="/dom/toxicdomscripts/...">` に nonce を付けるので、同一オリジンの外部スクリプトは読み込まれる。ただし、そのスクリプト（`ToxicDomScripts` が返す source＋sink の JS）の中の `eval` などは、このページの CSP で拒否される。
+- 入力を `\w+` に制限する元の確認（108-112行）はそのまま。
+
+##### (7) 追加したヘルパーメソッド（修正後 122-147行）
+
+```java
+private static String generateNonce() {               // 123-127行
+  byte[] bytes = new byte[16];
+  NONCE_RANDOM.nextBytes(bytes);
+  return BaseEncoding.base64().encode(bytes);
+}
+
+private static String contentSecurityPolicy(String nonce) {   // 137-140行
+  return "script-src 'nonce-" + nonce + "'; object-src 'none'; base-uri 'none'; "
+      + "require-trusted-types-for 'script'";
+}
+
+private static String addNonce(String template, String nonce) {   // 145-147行
+  return template.replace("<script", "<script nonce=\"" + nonce + "\"");
+}
+```
+
+- `generateNonce`（123-127行）: 16 バイト（128 ビット）の乱数を作り、Base64 文字列にする。Base64 の文字（英数字・`+`・`/`・`=`）は CSP の nonce の書式に合い、`"` を含まないので属性値を壊さない。
+- `contentSecurityPolicy`（137-140行）: CSP の値を組み立てる。各ディレクティブの意味は 1 章のとおり。`'unsafe-eval'`／`'unsafe-inline'` を入れないことが、この修正の要点。
+- `addNonce`（145-147行）: 外側テンプレートの `<script` を `<script nonce="…"` に置き換える。外側テンプレート（`toxicdom.tmpl`／`toxicdomexternal.tmpl`）にだけ使う。
+
+##### XSS が防げる理由
+
+DOM-based XSS では、攻撃者の値がブラウザの中で JS として実行される（`eval`）か、HTML として解釈されてスクリプトが動く（`document.write`／`innerHTML` で `<script>` やイベントハンドラが入る）ことで被害が起きる。nonce 方式の CSP は、ブラウザに「この応答で実行してよいのは、ヘッダと同じ nonce を持つ `<script>` だけで、文字列からのコード実行やインラインのハンドラは禁止」と指示する。攻撃者の値は応答ごとに変わる nonce を知ることができないので、どの sink に届いても、スクリプトとして実行されなくなる。
+
+#### 3. 修正の結果
+
+##### 攻撃例の入力が修正後にどう扱われるか
+
+- `/dom/toxicdom/window/name/eval`: 攻撃者が `window.name` に JS を入れてから被害者をこの URL に遷移させても、`eval(window.name)` は CSP 違反として `EvalError` になり、攻撃者の JS は実行されない。非同期の `trigger(window.name)` も同じ。
+- `/dom/toxicdom/window/name/documentWrite`、`.../innerHtml`: `window.name` に `<script>…</script>` や `<img src=x onerror=…>` を入れても、差し込まれた `<script>` は nonce がないので実行されず、`onerror` などのインラインのハンドラも実行されない。Trusted Types に対応したブラウザでは、`document.write`／`innerHTML` に文字列を渡した時点で `TypeError` になり、HTML 自体が差し込まれない。
+- `/dom/toxicdom/postMessage/eval`、`.../improperOriginValidationWithRegExp`: 罠ページから `postMessage` で JS 文字列を送っても、`eval(msg.data)` は CSP で拒否される。
+- `/dom/toxicdom/postMessage/innerHtml`: JSON の `html` に `<img onerror=…>` を入れても、ハンドラは実行されない。
+- 3 区切りのパス（`/dom/toxicdom/x/window/name/eval` など）: 外部スクリプトは読み込まれるが、その中の `eval` は同じく拒否される。
+
+##### 正常な入力での動作への影響
+
+- 変わらない点: URL とテンプレートの対応、応答の HTML（`<script>` に `nonce` 属性が増えるだけ）、ステータスコード、エラー応答、入力チェック（`\w+`）は元のまま。外側の `<script>` の中のふつうの JS（値を読む処理、`setTimeout(function…)` など）はそのまま動く。
+- 変わる点: `eval`／`document.write`／`innerHTML` を使う処理は、CSP によって止まる（Trusted Types 対応ブラウザでは `document.write("PostMessage arrived!")` のような固定の文字列の書き込みも止まる）。Firing Range は「XSS スキャナが脆弱性を見つけられるか」を試すための意図的に脆弱なテストベッドなので、この修正を入れるとテストベッドとしての目的（XSS が成立すること）は果たせなくなる。この修正は「このコードを安全な状態にするなら」という前提のものである。
+
+#### 4. 注意点
+
+- 修正は「ブラウザに実行を止めさせる」方式で、sink のテンプレート（`eval`／`document.write`／`innerHTML`）そのものは書き換えていない。CSP Level 2（nonce）に対応しない非常に古いブラウザでは防げない（CSP Level 1 のみ対応のブラウザでは、`'unsafe-inline'` がないためインラインのスクリプトがすべて止まり、安全側に倒れる）。根本からなくすには、sink を `textContent`／`createTextNode` に置き換える、`eval` をやめて `JSON.parse` にする、`postMessage` で `msg.origin` を完全一致で確認する、といったテンプレート側の修正も必要。
+- Trusted Types（`require-trusted-types-for`）は Chromium 系だけが対応している。他のブラウザでは、`document.write`／`innerHTML` によるスクリプトのない HTML の差し込み（偽のログインフォームやリンクの表示など、HTML インジェクション）は残る。ただし、スクリプトの実行（XSS）は nonce と `'unsafe-eval'`・`'unsafe-inline'` なしの CSP で止まる。
+- `/dom/toxicdomscripts/*`（`ToxicDomScripts.java`）は修正していない。この応答は `text/javascript` なので、直接開いても HTML としては表示されず、それだけでは XSS にならない。ただし、別のページ（CSP のないページ）がこのスクリプトを読み込むと、同じ DOM-based XSS が起きる。同じ source／sink テンプレートを使う他のサーブレットも同様。
+- XSS 以外の問題（修正していない）:
+  - `generateAccesslessTemplate` の呼び出し（修正後 55-56行、元の 52-53行）は `try`／`catch` の外にあり、存在しないテンプレート名を指定すると `IOException` がそのまま投げられて 500 エラーになる。
+  - `/dom/toxicdom`（末尾の `/` なし）にアクセスすると `getPathInfo()` が `null` になり、45行（元の 49行）で `NullPointerException` になる。
+  - `Templates.getTemplate` が「`..`」を含むパスで投げる `IllegalArgumentException` はメッセージが `null` で、`Responses.sendError` の `Escaper.escapeHtml(null)` で `NullPointerException` になる（2・3 区切りのパス）。
+  - いずれも堅牢性の問題で、XSS ではない。パストラバーサルは「`..`」の拒否と先頭の固定文字列（`sources/`／`sinks/`）で防がれている。
+
+### 修正したコード: ToxicDom.java
+
+```java
+/*
+ * Copyright 2014 Google Inc. All rights reserved.
+ * （Apache License 2.0 のライセンスヘッダは省略）
+ */
+
+package com.google.testing.security.firingrange.tests.dom;
+
+import com.google.common.base.CharMatcher;
+import com.google.common.io.BaseEncoding; // 修正: nonce を Base64 文字列にするため（Guava 18 に含まれる）
+import com.google.testing.security.firingrange.utils.Responses;
+import com.google.testing.security.firingrange.utils.Templates;
+
+import java.io.IOException;
+import java.security.SecureRandom; // 修正: 推測されない nonce を作るため
+import java.util.regex.Pattern;
+
+import javax.servlet.http.HttpServlet;
+import javax.servlet.http.HttpServletRequest;
+import javax.servlet.http.HttpServletResponse;
+
+/**
+ * A servlet to provide toxic DOM based XSSes. It is mapped to the whole /dom/toxicdom/
+ * directory and maps paths as follows:
+ * <ul>
+ *     <li> Source object
+ *     <li> Source property
+ *     <li> Sink
+ * </ul>
+ *
+ * Thus, {@code /dom/toxicdom/document/cookie/eval} will map to the document.cookie source,
+ * and the eval sink.
+ */
+public class ToxicDom extends HttpServlet {
+
+  private static final String TOXIC_TEMPLATE = "toxicdom.tmpl";
+  private static final String TOXIC_EXTERNAL_TEMPLATE = "toxicdomexternal.tmpl";
+
+  private static final Pattern WORD_CHARS_ONLY = Pattern.compile("^\\w+$");
+
+  // 修正: CSP の nonce を作るための、暗号論的に安全な乱数生成器
+  private static final SecureRandom NONCE_RANDOM = new SecureRandom();
+
+  @Override
+  public void doGet(HttpServletRequest request, HttpServletResponse response) throws IOException {
+    String pathInfo = request.getPathInfo().substring(1);
+
+    // 修正: 応答ごとに新しい nonce を作り、Content-Security-Policy ヘッダを付ける。
+    // サーバーが nonce を付けた <script> だけが実行でき、eval（文字列からのコード実行）、
+    // インラインのイベントハンドラ、javascript: URL、document.write や innerHTML で
+    // 後から差し込まれた <script> は、ブラウザが実行しなくなる。
+    String nonce = generateNonce();
+    response.setHeader("Content-Security-Policy", contentSecurityPolicy(nonce));
+
+    if (CharMatcher.is('/').countIn(pathInfo) == 1) {
+      Responses.sendXssed(response, generateAccesslessTemplate(
+          pathInfo.split("/")[0], pathInfo.split("/")[1], nonce)); // 修正: nonce を渡す
+    } else if (CharMatcher.is('/').countIn(pathInfo) == 2) {
+      try {
+        Responses.sendXssed(response, generateTemplate(
+            pathInfo.split("/")[0], pathInfo.split("/")[1], pathInfo.split("/")[2],
+            nonce)); // 修正: nonce を渡す
+      } catch (IllegalArgumentException | IOException | ArrayIndexOutOfBoundsException e) {
+        Responses.sendError(response, e.getMessage(), 400);
+      }
+    } else if (CharMatcher.is('/').countIn(pathInfo) == 3) {
+      try {
+        Responses.sendXssed(response, generateExternalTemplate(
+            pathInfo.split("/")[1], pathInfo.split("/")[2], pathInfo.split("/")[3],
+            nonce)); // 修正: nonce を渡す
+      } catch (IllegalArgumentException | IOException | ArrayIndexOutOfBoundsException e) {
+        Responses.sendError(response, e.getMessage(), 400);
+      }
+    } else {
+      String errorMsg = String.format("Missing sink, not enough sinks or too many sinks :(."
+          + "Got %d, expected 2 or 3", CharMatcher.is('/').countIn(pathInfo));
+      Responses.sendError(response, errorMsg, 400);
+    }
+  }
+
+  // 修正: 引数に nonce を追加
+  private String generateAccesslessTemplate(String source, String sink, String nonce)
+      throws IOException {
+    String sourcePath = "sources/" + source + "/" + sink + ".tmpl";
+    String payload = Templates.getTemplate(sourcePath, ToxicDom.class);
+
+    // 修正: ペイロードを埋め込む「前」に、外側テンプレートの <script> にだけ nonce を付ける
+    String toxicTemplate = addNonce(Templates.getTemplate(TOXIC_TEMPLATE, ToxicDom.class), nonce);
+    return Templates.replacePayload(toxicTemplate, payload);
+  }
+
+  // 修正: 引数に nonce を追加
+  private String generateTemplate(String source, String accessType, String sink, String nonce)
+      throws IOException {
+    String sourcePath = "sources/" + source + "/" + accessType + ".tmpl";
+    String sourceTemplate = Templates.getTemplate(sourcePath, ToxicDom.class);
+    String sinkPath = "sinks/" + sink + ".tmpl";
+    String sinkTemplate = Templates.getTemplate(sinkPath, ToxicDom.class);
+
+    // 修正: ペイロードを埋め込む「前」に、外側テンプレートの <script> にだけ nonce を付ける
+    String toxicTemplate = addNonce(Templates.getTemplate(TOXIC_TEMPLATE, ToxicDom.class), nonce);
+    return Templates.replacePayload(toxicTemplate, sourceTemplate + sinkTemplate);
+  }
+
+  // 修正: 引数に nonce を追加
+  private String generateExternalTemplate(String source, String accessType, String sink,
+      String nonce) throws IOException {
+
+    if (!WORD_CHARS_ONLY.matcher(source).matches()
+        || !WORD_CHARS_ONLY.matcher(accessType).matches()
+        || !WORD_CHARS_ONLY.matcher(sink).matches()) {
+      return "Invalid Input. Only word characters ([a-zA-Z0-9_]) are allowed.";
+    }
+
+    // 修正: 外側テンプレートの <script src=...> に nonce を付け、同一オリジンの外部スクリプトの
+    // 読み込みだけを許可する（読み込まれたスクリプト内の eval などは、このページの CSP で拒否される）
+    String toxicTemplate = addNonce(
+        Templates.getTemplate(TOXIC_EXTERNAL_TEMPLATE, ToxicDom.class), nonce);
+    return Templates.replacePayload(
+        toxicTemplate, "/dom/toxicdomscripts/" + source + "/" + accessType + "/" + sink);
+  }
+
+  // 修正: 16 バイト（128 ビット）の乱数を Base64 にした nonce を返す（応答ごとに使い捨て）
+  private static String generateNonce() {
+    byte[] bytes = new byte[16];
+    NONCE_RANDOM.nextBytes(bytes);
+    return BaseEncoding.base64().encode(bytes);
+  }
+
+  // 修正: CSP の内容を組み立てる。
+  //   script-src 'nonce-...' : nonce 付きの script だけを許可する。'unsafe-eval' と 'unsafe-inline' を
+  //                            付けないので、eval・new Function・文字列の setTimeout、インラインの
+  //                            イベントハンドラ（onerror= など）、javascript: URL はすべて拒否される。
+  //   object-src 'none'      : <object>／<embed> を差し込んでのスクリプト実行を禁止する。
+  //   base-uri 'none'        : <base> を差し込んで相対 URL の読み込み先を変えることを禁止する。
+  //   require-trusted-types-for 'script' : 対応ブラウザでは innerHTML・document.write に
+  //                            文字列を渡すこと自体を拒否する（HTML の差し込みも止める追加の防御）。
+  private static String contentSecurityPolicy(String nonce) {
+    return "script-src 'nonce-" + nonce + "'; object-src 'none'; base-uri 'none'; "
+        + "require-trusted-types-for 'script'";
+  }
+
+  // 修正: 外側テンプレート（toxicdom.tmpl／toxicdomexternal.tmpl）の <script タグに nonce 属性を付ける。
+  // source／sink テンプレートを埋め込む前の外側テンプレートだけに使うので、ペイロード側や、
+  // 実行中に document.write／innerHTML で差し込まれた <script> には nonce が付かず、CSP で止まる。
+  private static String addNonce(String template, String nonce) {
+    return template.replace("<script", "<script nonce=\"" + nonce + "\"");
+  }
+}
+```
+
+---
