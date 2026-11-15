@@ -1,0 +1,108 @@
+## No.10 OWASP-Benchmark/BenchmarkPython testcode/BenchmarkTest00097.py
+- 対象: https://github.com/OWASP-Benchmark/BenchmarkPython/blob/main/testcode/BenchmarkTest00097.py
+- XSS 種別: 反射型（source・sink は "第2回xssの詳細"）
+- 修正したファイル: BenchmarkTest00097.py
+
+### 修正コードの説明
+
+#### No.10 BenchmarkTest00097.py の XSS 修正の説明
+
+##### 1. 修正の方針
+
+- 対象の脆弱性: 反射型 XSS（CWE-79）
+  - source: 31 行目 `param = request.form.get("BenchmarkTest00097")`（POST のフォームパラメータ。GET のルートも同じ関数を呼ぶ）
+  - 伝播: 37 行目 `bar = param.split(' ')[0]`（空白より前の部分を取り出すだけで、エスケープはしない）
+  - sink: 42 行目の f 文字列で `bar` を `RESPONSE` に埋め込み、45 行目 `return RESPONSE` で `text/html` の応答として返す
+- 防ぐ場所: sink 側。42 行目で `bar` を応答の文字列に埋め込む直前。
+- 防ぐ方法: 同じリポジトリの `helpers/utils.py` にある `escape_for_html()`（ESAPI の HTML エスケープを移植したもの）で `bar` を HTML エスケープしてから埋め込む。
+- この方法を選んだ理由:
+  - 出力先は HTML の本文なので、出力の直前に HTML 用のエスケープをするのが XSS 対策の基本である。入力側で特定の文字を消す方法（ブラックリスト）より漏れが少ない。
+  - `escape_for_html` は元のコードの 19 行目ですでに import されている（使われていなかっただけ）。新しい import やライブラリを足さずに 1 か所の変更で直せ、修正が最小限になる。
+  - `escape_for_html` は英数字と `, . - _ 空白` 以外の文字をすべて文字参照に変える。`<` `>` `"` `'` `&` も変換されるので、HTML の本文でも属性値でも安全である。
+
+##### 2. 変更箇所ごとの説明
+
+変更したファイルは `fix01_BenchmarkTest00097.py` の 1 か所だけである（元のファイル `testcode/BenchmarkTest00097.py` の 42 行目。修正ファイルではライセンスヘッダを省いたため 25〜27 行目）。
+
+修正前（元のファイル 41〜43 行目）:
+
+```python
+		RESPONSE += (
+			f'bar is \'{bar}\' and otherarg is \'{otherarg}\''
+		)
+```
+
+修正後（修正ファイル 24〜28 行目）:
+
+```python
+		RESPONSE += (
+			# 修正: ユーザー入力由来の bar を、HTML に埋め込む直前に escape_for_html で HTML エスケープする
+			# （< > " ' & などが文字参照になり、タグや属性として解釈されなくなる）
+			f'bar is \'{escape_for_html(bar)}\' and otherarg is \'{otherarg}\''
+		)
+```
+
+各行の説明:
+
+- 25〜26 行目（追加）: 修正の内容を書いた日本語コメント。動作には影響しない。
+- 27 行目（変更）: f 文字列の `{bar}` を `{escape_for_html(bar)}` に変えた。
+  - `escape_for_html` は文字を 1 文字ずつ調べ、英数字と `, . - _ 空白` はそのまま残す。
+  - `< > " &` は `&lt; &gt; &quot; &amp;` に、それ以外の記号（`' / = ( )` など）は `&#x27;` のような 16 進の文字参照に変える。
+  - 制御文字は `&#xfffd;`（置換文字）に変える。
+  - これにより、`bar` に `<` があっても `&lt;` として出力される。ブラウザはタグの始まりと見なさず、画面に文字の「<」を表示するだけになる。どんなタグもイベントハンドラ属性も作れないので、スクリプトは実行されない。
+- `otherarg` は固定の文字列 `"static text"` でユーザー入力ではないので、エスケープしていない。
+- source（31 行目）、空白で区切る処理（37 行目）、ルートの定義、`return RESPONSE` はそのままにした。
+
+##### 3. 修正の結果
+
+- 攻撃例の入力の扱い:
+  - 攻撃者が、空白を含まないスクリプト実行用のタグ（画像タグの読み込みエラー時にスクリプトを実行するものなど）を `BenchmarkTest00097` に入れて POST させたとする。
+  - 修正前: 先頭の空白までの部分がそのまま HTML に入り、タグとして解釈されてスクリプトが実行された。
+  - 修正後: `<`、`>`、`/`、`=`、`(`、`)` などがすべて文字参照になって出力される。ブラウザには攻撃文字列がただの文字として表示されるだけで、スクリプトは実行されない。
+- 正常な入力への影響:
+  - 変わらない点: テストページのチェックボックスの値（`SafeText`、`Movies`、`Writing`、`Singing`）のような英数字だけの値は、変換されずに今までと同じ文字列で出力される。日本語などの英数字以外の文字（`isalnum()` が真になる文字）もそのまま出力される。空白で区切った先頭部分だけを使う動作、空の場合に `bar is '' ...` と表示される動作も変わらない。
+  - 変わる点: 記号を含む入力（例: `a/b`、`x=1`、`O'Reilly`）は、応答の HTML ソース上では文字参照（`&#x2f;` など）に変わる。ただしブラウザでの表示は元の文字と同じなので、利用者から見た表示は変わらない。
+
+##### 4. 注意点
+
+- このファイルには XSS 以外の脆弱性は見つからなかった。修正したのは XSS の 1 か所だけである。
+- 応答は HTML 文書の形になっていない断片の文字列で、`Content-Type` は Flask の既定値（`text/html; charset=utf-8`）のままである。今回の修正では変えていない。多層防御として、Content-Security-Policy ヘッダや `X-Content-Type-Options: nosniff` の付与は別に検討するとよい（`app.py` 全体の設定になるため、今回は対象外とした）。
+- `escape_for_html` は HTML の本文と属性値に対するエスケープである。将来この値を JavaScript の中や URL（`href` など）に出力するように変える場合は、その文脈に合ったエンコードや検証が別に必要になる。
+- フォームの送信元を確認する仕組み（CSRF トークンなど）はなく、外部サイトから自動で POST させることはできる。ただし出力がエスケープされるので、XSS としては成立しない。
+
+### 修正したコード: BenchmarkTest00097.py
+
+```python
+from flask import redirect, url_for, request, make_response, render_template
+from helpers.utils import escape_for_html
+
+def init(app):
+
+	@app.route('/benchmark/xss-00/BenchmarkTest00097', methods=['GET'])
+	def BenchmarkTest00097_get():
+		return BenchmarkTest00097_post()
+
+	@app.route('/benchmark/xss-00/BenchmarkTest00097', methods=['POST'])
+	def BenchmarkTest00097_post():
+		RESPONSE = ""
+
+		param = request.form.get("BenchmarkTest00097")
+		if not param:
+			param = ""
+
+		bar = ''
+		if param:
+			bar = param.split(' ')[0]
+
+
+		otherarg = "static text"
+		RESPONSE += (
+			# 修正: ユーザー入力由来の bar を、HTML に埋め込む直前に escape_for_html で HTML エスケープする
+			# （< > " ' & などが文字参照になり、タグや属性として解釈されなくなる）
+			f'bar is \'{escape_for_html(bar)}\' and otherarg is \'{otherarg}\''
+		)
+
+		return RESPONSE
+```
+
+---
