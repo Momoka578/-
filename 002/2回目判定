@@ -1,0 +1,23 @@
+### No.2 SARD 501353 news-edit.jsp（NewsEditServlet.java / NewsServiceImpl.java / home.jsp）
+- 対象: https://samate.nist.gov/SARD/test-cases/501353/versions/1.0.1（SARD のテストケース（v1.0.1、DSpace 6.2 の Java・JSP））
+- 判定: **脆弱性あり**（クロスサイトスクリプティング（ストア型）・CWE-79）
+- 根拠:
+  - dspace-jspui/src/main/webapp/dspace-admin/news-edit.jsp 68行目 `<textarea class="form-control" name="news" rows="10" cols="50"><%= news %></textarea>` で、ニュースファイルの中身（request 属性 "news"）を HTML エスケープせずに textarea 内へ出力している。
+  - textarea の中身は RCDATA なのでタグは解釈されないが、`</textarea>` が現れるとそこで textarea が閉じる。ニュース本文に `</textarea>` に続けて script 要素やイベントハンドラ付きの要素を入れると、ニュース編集画面を開いた管理者のブラウザでスクリプトが実行される。
+  - ニュース本文は NewsEditServlet.java 75行目で POST パラメータ "news" をそのまま受け取り、78行目 writeNewsFile() → NewsServiceImpl.java 107〜122行目で ${dspace.dir}/config/news-top.html 等に無加工で保存される。保存時にも読み出し時（NewsServiceImpl.java 69〜103行目）にも検証・無害化はない。
+  - 同じデータを表示する home.jsp 77行目・168行目は Utils.addEntities()（上流 Utils.java では com.coverity.security.Escape.html による HTML エスケープ）で無害化しており、このコードはニュース本文を「エスケープすべき信頼できない文字列」として扱っている。それにもかかわらず news-edit.jsp 68行目だけ未エスケープで、出力のしかたが一貫していない。
+  - 書き込み口 /dspace-admin/news-edit は web.xml の AdminOnlyFilter で管理者に限られる。ただし NewsEditServlet（doDSPost）にも上流の DSpaceServlet にも CSRF トークンの確認がない。このため、外部の攻撃者は、ログイン中の管理者に罠ページを開かせるだけで、悪意あるニュース本文を保存させられる（CSRF 経由の書き込み）。
+  - position パラメータ（news-edit.jsp 70行目に未エスケープで出力）は、readNewsFile()/writeNewsFile() の validate() によって許可リスト（news-top.html, news-side.html とロケール付きの名前）との完全一致に限られている。許可されない値では IllegalArgumentException になり JSP まで届かないため、XSS・パストラバーサルとも成立しない。
+- 使用トークン量（判定）: 新規 38,151（入力 16 ／ キャッシュ作成 24,034 ／ 出力〔推定〕 14,101）、キャッシュ読込 229,835、総処理 267,986、リクエスト 8 回（出力の記録値 13,530）
+
+## No.2 SARD 501353 news-edit.jsp（NewsEditServlet.java / NewsServiceImpl.java / home.jsp）
+- 対象: https://samate.nist.gov/SARD/test-cases/501353/versions/1.0.1
+
+- **XSS 種別**: ストア型（攻撃文字列がサーバー側のニュースファイルに保存され、後で別のリクエスト（submit_edit）でニュース編集画面を表示したときに出力されるため）
+- **source**: NewsEditServlet.java 75行目 `news = (String) request.getParameter("news");`（submit_save 時の POST パラメータ "news"）
+- **伝播経路**: NewsEditServlet.java 78行目 newsService.writeNewsFile(position, news) → NewsServiceImpl.java 119〜122行目 out.print(news) でファイル（config/news-top.html 等）へ保存 → （後の submit_edit リクエスト）NewsEditServlet.java 60行目 newsService.readNewsFile(position) → NewsServiceImpl.java 83〜103行目 ファイルを読んで行を連結して返す → NewsEditServlet.java 66行目 request.setAttribute("news", news) → news-edit.jsp 30行目 request.getAttribute("news") → 68行目
+- **sink**: news-edit.jsp 68行目 `<textarea ...><%= news %></textarea>`（エスケープなしの textarea 内への出力）
+- **脆弱性の位置**: sink 側。news-edit.jsp 68行目で出力エンコードをしていないこと。source 側（NewsEditServlet.java 75行目）でも検証していないが、ニュース本文には任意の文字が入ってよいため、入力で弾くのではなく出力時のエスケープで防ぐべき箇所である。
+- **攻撃例**: 攻撃者は、ログイン中の管理者に罠ページを開かせ、/dspace-admin/news-edit へ submit_save・position=news-top.html・news=「</textarea> の後にスクリプトを含む文字列」を自動送信させる（CSRF。悪意ある管理者や、ファイルに書き込める者が直接保存してもよい）。その後、管理者がニュース編集画面（submit_edit）を開くと、textarea が途中で閉じて、続くスクリプトが管理者の権限・セッションで実行される。その結果、管理者アカウントの操作（ユーザーの昇格・設定変更など）を乗っ取られる。
+  - 補足: home.jsp 206行目 communityService.getMetadata(com, "short_description") も未エスケープで出力している。ただし上流 DSpace 6.2 の community-list.jsp でも short_description を同じように生出力しており、HTML を許す既存の設計と考えられる。このテストケースの主題（ニュースのデータの流れ）とは別なので、今回の判定・修正の対象にはしない。
+
