@@ -1,0 +1,27 @@
+### No.6 OWASP-Benchmark/BenchmarkJava BenchmarkTest00030.java
+- 対象: https://github.com/OWASP-Benchmark/BenchmarkJava/blob/master/src/main/java/org/owasp/benchmark/testcode/BenchmarkTest00030.java（GitHub のコード（第1回で取得したときのコミットに固定））
+- 判定: **脆弱性あり**（クロスサイトスクリプティング（反射型）・CWE-79。付随して書式文字列の外部制御・CWE-134）
+- XSS に該当: 種別・source・sink は "第2回xssの詳細"、修正コードは "第2回修正版コード" を参照
+- 根拠（エージェントの判定記録から）:
+  - 根拠: src/main/java/org/owasp/benchmark/testcode/BenchmarkTest00030.java（コミット 8b67a88d）
+  - 42行目で Content-Type を text/html;charset=UTF-8 に設定している。
+  - 44〜49行目で request.getParameterMap() からパラメータ "BenchmarkTest00030" の最初の値を取り出し、そのまま変数 param に入れている。検証・エスケープは一切ない。
+  - 51行目で X-XSS-Protection: 0 を設定し、ブラウザ側の XSS フィルタを明示的に無効化している。
+  - 53行目で response.getWriter().printf(param, obj) としており、利用者の入力 param を「書式文字列」としてそのまま HTML レスポンス本文に出力している。< > " ' & はエスケープされないため、HTML タグやスクリプトを含む値を送ると、レスポンス HTML にそのまま埋め込まれ、被害者のブラウザで実行される。
+  - 書式指定子（%s など）は "a","b" に置き換わるだけで、HTML の特殊文字には影響しない（% を含まなければ入力はそのまま出力される）。
+  - 同じコミットの web.xml に登録されたフィルタ（DataBaseFilter、HTTPResponseHeaderFilter、Tomcat の HttpHeaderSecurityFilter）は入力を無害化しない。HTTPResponseHeaderFilter が付ける CSP は default-src に 'unsafe-inline' 'unsafe-eval' を含むため、インラインスクリプトやイベントハンドラ属性は止められない。
+  - 付随する問題（CWE-134）: 入力を書式文字列として使っているため、%d や %q のような不正・不一致の書式指定子を送ると IllegalFormatException 等の例外が発生し、500 エラーになる（Java のため任意メモリ読み書きにはならないが、エラーの誘発・出力の改変が可能）。
+- 使用トークン量（判定）: 新規 9,387（入力 8 ／ キャッシュ作成 6,494 ／ 出力〔推定〕 2,885）、キャッシュ読込 81,521、総処理 90,908、リクエスト 4 回（出力の記録値 3,231）
+
+---
+## No.6 OWASP-Benchmark/BenchmarkJava BenchmarkTest00030.java
+- 対象: https://github.com/OWASP-Benchmark/BenchmarkJava/blob/master/src/main/java/org/owasp/benchmark/testcode/BenchmarkTest00030.java
+
+- **XSS 種別**: 反射型。リクエストパラメータの値が保存されずに、同じリクエストのレスポンス HTML にサーバー側でそのまま書き出されるため。
+- **source**: 44行目 request.getParameterMap() → 47〜48行目 map.get("BenchmarkTest00030") の values[0]（HTTP リクエストパラメータ BenchmarkTest00030、GET/POST とも。35行目で doGet は doPost に委譲）
+- **伝播経路**: 47行目 values = map.get("BenchmarkTest00030") → 48行目 param = values[0] → 53行目 printf の第1引数（書式文字列）として使用。途中に検証・エンコード処理はない。
+- **sink**: 53行目 response.getWriter().printf(param, obj)（42行目で text/html と宣言した HTTP レスポンス本文への出力）
+- **脆弱性の位置**: sink 側（53行目）。入力を HTML エンコードせずに、しかも書式文字列として HTML レスポンスに出力していることが原因。source 側（48行目）で入力検証もしていないが、根本は出力時のエスケープ欠如。
+- **攻撃例**: 攻撃者が、パラメータ BenchmarkTest00030 にスクリプトタグ（またはイベントハンドラ属性付きの img タグ等）を入れた URL を作り、メールや掲示板などで被害者にクリックさせる。被害者のブラウザがその URL にアクセスすると、サーバーは入力をそのまま HTML として返すため、スクリプトが対象サイトのオリジンで実行され、Cookie の窃取や被害者になりすました操作が行われる。X-XSS-Protection: 0 と 'unsafe-inline' を許す CSP のため、ブラウザ側でも防がれない。
+
+---
