@@ -1,0 +1,519 @@
+## No.11 leizongmin/js-xss lib/index.js（filterXSSWithResult）・lib/xss.js・lib/default.js
+- 対象: https://github.com/leizongmin/js-xss
+- XSS 種別: その他（source・sink は "第2回xssの詳細"）
+- 修正したファイル: index.js、xss.js
+
+### 修正コードの説明
+
+#### No.11 leizongmin/js-xss（コミット 9b42221）修正コードの説明
+
+対象ファイル: `lib/index.js` → `fix01_index.js`、`lib/xss.js` → `fix01_xss.js`（`lib/default.js` と `lib/parser.js` は変更しない）
+
+#### 1. 修正の方針
+
+このライブラリは、信頼できない HTML をホワイトリストで無害化する。今回、無害化を回避して XSS を起こせる経路が 2 つ見つかった。どちらも出力の直前、つまり無害化の処理の中でふさぐ。
+
+| No. | source → sink | 防ぐ場所 | 方法 |
+|---|---|---|---|
+| (1) | 汚染された `Object.prototype` のプロパティ（と入力 HTML）→ `filterXSSWithResult(...).html` | `lib/index.js` の filterXSSWithResult。options を複製し、元のフックを取り出す部分 | 自身のプロパティだけを複製し、自身のプロパティだけを読む（`hasOwnProperty`） |
+| (2) | 入力 HTML の属性値 → `singleQuotedAttributeValue:true` のときの `name='value'` の出力（xss.js 201行） | `lib/xss.js` の属性を組み立てる直前 | 囲み文字が `'` のときだけ、値の `'` を `&#39;` にエスケープする |
+
+方法を選んだ理由:
+- (1) ライブラリ本体（`FilterXSS` のコンストラクタ）は、すでに `hasOwnProperty` を使って、継承されたプロパティを options として採用しない設計になっている。テストにも "prototype pollution protection" がある。新しく追加された `filterXSSWithResult` だけがこの設計から外れている。そこで、同じ書き方（`Object.prototype.hasOwnProperty.call`）に合わせるのが最小で一貫した修正になる。
+- (2) 囲み文字は `FilterXSS` が決める（`this.attributeWrapSign`）。どの文字をエスケープすべきかを確実に知っているのは、属性を組み立てる箇所だけである。`default.js` の `escapeAttrValue` で常に `'` もエスケープする方法もある。しかしその方法では、既定の `"` 囲みのときの出力も変わり、公開 API である `escapeAttrValue` の結果も変わる。既存の利用者やテストへの影響が大きいので、`'` で囲む場合だけに限って処理を足す。また、利用者が `safeAttrValue` を自作した場合も最後にこの処理を通るので、(2) を確実に防げる。
+
+#### 2. 変更箇所ごとの説明
+
+##### 2-1. `fix01_index.js` 41-48行（元の `lib/index.js` 41-43行）
+
+修正前:
+```js
+    for (var key in options) {
+      opts[key] = options[key];
+    }
+```
+修正後:
+```js
+    for (var key in options) {
+      // 修正: for...in は継承されたプロパティも列挙するため、自身のプロパティだけを複製する。
+      // （コメント 2 行省略）
+      if (Object.prototype.hasOwnProperty.call(options, key)) {
+        opts[key] = options[key];
+      }
+    }
+```
+- `for...in` は、オブジェクト自身のプロパティに加えて、プロトタイプ連鎖上の列挙可能なプロパティも列挙する。攻撃者が `Object.prototype.whiteList = {script:["src"]}` のように汚染すると、修正前のコードではそれが `opts.whiteList` という**自身の**プロパティとして複製されていた。そのため `FilterXSS` の `hasOwnProperty` の確認を通り抜け、汚染された値が利用者の指定として採用された。
+- 追加した `if (Object.prototype.hasOwnProperty.call(options, key))` は、`options` 自身が持つプロパティだけを複製する。`options.hasOwnProperty(...)` ではなく `Object.prototype.hasOwnProperty.call` を使う。こうすれば、options の `hasOwnProperty` が上書きされていたり、プロトタイプが null だったりしても正しく判定できる。
+- これで、汚染された whiteList・onTag・onTagAttr・escapeHtml・safeAttrValue・css などは `opts` に入らない。`FilterXSS` では既定値（`DEFAULT.*`）が使われる。
+
+##### 2-2. `fix01_index.js` 51-59行（元の `lib/index.js` 46-48行）
+
+修正前:
+```js
+  // Save any hooks the user may have already provided
+  var originalOnIgnoreTag = opts.onIgnoreTag;
+  var originalOnIgnoreTagAttr = opts.onIgnoreTagAttr;
+```
+修正後:
+```js
+  // Save any hooks the user may have already provided
+  // 修正: 利用者が自身のプロパティとして指定したフックだけを「元のフック」とする。
+  // opts.onIgnoreTag と書くと継承元（汚染された Object.prototype）の関数を拾ってしまうため。
+  var originalOnIgnoreTag = Object.prototype.hasOwnProperty.call(opts, "onIgnoreTag")
+    ? opts.onIgnoreTag
+    : undefined;
+  var originalOnIgnoreTagAttr = Object.prototype.hasOwnProperty.call(opts, "onIgnoreTagAttr")
+    ? opts.onIgnoreTagAttr
+    : undefined;
+```
+- `opts` はふつうのオブジェクト（`{}`）なので、`opts.onIgnoreTag` を読むと、自身にない場合は `Object.prototype.onIgnoreTag` まで探しにいく。修正前は options を省略した場合でも、汚染された関数が「元のフック」になっていた。下のラッパー（`opts.onIgnoreTag` と `opts.onIgnoreTagAttr`）がその戻り値（たとえば `<script>` タグそのものや `onclick="..."`）を返し、xss.js の 207-208行と 221-222行がそれを無害化せずに出力していた。
+- 修正後は、`opts` 自身がそのプロパティを持つときだけ元のフックとして使い、持たないときは `undefined` にする。`undefined` の場合、ラッパーは何も返さない（`undefined`）。その結果、ライブラリ本来の動作（タグは `escapeHtml` でエスケープし、属性は削除）になる。
+- 2-1 で自身のプロパティだけを複製したので、ここで自身のプロパティを持っていれば、それは利用者が `options` に直接書いたフックである。利用者のフックを呼ぶ機能はそのまま残る。
+- 補足: `JSON.parse` で作った options に、自身のプロパティとして `"__proto__"` キーがある場合を考える。このとき 2-1 の代入は `opts` のプロトタイプを変えるだけである。そのプロトタイプ上の値は、この 2-2 の判定でも `FilterXSS` の `shallowCopyObject` でも「継承されたプロパティ」として無視されるので、影響しない。
+
+##### 2-3. `fix01_xss.js` 14-15行（追加）
+
+```js
+// 修正: 属性値を ' で囲むときに、値の中の ' をエスケープするための正規表現
+var REGEXP_SINGLE_QUOTE = /'/g;
+```
+- `'` をすべて置き換えるための正規表現を、モジュールの先頭で 1 回だけ作る。`default.js` の `REGEXP_QUOTE` と同じ書き方にそろえている。`replace` だけで使うので、`g` フラグの `lastIndex` の問題は起きない。
+
+##### 2-4. `fix01_xss.js` 203-210行（元の `lib/xss.js` 200-201行）
+
+修正前:
+```js
+            if (value) {
+              return name + '=' + attributeWrapSign + value + attributeWrapSign;
+```
+修正後:
+```js
+            if (value) {
+              // 修正: 囲み文字が ' のときは、値の中の ' を &#39; にエスケープする。
+              // （コメント 2 行省略）
+              if (attributeWrapSign === "'") {
+                value = String(value).replace(REGEXP_SINGLE_QUOTE, "&#39;");
+              }
+              return name + '=' + attributeWrapSign + value + attributeWrapSign;
+```
+- `if (attributeWrapSign === "'")`: `singleQuotedAttributeValue: true` を指定したときだけ処理する。既定の `"` 囲みでは何もしない。
+- `String(value)`: 利用者が自作した `safeAttrValue` が文字列以外を返しても、`replace` で例外が出ないように文字列に変換する。既定の `safeAttrValue` は文字列を返すので、結果は変わらない。
+- `.replace(REGEXP_SINGLE_QUOTE, "&#39;")`: 値の中の `'` を、数値文字参照 `&#39;` に置き換える。ブラウザは、属性値の中の `&#39;` を文字 `'` として解釈するが、囲みの終わりとしては扱わない。したがって、値は必ず `'...'` の中に閉じ込められ、後ろに別の属性を作れない。
+- XSS を防げる理由: 修正前は `escapeAttrValue` が `"` `<` `>` しかエスケープしなかった。値の中の `'` が `'` 囲みを閉じ、そのあとの `onmouseover=...` が独立した属性として解釈されていた。修正後は、囲み文字と同じ文字が値に残らない。
+
+#### 3. 修正の結果
+
+攻撃例の入力の扱い（修正版を、lib と同じ内容の dist/xss.js に当てはめた場合の想定）:
+- (1) `Object.prototype.onIgnoreTag = (t, h) => h` と `Object.prototype.onIgnoreTagAttr = (t, n, v) => n + '="' + v + '"'` で汚染された状態で、`filterXSSWithResult('<script>alert(1)</script><a href=# onclick=alert(2)>a</a>')` を呼ぶ。
+  - 修正前: `<script>alert(1)</script><a href="#" onclick="alert(2)">a</a>`
+  - 修正後: `&lt;script&gt;alert(1)&lt;/script&gt;<a href="#">a</a>`（`filterXSS` と同じ結果）
+- (1) `Object.prototype.whiteList = {script:["src"], img:["src","onerror"]}` で汚染された状態で、`filterXSSWithResult(html, {})` を呼ぶ。
+  - 汚染された whiteList は複製されず、既定のホワイトリストが使われる。`<script>` はエスケープされ、`onerror` は削除される。
+- (2) `singleQuotedAttributeValue: true` で `<a title="' onmouseover=alert(1) '">hi</a>` を処理する。
+  - 修正前: `<a title='' onmouseover=alert(1) ''>hi</a>`（onmouseover 属性が注入される）
+  - 修正後: `<a title='&#39; onmouseover=alert(1) &#39;'>hi</a>`（全体が title の値になり、表示上は `' onmouseover=alert(1) '` という文字列になるだけ）
+
+正常な入力での動作への影響:
+- 変わらない点:
+  - Object.prototype が汚染されていない通常の環境では、`filterXSSWithResult` の `html` と `removed` の結果は修正前と同じである。
+  - options に直接指定した `onIgnoreTag` と `onIgnoreTagAttr` は、修正前と同じように呼ばれる。
+  - 既定の `"` 囲みでは、出力は 1 文字も変わらない。
+  - `filterXSS` と `FilterXSS` の通常の処理は変わらない。
+- 変わる点:
+  - options を継承で渡していた場合は、その設定が無視されるようになる。たとえば `Object.create(base)` で作ったオブジェクトに、設定を base 側に置いて渡す場合である。これは `filterXSS` と `new FilterXSS` がもともと採っている仕様と同じであり、両者の挙動がそろう。
+  - `singleQuotedAttributeValue: true` のとき、値に `'` を含む属性は `&#39;` を含む形で出力される（例: `title='It&#39;s'`）。ブラウザでの表示や値（`It's`）は変わらない。
+
+#### 4. 注意点
+
+- XSS 以外の問題は修正していない。`lib/parser.js` の parseAttr 169-170行は、空白文字が出るたびに属性文字列全体を `replace` で作り直す。そのため処理時間が入力長の 2 乗で増える（計算量の DoS: CWE-407。実測では 40k 文字で約 24 秒）。replace をループの外で 1 回だけ実行するなどの対策が必要だが、今回は対象外とした。
+- `filterXSSWithResult` が返す `removed` の `html` と `value` には、除去したタグや属性の**生の文字列**が入る。アプリが `removed` を画面（管理画面のログなど）に表示する場合は、利用側で HTML エスケープする必要がある。これは関数の仕様なので変更していない。
+- (1) の修正は、`filterXSSWithResult` が汚染の影響を受けないようにするだけである。プロトタイプ汚染そのもの（アプリ側の脆弱なマージ処理など）は直らない。汚染があれば、このライブラリ以外の部分で別の被害が出る可能性は残る。
+- 利用者が `onTag`・`onTagAttr`・`onIgnoreTag`・`onIgnoreTagAttr`・`safeAttrValue` を自作して文字列を返す場合、その文字列はそのまま出力される（`onTagAttr` が返す属性文字列も含む）。そのため、自作フックの中のエスケープは利用者の責任となる。(2) のエスケープは、`safeAttrValue` の戻り値には適用するが、`onTagAttr` などが返す完成済みの文字列には適用しない。
+- `dist/xss.js` と `dist/xss.min.js` はビルド成果物なので、今回は手で直していない。修正を反映するには、`npm run build` などで lib から作り直す必要がある。
+
+### 修正したコード: index.js
+
+```javascript
+/**
+ * xss
+ *
+ * @author Zongmin Lei<leizongmin@gmail.com>
+ */
+
+var DEFAULT = require("./default");
+var parser = require("./parser");
+var FilterXSS = require("./xss");
+
+/**
+ * filter xss function
+ *
+ * @param {String} html
+ * @param {Object} options { whiteList, onTag, onTagAttr, onIgnoreTag, onIgnoreTagAttr, safeAttrValue, escapeHtml }
+ * @return {String}
+ */
+function filterXSS(html, options) {
+  var xss = new FilterXSS(options);
+  return xss.process(html);
+}
+
+/**
+ * Filter XSS and return both the sanitized HTML and a list of removed elements.
+ * Addresses feature request: https://github.com/leizongmin/js-xss/issues/284
+ *
+ * @param {String} html    - dirty HTML string to sanitize
+ * @param {Object} options - same options as filterXSS()
+ * @return {Object} { html: String, removed: Array }
+ *
+ * Each item in `removed` is one of:
+ *   { type: "tag",  tag: "script", html: "<script>",  isClosing: false }
+ *   { type: "attr", tag: "a",      attr: "onclick",   value: "evil()" }
+ */
+function filterXSSWithResult(html, options) {
+  var removed = [];
+
+  // Copy options so we don't mutate the caller's object
+  var opts = {};
+  if (options) {
+    for (var key in options) {
+      // 修正: for...in は継承されたプロパティも列挙するため、自身のプロパティだけを複製する。
+      // 汚染された Object.prototype の whiteList・onTag・escapeHtml などを、
+      // opts 自身のプロパティとして FilterXSS に渡さないようにする。
+      if (Object.prototype.hasOwnProperty.call(options, key)) {
+        opts[key] = options[key];
+      }
+    }
+  }
+
+  // Save any hooks the user may have already provided
+  // 修正: 利用者が自身のプロパティとして指定したフックだけを「元のフック」とする。
+  // opts.onIgnoreTag と書くと継承元（汚染された Object.prototype）の関数を拾ってしまうため。
+  var originalOnIgnoreTag = Object.prototype.hasOwnProperty.call(opts, "onIgnoreTag")
+    ? opts.onIgnoreTag
+    : undefined;
+  var originalOnIgnoreTagAttr = Object.prototype.hasOwnProperty.call(opts, "onIgnoreTagAttr")
+    ? opts.onIgnoreTagAttr
+    : undefined;
+
+  // Override onIgnoreTag to record removed tags
+  opts.onIgnoreTag = function (tag, tagHtml, tagOptions) {
+    removed.push({
+      type: "tag",
+      tag: tag,
+      html: tagHtml,
+      isClosing: !!(tagOptions && tagOptions.isClosing),
+    });
+    // Still call the user's original hook if they had one
+    if (originalOnIgnoreTag) {
+      return originalOnIgnoreTag(tag, tagHtml, tagOptions);
+    }
+  };
+
+  // Override onIgnoreTagAttr to record removed attributes
+  opts.onIgnoreTagAttr = function (tag, name, value, isWhiteAttr) {
+    removed.push({
+      type: "attr",
+      tag: tag,
+      attr: name,
+      value: value,
+    });
+    // Still call the user's original hook if they had one
+    if (originalOnIgnoreTagAttr) {
+      return originalOnIgnoreTagAttr(tag, name, value, isWhiteAttr);
+    }
+  };
+
+  var cleanHtml = filterXSS(html, opts);
+
+  return {
+    html: cleanHtml,
+    removed: removed,
+  };
+}
+exports = module.exports = filterXSS;
+exports.filterXSS = filterXSS;
+exports.filterXSSWithResult = filterXSSWithResult;
+exports.FilterXSS = FilterXSS;
+
+(function () {
+  for (var i in DEFAULT) {
+    if (Object.prototype.hasOwnProperty.call(DEFAULT, i)) {
+      exports[i] = DEFAULT[i];
+    }
+  }
+  for (var j in parser) {
+    if (Object.prototype.hasOwnProperty.call(parser, j)) {
+      exports[j] = parser[j];
+    }
+  }
+})();
+
+// using `xss` on the browser, output `filterXSS` to the globals
+if (typeof window !== "undefined") {
+  window.filterXSS = module.exports;
+}
+
+// using `xss` on the WebWorker, output `filterXSS` to the globals
+function isWorkerEnv() {
+  return (
+    typeof self !== "undefined" &&
+    typeof DedicatedWorkerGlobalScope !== "undefined" &&
+    self instanceof DedicatedWorkerGlobalScope
+  );
+}
+if (isWorkerEnv()) {
+  self.filterXSS = module.exports;
+}
+```
+
+### 修正したコード: xss.js
+
+```javascript
+/**
+ * filter xss
+ *
+ * @author Zongmin Lei<leizongmin@gmail.com>
+ */
+
+var FilterCSS = require("cssfilter").FilterCSS;
+var DEFAULT = require("./default");
+var parser = require("./parser");
+var parseTag = parser.parseTag;
+var parseAttr = parser.parseAttr;
+var _ = require("./util");
+
+// 修正: 属性値を ' で囲むときに、値の中の ' をエスケープするための正規表現
+var REGEXP_SINGLE_QUOTE = /'/g;
+
+/**
+ * returns `true` if the input value is `undefined` or `null`
+ *
+ * @param {Object} obj
+ * @return {Boolean}
+ */
+function isNull(obj) {
+  return obj === undefined || obj === null;
+}
+
+/**
+ * get attributes for a tag
+ *
+ * @param {String} html
+ * @return {Object}
+ *   - {String} html
+ *   - {Boolean} closing
+ */
+function getAttrs(html) {
+  var i = _.spaceIndex(html);
+  if (i === -1) {
+    return {
+      html: "",
+      closing: html[html.length - 2] === "/",
+    };
+  }
+  html = _.trim(html.slice(i + 1, -1));
+  var isClosing = html[html.length - 1] === "/";
+  if (isClosing) html = _.trim(html.slice(0, -1));
+  return {
+    html: html,
+    closing: isClosing,
+  };
+}
+
+/**
+ * shallow copy
+ *
+ * @param {Object} obj
+ * @return {Object}
+ */
+function shallowCopyObject(obj) {
+  var ret = {};
+  for (var i in obj) {
+    if (Object.prototype.hasOwnProperty.call(obj, i)) {
+      ret[i] = obj[i];
+    }
+  }
+  return ret;
+}
+
+function keysToLowerCase(obj) {
+  var ret = {};
+  for (var i in obj) {
+    if (Object.prototype.hasOwnProperty.call(obj, i)) {
+      if (Array.isArray(obj[i])) {
+        ret[i.toLowerCase()] = obj[i].map(function (item) {
+          return item.toLowerCase();
+        });
+      } else {
+        ret[i.toLowerCase()] = obj[i];
+      }
+    }
+  }
+  return ret;
+}
+
+/**
+ * FilterXSS class
+ *
+ * @param {Object} options
+ *        whiteList (or allowList), onTag, onTagAttr, onIgnoreTag,
+ *        onIgnoreTagAttr, safeAttrValue, escapeHtml
+ *        stripIgnoreTagBody, allowCommentTag, stripBlankChar
+ *        css{whiteList, onAttr, onIgnoreAttr} `css=false` means don't use `cssfilter`
+ */
+function FilterXSS(options) {
+  options = shallowCopyObject(options || {});
+
+  if (Object.prototype.hasOwnProperty.call(options, 'stripIgnoreTag') && options.stripIgnoreTag) {
+    if (Object.prototype.hasOwnProperty.call(options, 'onIgnoreTag') && options.onIgnoreTag) {
+      console.error(
+        'Notes: cannot use these two options "stripIgnoreTag" and "onIgnoreTag" at the same time'
+      );
+    }
+    options.onIgnoreTag = DEFAULT.onIgnoreTagStripAll;
+  }
+  if (Object.prototype.hasOwnProperty.call(options, 'whiteList') || Object.prototype.hasOwnProperty.call(options, 'allowList')) {
+    const wl = Object.prototype.hasOwnProperty.call(options, 'whiteList') ? options.whiteList : options.allowList;
+    options.whiteList = keysToLowerCase(wl);
+  } else {
+    options.whiteList = DEFAULT.whiteList;
+  }
+
+  this.attributeWrapSign = Object.prototype.hasOwnProperty.call(options, 'singleQuotedAttributeValue') && options.singleQuotedAttributeValue === true ? "'" : DEFAULT.attributeWrapSign;
+
+  options.onTag = Object.prototype.hasOwnProperty.call(options, 'onTag') ? options.onTag : DEFAULT.onTag;
+  options.onTagAttr = Object.prototype.hasOwnProperty.call(options, 'onTagAttr') ? options.onTagAttr : DEFAULT.onTagAttr;
+  options.onIgnoreTag = Object.prototype.hasOwnProperty.call(options, 'onIgnoreTag') ? options.onIgnoreTag : DEFAULT.onIgnoreTag;
+  options.onIgnoreTagAttr = Object.prototype.hasOwnProperty.call(options, 'onIgnoreTagAttr') ? options.onIgnoreTagAttr : DEFAULT.onIgnoreTagAttr;
+  options.safeAttrValue = Object.prototype.hasOwnProperty.call(options, 'safeAttrValue') ? options.safeAttrValue : DEFAULT.safeAttrValue;
+  options.escapeHtml = Object.prototype.hasOwnProperty.call(options, 'escapeHtml') ? options.escapeHtml : DEFAULT.escapeHtml;
+  this.options = options;
+
+  if (Object.prototype.hasOwnProperty.call(options, 'css') && options.css === false) {
+    this.cssFilter = false;
+  } else {
+    options.css = Object.prototype.hasOwnProperty.call(options, 'css') ? options.css : {};
+    this.cssFilter = new FilterCSS(options.css);
+  }
+}
+
+/**
+ * start process and returns result
+ *
+ * @param {String} html
+ * @return {String}
+ */
+FilterXSS.prototype.process = function (html) {
+  // compatible with the input
+  html = html || "";
+  html = html.toString();
+  if (!html) return "";
+
+  var me = this;
+  var options = me.options;
+  var whiteList = options.whiteList;
+  var onTag = options.onTag;
+  var onIgnoreTag = options.onIgnoreTag;
+  var onTagAttr = options.onTagAttr;
+  var onIgnoreTagAttr = options.onIgnoreTagAttr;
+  var safeAttrValue = options.safeAttrValue;
+  var escapeHtml = options.escapeHtml;
+  var attributeWrapSign = me.attributeWrapSign;
+  var cssFilter = me.cssFilter;
+
+  // remove invisible characters
+  if (options.stripBlankChar) {
+    html = DEFAULT.stripBlankChar(html);
+  }
+
+  // remove html comments
+  if (!options.allowCommentTag) {
+    html = DEFAULT.stripCommentTag(html);
+  }
+
+  // if enable stripIgnoreTagBody
+  var stripIgnoreTagBody = false;
+  if (options.stripIgnoreTagBody) {
+    stripIgnoreTagBody = DEFAULT.StripTagBody(
+      options.stripIgnoreTagBody,
+      onIgnoreTag
+    );
+    onIgnoreTag = stripIgnoreTagBody.onIgnoreTag;
+  }
+
+  var retHtml = parseTag(
+    html,
+    function (sourcePosition, position, tag, html, isClosing) {
+      var info = {
+        sourcePosition: sourcePosition,
+        position: position,
+        isClosing: isClosing,
+        isWhite: Object.prototype.hasOwnProperty.call(whiteList, tag),
+      };
+
+      // call `onTag()`
+      var ret = onTag(tag, html, info);
+      if (!isNull(ret)) return ret;
+
+      if (info.isWhite) {
+        if (info.isClosing) {
+          return "</" + tag + ">";
+        }
+
+        var attrs = getAttrs(html);
+        var whiteAttrList = whiteList[tag];
+        var attrsHtml = parseAttr(attrs.html, function (name, value) {
+          // call `onTagAttr()`
+          var isWhiteAttr = _.indexOf(whiteAttrList, name) !== -1;
+          var ret = onTagAttr(tag, name, value, isWhiteAttr);
+          if (!isNull(ret)) return ret;
+
+          if (isWhiteAttr) {
+            // call `safeAttrValue()`
+            value = safeAttrValue(tag, name, value, cssFilter);
+            if (value) {
+              // 修正: 囲み文字が ' のときは、値の中の ' を &#39; にエスケープする。
+              // escapeAttrValue は " < > しかエスケープしないため、
+              // そのままだと値の中の ' で囲みが閉じ、別の属性（onmouseover など）を注入できた。
+              if (attributeWrapSign === "'") {
+                value = String(value).replace(REGEXP_SINGLE_QUOTE, "&#39;");
+              }
+              return name + '=' + attributeWrapSign + value + attributeWrapSign;
+            } else {
+              return name;
+            }
+          } else {
+            // call `onIgnoreTagAttr()`
+            ret = onIgnoreTagAttr(tag, name, value, isWhiteAttr);
+            if (!isNull(ret)) return ret;
+            return;
+          }
+        });
+
+        // build new tag html
+        html = "<" + tag;
+        if (attrsHtml) html += " " + attrsHtml;
+        if (attrs.closing) html += " /";
+        html += ">";
+        return html;
+      } else {
+        // call `onIgnoreTag()`
+        ret = onIgnoreTag(tag, html, info);
+        if (!isNull(ret)) return ret;
+        return escapeHtml(html);
+      }
+    },
+    escapeHtml
+  );
+
+  // if enable stripIgnoreTagBody
+  if (stripIgnoreTagBody) {
+    retHtml = stripIgnoreTagBody.remove(retHtml);
+  }
+
+  return retHtml;
+};
+
+module.exports = FilterXSS;
+```
+
+---
