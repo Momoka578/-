@@ -12,3 +12,14 @@
 - 使用トークン量（判定）: 新規 10,469（入力 6 ／ キャッシュ作成 7,700 ／ 出力〔推定〕 2,763）、キャッシュ読込 60,330、総処理 70,799、リクエスト 3 回（出力の記録値 3,030）
 
 ---
+## No.15 google/firing-range DOMPropagation.java（+ data/dompropagation.tmpl, data/toxicdom.tmpl）
+- 対象: https://github.com/google/firing-range/blob/master/src/tests/dom/DOMPropagation.java
+
+- **XSS 種別**: DOM-base（入力は URL フラグメントで、サーバーを経由しない。クライアント側の JavaScript だけで source から sink（eval）へ流れる。サーバーの応答は毎回同じ固定内容）
+- **source**: dompropagation.tmpl 4 行目 location.hash.substr(1)（URL の # 以降。攻撃者がリンクで自由に指定できる）
+- **伝播経路**: dompropagation.tmpl 4 行目 payload → 5 行目 window.status = payload（DOM 属性へ書き込み）→ 6 行目 retrieved_payload = window.status（読み戻し）→ 7 行目 eval の引数。この JS は DOMPropagation.java 35 行目で toxicdom.tmpl 5 行目の <script> 内に埋め込まれ、37 行目で配信される
+- **sink**: dompropagation.tmpl 7 行目 eval(retrieved_payload)
+- **脆弱性の位置**: sink 側。source（location.hash）は攻撃者が制御できる値として扱うのが前提で、問題は信頼できない文字列をコードとして eval に渡している 7 行目にある（window.status を経由しても値は無害化されない）。DOMPropagation.java は、この危険な JS をそのまま配信している（37 行目、X-XSS-Protection: 0 でブラウザの防御も無効化）
+- **攻撃例**: 攻撃者は、# の後ろに Cookie を外部サーバーへ送る JavaScript 文を付けた /dom/dompropagation の URL を作り、メールや掲示板で被害者に踏ませる。ページが読み込まれると、その文が window.status を経由して eval で実行され、被害者のセッション情報が攻撃者に送られる。
+
+---
