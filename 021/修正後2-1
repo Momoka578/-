@@ -1,0 +1,307 @@
+## No.21 CVE-2017-0931 html-janitor (guardian/html-janitor, src/html-janitor.js)
+- 対象: https://github.com/ossf-cve-benchmark/ossf-cve-benchmark/blob/main/CVEs/CVE-2017-0931.json
+- XSS 種別: DOM-base（source・sink は "第2回xssの詳細"）
+- 修正したファイル: html-janitor.js
+
+### 修正コードの説明
+
+#### No.21 CVE-2017-0931 html-janitor（src/html-janitor.js）修正コードの説明
+
+修正済みファイル: `fix01_html-janitor.js`（元: guardian/html-janitor の prePatch 8c99e653 の `src/html-janitor.js`）
+
+#### 1. 修正の方針
+
+- 防ぐ脆弱性（source → sink）
+  - source: 42 行目 `HTMLJanitor.prototype.clean = function (html)` の引数 `html`（利用者や第三者から来る、信頼できない HTML）
+  - sink: 44 行目 `sandbox.innerHTML = html;`。43 行目で `document.createElement('div')` により、作業用の div（sandbox）を「表示中の生きた document」の要素として作っている。
+  - 生きた document の要素は、画面に挿入されていなくても、innerHTML で作られた時点で `<img src>` などのリソース取得が始まる。取得に失敗すると error イベントが非同期に発生し、要素に残っている `onerror` などのイベントハンドラ属性が実行される。
+  - `_sanitize` は、ホワイトリストにない要素を `removeChild` で外すだけで（元 111 行目）、その要素の属性は消さない。そのため、外された `<img>` の画像取得が後で失敗した時に `onerror` が実行される。戻り値の HTML は安全でも、`clean()` を呼んだだけでページの権限で攻撃者の JS が動く（DOM-based XSS）。
+- どこで、どう防ぐか
+  - sink 側（`clean()` の 43 行目）で、作業用 div の持ち主の文書を変える。`document.implementation.createHTMLDocument('')` で作る文書は、閲覧コンテキスト（ウィンドウ）を持たない不活性な文書なので、その中の要素に innerHTML で HTML を入れても、画像などのリソース取得、イベントハンドラ、`<script>` は動かない。
+  - これに合わせて、`createTreeWalker` は表示中の `document` ではなく、走査対象の node 自身の `ownerDocument`（＝不活性な文書）から TreeWalker を作るようにした。
+- この方法を選んだ理由
+  - 問題の原因は「サニタイズ前の HTML を、スクリプトが動く文書で解析していること」なので、その解析場所を不活性な文書に移すのが、原因そのものを断つ一番確実な方法である。`<img>` だけでなく、`<video>`/`<audio>`/`<source>`/`<object>`/`<embed>`/`<link>` など、読み込みやイベントを伴うすべての要素にまとめて効く。
+  - 「外す要素の on* 属性を先に消す」方法も考えられるが、イベントが発生する要素や属性を全部数え上げる必要があり、漏れが出やすい。さらに、innerHTML の代入時点で取得が始まるので、属性の削除が間に合う保証もない。
+  - 変更は 2 か所だけで、ホワイトリストの判定や出力の形は変わらない。そのため、元のコードの動作（テストの期待値）を保てる。`createHTMLDocument` は主要ブラウザで広く使える標準 API である。
+
+#### 2. 変更箇所ごとの説明
+
+##### 変更 1: `clean()` の作業用 div を不活性な文書の中に作る（修正後 43〜51 行目）
+
+修正前（元 42〜44 行目）:
+
+```js
+  HTMLJanitor.prototype.clean = function (html) {
+    var sandbox = document.createElement('div');
+    sandbox.innerHTML = html;
+```
+
+修正後（修正後 42〜51 行目）:
+
+```js
+  HTMLJanitor.prototype.clean = function (html) {
+    // 【XSS 修正】作業用の div を、表示中の document（スクリプト・イベントハンドラ・
+    // 画像などの読み込みが有効）ではなく、createHTMLDocument で作った
+    // 閲覧コンテキストを持たない不活性な文書の中に作る。
+    // この文書の要素に innerHTML で HTML を入れても、<img src onerror> などの
+    // リソース取得やイベントハンドラ、<script> は実行されないため、
+    // サニタイズ前の HTML を解析する時点でのスクリプト実行を防げる。
+    var sandboxDocument = document.implementation.createHTMLDocument('');
+    var sandbox = sandboxDocument.createElement('div');
+    sandbox.innerHTML = html;
+```
+
+- 43〜48 行目: 修正の理由を書いた日本語コメント。
+- 49 行目 `var sandboxDocument = document.implementation.createHTMLDocument('');`
+  - 表示中のページとは別の、空の HTML 文書を新しく作る。この文書は閲覧コンテキストを持たないので、スクリプトは無効、画像などの読み込みも行われない。
+- 50 行目 `var sandbox = sandboxDocument.createElement('div');`
+  - 作業用の div を、表示中の `document` ではなく、上の不活性な文書の要素として作る（元 43 行目の置き換え）。
+- 51 行目 `sandbox.innerHTML = html;`
+  - 元 44 行目と同じ文。ただし代入先が不活性な文書の要素になったので、`<img src=... onerror=...>` が解析されて img 要素ができても、画像の取得は行われず、error イベントも発生しない。`onerror` 属性は文字列として残るだけで、その後の `_sanitize` で、要素ごと外されるか属性が消される。
+- これで XSS が防げる理由: 攻撃者の JS が動くきっかけは「生きた文書で解析した要素のリソース取得とイベント」だった。解析の場所を不活性な文書に移したので、サニタイズの前にも後にも、作業用 DOM の中でスクリプトが実行される経路がなくなる。
+
+##### 変更 2: TreeWalker を対象 node の文書から作る（修正後 141〜146 行目）
+
+修正前（元 134〜138 行目）:
+
+```js
+  function createTreeWalker(node) {
+    return document.createTreeWalker(node,
+                                     NodeFilter.SHOW_TEXT | NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_COMMENT,
+                                     null, false);
+  }
+```
+
+修正後（修正後 141〜146 行目）:
+
+```js
+  function createTreeWalker(node) {
+    // 【XSS 修正に伴う変更】走査対象の node は不活性な文書（sandboxDocument）に属するため、
+    // その node 自身の ownerDocument から TreeWalker を作る（表示中の document には触れない）。
+    return node.ownerDocument.createTreeWalker(node,
+                                     NodeFilter.SHOW_TEXT | NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_COMMENT,
+                                     null, false);
+  }
+```
+
+- 142〜143 行目: 変更理由の日本語コメント。
+- 144 行目 `node.ownerDocument.createTreeWalker(node, ...)`
+  - 走査する node（sandbox やその子孫）が属する不活性な文書から TreeWalker を作る。走査の内容（テキスト・要素・コメントを対象にする、フィルタなし）は元と同じ。
+  - XSS を直接防ぐ変更ではなく、変更 1 に合わせて、走査の処理も sandbox と同じ文書の中で完結させるための整合の変更である。表示中の `document` の TreeWalker でも別の文書の node は走査できるが、作業を不活性な文書の中にそろえておくほうが意図が明確になる。
+
+#### 3. 修正の結果
+
+- 攻撃例の入力の扱い
+  - img を許可しない設定で `clean('<img src=存在しないURL onerror=任意のJS>')` を呼んだ場合
+    - 修正前: 戻り値は空文字列だが、作業用 div の中で作られた img の画像取得が失敗した時点で `onerror` の JS が実行されていた。
+    - 修正後: img は不活性な文書の中で作られるので、画像の取得は行われず、error イベントも発生しない。img は `_sanitize` で外され、戻り値は空文字列。JS は一度も実行されない。
+  - img を許可していて、onerror を許可しない設定の場合も、解析時に取得が始まらないので、属性の削除が間に合うかどうかに左右されなくなる。戻り値からは onerror が消える。
+  - `<video><source onerror=...>`、`<object data=...>`、`<link rel=... onload=...>` など、読み込みやイベントを伴う他の要素も同じ理由で実行されない。`<script>` は元から innerHTML では実行されないが、不活性な文書でも実行されない。
+- 正常な入力での動作への影響
+  - 変わらない点: ホワイトリストによるタグと属性の判定、ブロック要素の入れ子の解消、コメントの削除、空白テキストの削除、`SCRIPT`/`STYLE` の中身の破棄、戻り値の形式（`sandbox.innerHTML` の文字列）はすべて元と同じ。設定で関数を渡した場合も、引数の要素が不活性な文書の要素になるだけで、`textContent`/`innerHTML`/`classList`/`hasAttribute` などは同じように使える。
+  - 変わる点: `clean()` の実行中に、作業用 DOM の画像などの読み込みが起きなくなる（元の動作では、捨てる予定の要素の画像まで取得していた）。表示側の動作には影響しない。`clean()` を呼ぶたびに空の文書を 1 つ作るので、わずかにコストが増えるが、実用上は問題にならない程度である。
+  - 設定の関数の中で `el.ownerDocument` が表示中の `document` であることに頼っている場合は、結果が変わる可能性がある（通常の使い方では起きない）。
+
+#### 4. 注意点（修正していないもの・残る制約）
+
+- 本修正は「サニタイズ中に作業用 DOM でスクリプトが実行される」問題だけを直している。次のものは、設定に依存する問題として修正していない。
+  - 属性を `true` で許可した場合の URL スキームの検査がない: 例えば `a: { href: true }` では `href="javascript:..."` もそのまま通る。必要なら、設定側で href に関数を渡して `http:`/`https:`/`mailto:` などだけを許可する。
+  - タグを `true` で許可すると、`on*` 属性を含むすべての属性が残る（例: `small: true`）。信頼できない入力に使う場合は、タグを `true` にしない。
+  - `<template>` を許可すると、TreeWalker は `template.content` を辿らないため、中身が検査されずに残る。`template` は許可しないこと。
+  - 戻り値の HTML 文字列を別の場所で再度解析すると、解析のされ方が変わる（mutation XSS）可能性は、許可するタグの組み合わせによっては残る。許可するタグは、必要最小限の書式用タグにとどめるのが望ましい。
+- `document.implementation.createHTMLDocument` が使えない極めて古いブラウザでは動かない（README のとおり、もともと Node.js では使えないブラウザ専用のライブラリである）。
+- README にもあるとおり、本ライブラリは信頼できない入力向けに十分に検証されたものではない。信頼できない HTML を扱う場合は、DOMPurify のような専用のサニタイザの利用や、サーバ側での検査も合わせて検討すること。
+
+### 修正したコード: html-janitor.js
+
+```javascript
+(function (root, factory) {
+  if (typeof define === 'function' && define.amd) {
+    define('html-janitor', factory);
+  } else if (typeof exports === 'object') {
+    module.exports = factory();
+  } else {
+    root.HTMLJanitor = factory();
+  }
+}(this, function () {
+
+  /**
+   * @param {Object} config.tags Dictionary of allowed tags.
+   * @param {boolean} config.keepNestedBlockElements Default false.
+   */
+  function HTMLJanitor(config) {
+
+    var tagDefinitions = config['tags'];
+    var tags = Object.keys(tagDefinitions);
+
+    var validConfigValues = tags
+      .map(function(k) { return typeof tagDefinitions[k]; })
+      .every(function(type) { return type === 'object' || type === 'boolean' || type === 'function'; });
+
+    if(!validConfigValues) {
+      throw new Error("The configuration was invalid");
+    }
+
+    this.config = config;
+  }
+
+  // TODO: not exhaustive?
+  var blockElementNames = ['P', 'LI', 'TD', 'TH', 'DIV', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'PRE'];
+  function isBlockElement(node) {
+    return blockElementNames.indexOf(node.nodeName) !== -1;
+  }
+
+  var inlineElementNames = ['A', 'B', 'STRONG', 'I', 'EM', 'SUB', 'SUP', 'U', 'STRIKE'];
+  function isInlineElement(node) {
+    return inlineElementNames.indexOf(node.nodeName) !== -1;
+  }
+
+  HTMLJanitor.prototype.clean = function (html) {
+    // 【XSS 修正】作業用の div を、表示中の document（スクリプト・イベントハンドラ・
+    // 画像などの読み込みが有効）ではなく、createHTMLDocument で作った
+    // 閲覧コンテキストを持たない不活性な文書の中に作る。
+    // この文書の要素に innerHTML で HTML を入れても、<img src onerror> などの
+    // リソース取得やイベントハンドラ、<script> は実行されないため、
+    // サニタイズ前の HTML を解析する時点でのスクリプト実行を防げる。
+    var sandboxDocument = document.implementation.createHTMLDocument('');
+    var sandbox = sandboxDocument.createElement('div');
+    sandbox.innerHTML = html;
+
+    this._sanitize(sandbox);
+
+    return sandbox.innerHTML;
+  };
+
+  HTMLJanitor.prototype._sanitize = function (parentNode) {
+    var treeWalker = createTreeWalker(parentNode);
+    var node = treeWalker.firstChild();
+    if (!node) { return; }
+
+    do {
+      if (node.nodeType === Node.TEXT_NODE) {
+        // If this text node is just whitespace and the previous or next element
+        // sibling is a block element, remove it
+        // N.B.: This heuristic could change. Very specific to a bug with
+        // `contenteditable` in Firefox: http://jsbin.com/EyuKase/1/edit?js,output
+        // FIXME: make this an option?
+        if (node.data.trim() === ''
+            && ((node.previousElementSibling && isBlockElement(node.previousElementSibling))
+                 || (node.nextElementSibling && isBlockElement(node.nextElementSibling)))) {
+          parentNode.removeChild(node);
+          this._sanitize(parentNode);
+          break;
+        } else {
+          continue;
+        }
+      }
+
+      // Remove all comments
+      if (node.nodeType === Node.COMMENT_NODE) {
+        parentNode.removeChild(node);
+        this._sanitize(parentNode);
+        break;
+      }
+
+      var isInline = isInlineElement(node);
+      var containsBlockElement;
+      if (isInline) {
+        containsBlockElement = Array.prototype.some.call(node.childNodes, isBlockElement);
+      }
+
+      // Block elements should not be nested (e.g. <li><p>...); if
+      // they are, we want to unwrap the inner block element.
+      var isNotTopContainer = !! parentNode.parentNode;
+      var isNestedBlockElement =
+            isBlockElement(parentNode) &&
+            isBlockElement(node) &&
+            isNotTopContainer;
+
+      var nodeName = node.nodeName.toLowerCase();
+
+      var allowedAttrs = getAllowedAttrs(this.config, nodeName, node);
+
+      var isInvalid = isInline && containsBlockElement;
+
+      // Drop tag entirely according to the whitelist *and* if the markup
+      // is invalid.
+      if (isInvalid || shouldRejectNode(node, allowedAttrs)
+          || (!this.config.keepNestedBlockElements && isNestedBlockElement)) {
+        // Do not keep the inner text of SCRIPT/STYLE elements.
+        if (! (node.nodeName === 'SCRIPT' || node.nodeName === 'STYLE')) {
+          while (node.childNodes.length > 0) {
+            parentNode.insertBefore(node.childNodes[0], node);
+          }
+        }
+        parentNode.removeChild(node);
+
+        this._sanitize(parentNode);
+        break;
+      }
+
+      // Sanitize attributes
+      for (var a = 0; a < node.attributes.length; a += 1) {
+        var attr = node.attributes[a];
+
+        if (shouldRejectAttr(attr, allowedAttrs, node)) {
+          node.removeAttribute(attr.name);
+          // Shift the array to continue looping.
+          a = a - 1;
+        }
+      }
+
+      // Sanitize children
+      this._sanitize(node);
+
+    } while ((node = treeWalker.nextSibling()));
+  };
+
+  function createTreeWalker(node) {
+    // 【XSS 修正に伴う変更】走査対象の node は不活性な文書（sandboxDocument）に属するため、
+    // その node 自身の ownerDocument から TreeWalker を作る（表示中の document には触れない）。
+    return node.ownerDocument.createTreeWalker(node,
+                                     NodeFilter.SHOW_TEXT | NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_COMMENT,
+                                     null, false);
+  }
+
+  function getAllowedAttrs(config, nodeName, node){
+    if (typeof config.tags[nodeName] === 'function') {
+      return config.tags[nodeName](node);
+    } else {
+      return config.tags[nodeName];
+    }
+  }
+
+  function shouldRejectNode(node, allowedAttrs){
+    if (typeof allowedAttrs === 'undefined') {
+      return true;
+    } else if (typeof allowedAttrs === 'boolean') {
+      return !allowedAttrs;
+    }
+
+    return false;
+  }
+
+  function shouldRejectAttr(attr, allowedAttrs, node){
+    var attrName = attr.name.toLowerCase();
+
+    if (allowedAttrs === true){
+      return false;
+    } else if (typeof allowedAttrs[attrName] === 'function'){
+      return !allowedAttrs[attrName](attr.value, node);
+    } else if (typeof allowedAttrs[attrName] === 'undefined'){
+      return true;
+    } else if (allowedAttrs[attrName] === false) {
+      return true;
+    } else if (typeof allowedAttrs[attrName] === 'string') {
+      return (allowedAttrs[attrName] !== attr.value);
+    }
+
+    return false;
+  }
+
+  return HTMLJanitor;
+
+}));
+```
+
+---
