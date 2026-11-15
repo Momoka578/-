@@ -1,0 +1,293 @@
+
+## No.22 CVE-2016-10735 bootstrap（twbs/bootstrap v4.0.0-beta、js/src/util.js の Util.getSelectorFromElement）
+- 対象: https://github.com/ossf-cve-benchmark/ossf-cve-benchmark/blob/main/CVEs/CVE-2016-10735.json
+- XSS 種別: DOM-base（source・sink は "第2回xssの詳細"）
+- 修正したファイル: util.js
+
+### 修正コードの説明
+
+#### No.22 CVE-2016-10735 修正コードの説明（twbs/bootstrap v4.0.0-beta `js/src/util.js`）
+
+修正ファイル: `fix01_util.js`（元: `js/src/util.js`、prePatch コミット `ba6a6f13691000ffaf22ef8e731513737659447f`）
+
+#### 1. 修正の方針
+
+##### 防ぐ脆弱性（source → sink）
+
+- **source**: `Util.getSelectorFromElement(element)` が読み取る、トリガー要素の属性値
+  - 114行 `element.getAttribute('data-target')`
+  - 116行 `element.getAttribute('href')`（data-target が無いか `#` のとき）
+- **sink**: 120行 `const $selector = $(selector)`
+  - jQuery 3 の `$()` は、文字列が `<` で始まり `>` で終わるとき、または空白の後に `<...>` が来る形のとき、CSS セレクタではなく **HTML として解析して DOM 要素を作る**。
+  - 作られた要素が onerror 属性付きの img 要素なら、文書に挿入されていなくても画像の読み込みに失敗した時点でスクリプトが実行される。
+- **二次的な sink**: 121行で `$selector.length > 0` が真になり、HTML の文字列がそのまま「セレクタ」として返される。そのため、呼び出し側の `$(selector)`（collapse.js 84/230/322/371行、modal.js 542行、carousel.js 464行、alert.js 93行、dropdown.js 353行、scrollspy.js 131行、tab.js 116行）でももう一度 HTML として解析される。
+
+##### どこで、どう防ぐか
+
+- **場所**: sink の 120行（`getSelectorFromElement` の中の存在確認）だけを直す。
+- **方法**: 存在確認を `$(selector)` から `document.querySelector(selector)` に置き換える。
+  - `document.querySelector()` は引数を **CSS セレクタとしてだけ** 解釈し、HTML として解析することはない。
+  - HTML の形の文字列（先頭が `<`）は CSS セレクタとして文法に合わないので、`querySelector` は `SyntaxError` を投げる。それを既存の `catch` で受けて `null` を返す。
+  - CSS セレクタとして正しい文字列は、先頭（空白を除く）が `<` になることがない。そのため、この関数が返す文字列は、呼び出し側で `$()` に渡しても HTML として解釈されない。
+
+##### この方法を選んだ理由
+
+- **すべての呼び出し元をまとめて守れる**: 10 か所近い呼び出し元は、どれも「`getSelectorFromElement` が返した文字列を `$()` に渡す」という同じ形をしている。入口の 1 か所でセレクタとして正しいものだけを通せば、呼び出し元を 1 つずつ直す必要がない（修正が最小になる）。
+- **ブラックリストより確実**: 「`<` で始まるものを拒否する」のような文字のチェックは、jQuery の HTML 判定の規則（先頭の空白の扱いなど）と少しでもずれると抜け道ができる。ブラウザ自身の CSS セレクタの解析器で検証すれば、「セレクタとして正しい」ことが保証される。
+- **HTML エスケープでは直せない**: 属性値はサーバー側で正しくエスケープされていても、`getAttribute()` の時点で `<` に戻る。問題は「データ（セレクタ）を HTML として解釈する API に渡している」ことなので、解釈する API を変えるのが正しい直し方になる。
+- **戻り値の意味が変わらない**: 関数の戻り値（「セレクタ文字列」または `null`）の型と意味はそのままなので、呼び出し側を変える必要がない。
+
+#### 2. 変更箇所ごとの説明
+
+##### ファイル: `js/src/util.js`（修正版: `fix01_util.js`）
+
+変更したのは `getSelectorFromElement` の `try` ブロックの中だけ。ほかの行は元のコードと同じ。
+
+**修正前（元のコード 119〜124行）**
+
+```js
+      try {
+        const $selector = $(selector)
+        return $selector.length > 0 ? selector : null
+      } catch (error) {
+        return null
+      }
+```
+
+**修正後（fix01_util.js 119〜129行）**
+
+```js
+      try {
+        // XSS 修正: 以前は $(selector) で存在確認をしていた。jQuery の $() は
+        // "<" で始まる文字列を HTML として解析して要素を作るため、data-target / href に
+        // HTML（例: onerror 付きの img タグ）が入っているとスクリプトが実行されていた。
+        // document.querySelector() は文字列を CSS セレクタとしてだけ解釈し、HTML を
+        // 解析しない。HTML の形の文字列はセレクタとして不正なので SyntaxError になり、
+        // 下の catch で null を返す。これで呼び出し側の $(selector) にも HTML が渡らない。
+        return document.querySelector(selector) ? selector : null
+      } catch (error) {
+        return null
+      }
+```
+
+**各行の説明**
+
+| 行（修正版） | 内容 | 役割 |
+|---|---|---|
+| 120〜125行 | 日本語コメント（追加） | 修正の理由と、XSS が防げる仕組みを説明する。 |
+| 126行 | `return document.querySelector(selector) ? selector : null`（変更） | 元の 120行 `const $selector = $(selector)` と 121行 `return $selector.length > 0 ? selector : null` の 2 行を置き換えた。`selector` を CSS セレクタとして文書から探し、1 つでも要素があれば `selector` を、無ければ `null` を返す。HTML の解析や要素の生成は行わない。 |
+| 127〜129行 | `catch (error) { return null }`（元のまま） | `querySelector` が不正なセレクタ（HTML の形の文字列、空文字列、`#` だけ、URL など）で投げる `SyntaxError` を受けて `null` を返す。 |
+
+**XSS が防げる理由**
+
+1. sink だった `$(selector)` を、HTML を解析しない `document.querySelector(selector)` に置き換えたので、120行で HTML の要素が作られることがなくなる。
+2. HTML の形の文字列は `SyntaxError` → `null` になるので、呼び出し側の `if (selector)` や `selector !== null` の判定で処理が止まる（collapse.js 371行の `$(null)` は空の jQuery オブジェクトになるだけ）。二次的な sink にも HTML の文字列が届かない。
+
+#### 3. 修正の結果
+
+##### 攻撃例の入力の扱い
+
+- 攻撃例: `data-toggle="collapse"` 付きのボタンの `data-target` に、onerror 属性付きの img タグの文字列が入っている。
+- **修正前**: クリック時（または Collapse の初期化時）に 120行の `$(selector)` が img 要素を作り、onerror のスクリプトが実行される。121行でその文字列が返され、呼び出し側の `$(selector)` でもう一度実行される。
+- **修正後**: 126行の `document.querySelector(...)` は、先頭が `<` の文字列を CSS セレクタとして解析できないので `SyntaxError` を投げる。`catch` で `null` が返り、要素は作られず、スクリプトは実行されない。呼び出し側も `null` を受けて何もしない（collapse は開閉しない、modal は開かない、など）。
+- `href` に同じ文字列が入っている場合（scrollspy のナビのリンクなど）も、同じように `null` になる。
+
+##### 正常な入力での動作への影響
+
+変わらない点:
+
+- Bootstrap の文書で使う形（`data-target="#myModal"`、`href="#collapseOne"`、`data-target=".multi-collapse"` など）は CSS セレクタとして正しいので、要素があれば今までどおり同じ文字列が返り、呼び出し側の動作も同じ。
+- 複数の要素に当たるセレクタ（`.multi-collapse` など）も、`querySelector` は最初の要素を返すので「存在する」と判定され、同じ文字列が返る。呼び出し側は今までどおり `$(selector)` で全部の要素を扱える。
+- 当たる要素が無いとき、空文字列、`#` だけ、`http://...` のような URL は、修正前も `null`（要素が無い、または jQuery の構文エラー）で、修正後も `null`（要素が無い、または `SyntaxError`）になる。
+
+変わる点:
+
+- jQuery（Sizzle）独自の拡張セレクタ（`:visible`、`:first`、`:eq(0)`、`:contains(...)` など）は標準の CSS セレクタではないので、`querySelector` が `SyntaxError` を投げ、`null` になる。data-target にこのような拡張セレクタを書いていたページでは、トリガーが反応しなくなる。Bootstrap の通常の使い方（id やクラスの指定）には影響しない。
+- `document.querySelector` が必要になるが、Bootstrap 4 が対象とするブラウザ（IE10 以降など）はすべて対応している。
+
+#### 4. 注意点
+
+- **今回直していない、同じ種類の箇所**（data 属性などの値を `$()` に渡している箇所。`getSelectorFromElement` を通らないため、この修正では防げない）:
+  - `collapse.js` 291行 `$(this._config.parent)`（`data-parent` 属性の値）
+  - `scrollspy.js` 80〜82行で `this._config.target`（`data-target` 属性の値）から作った `this._selector` を、123行で `$(this._selector)` に渡している
+  - `tooltip.js` 285行 `$(this.config.container)`（`data-container` 属性の値）
+  - これらも利用者が属性値を決められる場合は XSS になりうる。直す場合は、同じように `document.querySelector()` で検証してから `$()` に渡すか、文字列の場合は `$(document).find(value)` のように必ずセレクタとして扱う形にする必要がある。
+- `tooltip` / `popover` の `template` オプションや、`html: true` のときの `title` / `content` は、設計上 HTML として扱われる。ここに信頼できない値を入れないことは、Bootstrap を使う側の責任になる（今回の修正の対象外）。
+- この修正は「セレクタとして正しい文字列だけを通す」ものであり、属性値でページ内の任意の要素を指せること自体（例: 攻撃者が別のモーダルを開かせる）は防がない。これは XSS ではなく、Bootstrap の仕様どおりの動作である。
+- 配布用のビルド済みファイル（`dist/js/bootstrap.js` など）は `js/src` から生成されるので、修正後に再ビルドが必要。
+
+### 修正したコード: util.js
+
+```javascript
+/**
+ * --------------------------------------------------------------------------
+ * Bootstrap (v4.0.0-beta): util.js
+ * Licensed under MIT (https://github.com/twbs/bootstrap/blob/master/LICENSE)
+ * --------------------------------------------------------------------------
+ */
+
+const Util = (($) => {
+
+
+  /**
+   * ------------------------------------------------------------------------
+   * Private TransitionEnd Helpers
+   * ------------------------------------------------------------------------
+   */
+
+  let transition = false
+
+  const MAX_UID = 1000000
+
+  const TransitionEndEvent = {
+    WebkitTransition : 'webkitTransitionEnd',
+    MozTransition    : 'transitionend',
+    OTransition      : 'oTransitionEnd otransitionend',
+    transition       : 'transitionend'
+  }
+
+  // shoutout AngusCroll (https://goo.gl/pxwQGp)
+  function toType(obj) {
+    return {}.toString.call(obj).match(/\s([a-zA-Z]+)/)[1].toLowerCase()
+  }
+
+  function isElement(obj) {
+    return (obj[0] || obj).nodeType
+  }
+
+  function getSpecialTransitionEndEvent() {
+    return {
+      bindType: transition.end,
+      delegateType: transition.end,
+      handle(event) {
+        if ($(event.target).is(this)) {
+          return event.handleObj.handler.apply(this, arguments) // eslint-disable-line prefer-rest-params
+        }
+        return undefined // eslint-disable-line no-undefined
+      }
+    }
+  }
+
+  function transitionEndTest() {
+    if (window.QUnit) {
+      return false
+    }
+
+    const el = document.createElement('bootstrap')
+
+    for (const name in TransitionEndEvent) {
+      if (typeof el.style[name] !== 'undefined') {
+        return {
+          end: TransitionEndEvent[name]
+        }
+      }
+    }
+
+    return false
+  }
+
+  function transitionEndEmulator(duration) {
+    let called = false
+
+    $(this).one(Util.TRANSITION_END, () => {
+      called = true
+    })
+
+    setTimeout(() => {
+      if (!called) {
+        Util.triggerTransitionEnd(this)
+      }
+    }, duration)
+
+    return this
+  }
+
+  function setTransitionEndSupport() {
+    transition = transitionEndTest()
+
+    $.fn.emulateTransitionEnd = transitionEndEmulator
+
+    if (Util.supportsTransitionEnd()) {
+      $.event.special[Util.TRANSITION_END] = getSpecialTransitionEndEvent()
+    }
+  }
+
+
+  /**
+   * --------------------------------------------------------------------------
+   * Public Util Api
+   * --------------------------------------------------------------------------
+   */
+
+  const Util = {
+
+    TRANSITION_END: 'bsTransitionEnd',
+
+    getUID(prefix) {
+      do {
+        // eslint-disable-next-line no-bitwise
+        prefix += ~~(Math.random() * MAX_UID) // "~~" acts like a faster Math.floor() here
+      } while (document.getElementById(prefix))
+      return prefix
+    },
+
+    getSelectorFromElement(element) {
+      let selector = element.getAttribute('data-target')
+      if (!selector || selector === '#') {
+        selector = element.getAttribute('href') || ''
+      }
+
+      try {
+        // XSS 修正: 以前は $(selector) で存在確認をしていた。jQuery の $() は
+        // "<" で始まる文字列を HTML として解析して要素を作るため、data-target / href に
+        // HTML（例: onerror 付きの img タグ）が入っているとスクリプトが実行されていた。
+        // document.querySelector() は文字列を CSS セレクタとしてだけ解釈し、HTML を
+        // 解析しない。HTML の形の文字列はセレクタとして不正なので SyntaxError になり、
+        // 下の catch で null を返す。これで呼び出し側の $(selector) にも HTML が渡らない。
+        return document.querySelector(selector) ? selector : null
+      } catch (error) {
+        return null
+      }
+    },
+
+    reflow(element) {
+      return element.offsetHeight
+    },
+
+    triggerTransitionEnd(element) {
+      $(element).trigger(transition.end)
+    },
+
+    supportsTransitionEnd() {
+      return Boolean(transition)
+    },
+
+    typeCheckConfig(componentName, config, configTypes) {
+      for (const property in configTypes) {
+        if (Object.prototype.hasOwnProperty.call(configTypes, property)) {
+          const expectedTypes = configTypes[property]
+          const value         = config[property]
+          const valueType     = value && isElement(value) ?
+                                'element' : toType(value)
+
+          if (!new RegExp(expectedTypes).test(valueType)) {
+            throw new Error(
+              `${componentName.toUpperCase()}: ` +
+              `Option "${property}" provided type "${valueType}" ` +
+              `but expected type "${expectedTypes}".`)
+          }
+        }
+      }
+    }
+  }
+
+  setTransitionEndSupport()
+
+  return Util
+
+})(jQuery)
+
+export default Util
+```
+
+---
