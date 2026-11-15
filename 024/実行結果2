@@ -14,26 +14,16 @@
 - 使用トークン量（判定）: 新規 25,318（入力 18 ／ キャッシュ作成 17,221 ／ 出力〔推定〕 8,079）、キャッシュ読込 234,221、総処理 259,539、リクエスト 9 回（出力の記録値 7,131）
 
 ---
+## No.24 CVE-2017-1000427 marked 0.3.6（markedjs/marked, lib/marked.js の Renderer.prototype.link）
+- 対象: https://github.com/ossf-cve-benchmark/ossf-cve-benchmark/blob/main/CVEs/CVE-2017-1000427.json
 
-### No.25 CVE-2017-1001004 typed-function（typed-function.js）
-- 対象: https://github.com/ossf-cve-benchmark/ossf-cve-benchmark/blob/main/CVEs/CVE-2017-1001004.json（ossf-cve-benchmark のテストケース（prePatch のコミットのコード））
-- 判定: **脆弱性あり**（JavaScript コードインジェクション CWE-94。ブラウザで使うと XSS CWE-79 に相当。原因は生成コードへ埋め込む文字列のエスケープ・検証の欠如 CWE-116）
-- XSS に該当: 種別・source・sink は "第2回xssの詳細"、修正コードは "第2回修正版コード" を参照
-- 根拠（エージェントの判定記録から）:
-  - 根拠（prePatch 9a8cac3 の typed-function.js を静的に読んで判定。PoC の実行は権限で拒否されたため未実行）:
-  - _typed(name, signatures)（1079行）は、型付き関数の本体を JavaScript のソース文字列として組み立て、1115行 `new Function(refs.name, 'createError', body)` で評価し、1116行 `factory(refs, createError)` で即座に実行する。
-  - 関数名 name はエスケープも検証もせずにソースへ連結される。
-    - 1100行 `var _name = name || '';`
-    - 1102行 `code.push('function ' + _name + '(' + _args.join(', ') + ') {');` … 関数名の位置にそのまま入る
-    - 1104行 `code.push('  var name = \'' + _name + '\';');` … シングルクォート文字列の中にそのまま入る
-    - 1111行 `'return ' + code.join('\n')` で body になり、1115行で評価される。
-  - name の入口: 公開 API `typed(name: string, signatures: Object)`（1242行 'string, Object': _typed）で、呼び出し側が渡した任意の文字列がそのまま _typed に届く。typed(signatures) / typed(...fns) の経路でも getName()（64〜87行）が既存の型付き関数の fn.name を引き継いで 1240・1277行で _typed に渡す。
-  - 入力例: name を「f(){}, <任意の式>, function g」の形にすると、1102行は `return function f(){}, <任意の式>, function g(arg0) {` となり、return のカンマ式として <任意の式> が 1116行の factory 実行時（＝typed() を呼んだ時点）に実行される。1104行の側はクォートの中なので、ペイロードに ' を含めなければ構文は壊れない。name に ' を入れるだけでも構文エラーになる。
-  - シグネチャ文字列も同じ問題がある: シグネチャのキー（836〜839行）→ Signature（399〜402行、',' で分割）→ Param（199〜216行、'|' で分割して trim）を経て、625行 `'... // signature: ' + this.params.join(', ')` で行コメントに入る。型名の途中に改行を入れればコメントから抜けて任意のコードを書ける。'...any|<改行を含む文字列>' のような可変長 any 型の引数では getTypeTest()（33行、未知の型なら例外）を通らない（674〜682行）ので、登録外の型名でも生成コードまで届く。
-  - そのほか、668〜670行（conversion.from を // type: コメントへ）、719・820行（型名を '...' 文字列へ）もエスケープなしで連結している。ただしこれらは addType / addConversion で登録した型名・変換に限られる（開発者が決める値）。
-  - 影響: アプリが利用者に関数名やシグネチャを決めさせて typed() に渡す場合（例: 数式言語のライブラリが利用者定義の関数を typed で作る場合）、攻撃者は任意の JavaScript を実行できる。Node.js ではサーバ上の任意コード実行、ブラウザではページのオリジンでのスクリプト実行（XSS）になる。
-  - XSS 以外の修正案（参考）: Node.js 側の RCE も同じ修正（name とシグネチャ文字列の検証・エスケープ）で防げる。
-- 使用トークン量（判定）: 新規 38,919（入力 12 ／ キャッシュ作成 27,384 ／ 出力〔推定〕 11,523）、キャッシュ読込 163,161、総処理 202,080、リクエスト 6 回（出力の記録値 11,110）
-- 注記（親）: エージェントは無害な実験コードでの動作確認を試みたが、ダウンロードしたコードの実行は Claude Code の権限の判定で拒否されたため、判定と修正はコードを読んだだけで行った（エージェントの報告）。
+- **XSS 種別**: その他。marked はライブラリで、sanitize オプションの URL 検査をすり抜ける問題である。入力の保存・反射はライブラリを使うアプリ側で決まり（コメントなど保存された Markdown を表示すればストア型として現れる）、さらにスクリプトはページ内に挿入されるのではなく、リンクのクリックで開く data: URL の文書の中で実行されるため、反射型・ストア型・DOM-base のどれにもそのまま当てはまらない。
+- **source**: marked(src, opt)（1147 行、1219 行）に渡される利用者の Markdown 文字列。インラインリンクの正規表現 inline.link / inline._href（455 行、467 行）で取り出される href（InlineLexer.prototype.output の 619-625 行の cap[2]）、または参照リンク定義の href（371-374 行の cap[2]）。
+- **伝播経路**: Lexer.lex → Parser.parse（1219 行）→ InlineLexer.prototype.output（619-627 行 / 631-644 行）→ InlineLexer.prototype.outputLink（702-708 行。703 行の escape(link.href) は < > " ' & をエスケープするだけで、data: スキームはそのまま残る）→ Renderer.prototype.link（869 行）。sanitize 時の検査（872-880 行）で data: が止められない。
+- **sink**: Renderer.prototype.link の 882 行 out = '<a href="' + href + '"'（a 要素の href 属性）。
+- **脆弱性の位置**: sink 側。source の Markdown はどこから来てもよく、出力直前の Renderer.prototype.link の URL スキーム検査（878 行）が javascript:/vbscript: だけを禁止するブラックリストで data: を見落としていることが原因。
+- **攻撃例**: 攻撃者が、sanitize: true の marked で表示されるコメント欄などに、リンク先を「script を含む HTML を base64 にした data:text/html URL」にした Markdown リンクを投稿する。marked はこれを a 要素として出力し、閲覧者がリンクをクリックすると data: 文書の中のスクリプトが実行される（古いブラウザではサイトのオリジンで Cookie の窃取などが可能）。
 
 ---
+
+
