@@ -1,0 +1,187 @@
+# No.2 SARD 501353 news-edit.jsp（NewsEditServlet.java / NewsServiceImpl.java / home.jsp）
+- 対象: https://samate.nist.gov/SARD/test-cases/501353/versions/1.0.1
+- XSS 種別: ストア型（source・sink は "第2回xssの詳細"）
+- 修正したファイル: news-edit.jsp
+
+### 修正コードの説明
+
+#### No.2（SARD 501353）修正コードの説明
+
+対象ファイル: `dspace-jspui/src/main/webapp/dspace-admin/news-edit.jsp`（修正版: `fix01_news-edit.jsp`）
+
+##### 1. 修正の方針
+
+- **防ぐ脆弱性（source → sink）**
+  - source: `NewsEditServlet.java` 75行目。submit_save 時の POST パラメータ `news` を `request.getParameter("news")` で受け取る。
+  - 伝播: 同 78行目の `newsService.writeNewsFile(position, news)` が、`NewsServiceImpl.java` 119〜122行目で `config/news-top.html` などのファイルに無加工で保存する。後の submit_edit リクエストで、`NewsEditServlet.java` 60行目の `readNewsFile(position)` がファイルを読み戻し、66行目でリクエスト属性 `news` に入れる。`news-edit.jsp` 30行目がその属性を取り出す。
+  - sink: `news-edit.jsp` 68行目 `<textarea ...><%= news %></textarea>`。保存された本文をエスケープせずに出力している。
+  - 本文に `</textarea>` が含まれると、そこで textarea が閉じる。その後ろに続く script 要素などが、ニュース編集画面を開いた管理者のブラウザで実行される（ストア型 XSS）。
+- **どこで、どう防ぐか**: sink（`news-edit.jsp` の textarea への出力）で、`Utils.addEntities()` による HTML エスケープをかける。
+- **この方法を選んだ理由**
+  - ニュース本文は、管理者が自由に書く文章である。入力時（source 側）に特定の文字を拒否したり削ったりすると、正当な本文まで壊れてしまう。出力する文脈（HTML の textarea の中）に合わせて、出力時にエスケープするのが正しい対策になる。
+  - 同じニュース本文を表示する `home.jsp`（77行目・168行目）は、すでに `Utils.addEntities()` でエスケープしている。同じ関数を使えば、コード全体で出力のしかたがそろう。
+  - `Utils.addEntities()` は DSpace 標準のユーティリティである。上流の実装では `com.coverity.security.Escape.html()` を呼び、HTML の特殊文字を文字参照に変換する。新しい依存を増やさずに済む。
+  - 修正は 1 行の出力の変更と import 1 行だけで、最小限に収まる。
+
+##### 2. 変更箇所ごとの説明
+
+###### 変更1: import の追加（修正版 25〜26行目）
+
+修正前（元の 23〜24行目の後には何もない）:
+
+```jsp
+<%@ page import="org.dspace.app.webui.servlet.admin.NewsEditServlet" %>
+<%@ page import="org.dspace.core.Constants" %>
+```
+
+修正後:
+
+```jsp
+<%@ page import="org.dspace.app.webui.servlet.admin.NewsEditServlet" %>
+<%@ page import="org.dspace.core.Constants" %>
+<%-- 【XSS修正】ニュース本文を HTML エスケープするために Utils（addEntities）を読み込む --%>
+<%@ page import="org.dspace.core.Utils" %>
+```
+
+- 25行目: 修正の理由を書いた JSP コメントである。`<%-- --%>` なので、HTML の出力には含まれない。
+- 26行目: `org.dspace.core.Utils` を import し、JSP の中で `Utils.addEntities()` を呼べるようにする。`home.jsp` 23行目と同じ import である。
+
+###### 変更2: textarea への出力のエスケープ（元の 68行目 → 修正版 74行目）
+
+修正前（68行目）:
+
+```jsp
+        <textarea class="form-control" name="news" rows="10" cols="50"><%= news %></textarea>
+```
+
+修正後（70〜74行目）:
+
+```jsp
+        <%-- 【XSS修正】修正前は <%= news %> とファイルの中身をそのまま出力しており、
+             本文中の </textarea> で textarea が閉じられ、後続のスクリプトが実行されていた。
+             Utils.addEntities() で & < > " ' / を文字参照に変換してから出力する。
+             textarea 内の文字参照はブラウザが元の文字に戻して表示・送信するため、編集内容は変わらない。 --%>
+        <textarea class="form-control" name="news" rows="10" cols="50"><%= Utils.addEntities(news) %></textarea>
+```
+
+- 70〜73行目: 修正の理由と内容を書いた JSP コメントである。HTML の出力には含まれない。
+- 74行目: `news` をそのまま出力せず、`Utils.addEntities(news)` を通してから出力する。
+  - `<` は `&lt;`、`>` は `&gt;`、`&` は `&amp;`、`"` は `&quot;`、`'` は `&#39;` などの文字参照に変わる。
+- **XSS が防げる理由**
+  - 本文中の `</textarea>` は `&lt;/textarea&gt;` として出力される。ブラウザはこれを textarea の終了タグと認識しないため、textarea が途中で閉じない。
+  - その後ろに続く `<script>` なども `&lt;script&gt;` となり、textarea の中の単なる文字として扱われる。スクリプトは実行されない。
+
+##### 3. 修正の結果
+
+- **攻撃例の入力の扱い**
+  - 攻撃者が CSRF などを使って、`</textarea>` に続けてスクリプトを含む文字列をニュースとして保存させたとする。管理者がニュース編集画面を開いても、その文字列は textarea の中にそのまま「文字」として表示されるだけで、スクリプトは実行されない。
+  - 管理者は表示された内容を見て、不審な本文に気づき、削除できる。
+- **正常な入力での動作への影響**
+  - 変わらない点（1）: textarea の中身は RCDATA である。ブラウザは `&lt;` などの文字参照を元の文字 `<` に戻して表示し、フォーム送信時も元の文字で送る。このため、通常の本文（HTML タグを含む本文も）は、修正前と同じ見た目で編集でき、同じ内容で保存される。
+  - 変わらない点（2）: `home.jsp` での表示（`Utils.addEntities()` によるエスケープ表示）は変わらない。
+  - 変わる点（改善）: 修正前は、本文に `&lt;` のような文字参照の文字列そのものがあると、textarea で `<` に変わって表示され、そのまま保存すると本文が書き換わってしまっていた。修正後は `&amp;lt;` として出力されるので、元の `&lt;` という文字列のまま正しく往復する。
+
+##### 4. 注意点
+
+- **修正していない出力**
+  - `news-edit.jsp` の hidden 項目 `position`（修正版 76行目、`value='<%= position %>'`）は、エスケープしないまま残している。
+  - `NewsServiceImpl.validate()` が `position` を許可リスト（`news-top.html`・`news-side.html` とそのロケール付きの名前）との完全一致に限っている。許可されない値は `readNewsFile()` で例外になり、JSP まで届かない。そのため、現状では XSS にならない。
+  - 許可リストの設定を変えたときに備えるなら、多層防御として `Utils.addEntities(position)` を使うのが望ましい。
+- **CSRF（CWE-352）**
+  - `NewsEditServlet` の POST 処理には CSRF トークンの確認がない。外部の攻撃者でも、管理者のブラウザを使ってニュースを書き換えられる。
+  - 今回は XSS 以外の脆弱性は修正しない方針のため、手を付けていない。根本的には、フォームに CSRF トークンを入れて、サーバー側で検証する必要がある。
+- **home.jsp 206行目**
+  - コミュニティの `short_description` を未エスケープで出力している。
+  - 上流 DSpace 6.2 の `community-list.jsp` も同じように生出力しており、HTML を許す既存の設計と考えられる。ニュースのデータの流れとは別の話なので、今回は修正していない。
+  - コミュニティ管理者を信頼しない運用では、別途エスケープを検討する必要がある。
+- **ニュースに HTML を使う機能**
+  - この版の `home.jsp` はニュースをエスケープして表示する。このため、編集画面の注意書き（`jsp.dspace-admin.news-edit.text3`「HTML タグで書式を付けられる」）とは違い、HTML タグは文字としてそのまま表示される。
+  - これは今回の修正の前からの挙動であり、今回の修正では変えていない。
+
+### 修正したコード: news-edit.jsp
+
+```jsp
+<%--
+
+    The contents of this file are subject to the license and copyright
+    detailed in the LICENSE and NOTICE files at the root of the source
+    tree and available online at
+
+    http://www.dspace.org/license/
+
+--%>
+<%--
+  - News Edit Form JSP
+  -
+  - Attributes:
+   --%>
+
+<%@ page contentType="text/html;charset=UTF-8" %>
+
+<%@ taglib uri="http://java.sun.com/jsp/jstl/fmt"
+    prefix="fmt" %>
+
+<%@ taglib uri="http://www.dspace.org/dspace-tags.tld" prefix="dspace" %>
+
+<%@ page import="org.dspace.app.webui.servlet.admin.NewsEditServlet" %>
+<%@ page import="org.dspace.core.Constants" %>
+<%-- 【XSS修正】ニュース本文を HTML エスケープするために Utils（addEntities）を読み込む --%>
+<%@ page import="org.dspace.core.Utils" %>
+
+<%
+    String position = (String)request.getAttribute("position");
+
+    //get the existing news
+    String news = (String)request.getAttribute("news");
+
+    if (news == null)
+    {
+        news = "";
+    }
+
+	request.setAttribute("LanguageSwitch", "hide");
+%>
+
+<dspace:layout style="submission" titlekey="jsp.dspace-admin.news-edit.title"
+               navbar="admin"
+               locbar="link"
+               parenttitlekey="jsp.administer"
+               parentlink="/dspace-admin">
+
+    <%-- <h1>News Editor</h1> --%>
+    <h1><fmt:message key="jsp.dspace-admin.news-edit.heading"/></h1>
+    <%-- <p>Add or edit text in the box below to have it appear
+    in the <strong><%= positionStr%></strong> of the DSpace home page.</p> --%>
+
+ <form action="<%= request.getContextPath() %>/dspace-admin/news-edit" method="post">
+
+    <p class="alert alert-info">
+<% if (position.contains("top"))
+   { %>
+    <fmt:message key="jsp.dspace-admin.news-edit.text.topbox"/>
+<% }
+   else
+   { %>
+    <fmt:message key="jsp.dspace-admin.news-edit.text.sidebar"/>
+<% } %>
+    </p>
+    <%-- <p>You may format the text using HTML tags, but please note that the HTML will not be validated here.</p> --%>
+    <p class="alert alert-warning"><fmt:message key="jsp.dspace-admin.news-edit.text3"/></p>
+
+        <%--  <td class="submitFormLabel">News:</td> --%>
+		<span class="col-md-2"><fmt:message key="jsp.dspace-admin.news-edit.news"/></span>
+        <%-- 【XSS修正】修正前は <%= news %> とファイルの中身をそのまま出力しており、
+             本文中の </textarea> で textarea が閉じられ、後続のスクリプトが実行されていた。
+             Utils.addEntities() で & < > " ' / を文字参照に変換してから出力する。
+             textarea 内の文字参照はブラウザが元の文字に戻して表示・送信するため、編集内容は変わらない。 --%>
+        <textarea class="form-control" name="news" rows="10" cols="50"><%= Utils.addEntities(news) %></textarea>
+
+        <input type="hidden" name="position" value='<%= position %>'/>
+        <%-- <input type="submit" name="submit_save" value="Save"> --%>
+        <input class="btn btn-primary" type="submit" name="submit_save" value="<fmt:message key="jsp.dspace-admin.general.save"/>" />
+        <%-- <input type="submit" name="cancel" value="Cancel"> --%>
+		<input class="btn btn-default" type="submit" name="cancel" value="<fmt:message key="jsp.dspace-admin.general.cancel"/>" />
+
+    </form>
+</dspace:layout>
+```
