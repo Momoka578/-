@@ -1,0 +1,478 @@
+## No.18 google/firing-range ToxicDomScripts.java（+ 配信する src/tests/dom/data/sources/*/*.tmpl・sinks/*.tmpl）
+- 対象: https://github.com/google/firing-range/blob/master/src/tests/dom/ToxicDomScripts.java
+- XSS 種別: DOM-base（source・sink は "第2回xssの詳細"）
+- 修正したファイル: sinks_documentWrite.tmpl、sinks_eval.tmpl、sinks_innerHtml.tmpl、sinks_js_html_sanitize_eval.tmpl、sources_postMessage_complexMessageDocumentWriteEval.tmpl、sources_postMessage_documentWrite.tmpl、sources_postMessage_eval.tmpl、sources_postMessage_improperOriginValidationWithPartialStringComparison.tmpl、sources_postMessage_improperOriginValidationWithRegExp.tmpl、sources_postMessage_innerHtml.tmpl
+- 注記（親）: エージェントは MARK END の後の確認（10 個の修正テンプレートの構文確認と、source と修正後の sink を連結した動作確認）の後、MARK REVISE を記録して説明ファイルの例を 1 か所直した（部分一致を通ってしまうオリジンの例）。修正コード本体は直していない。ここに載せた説明は直した後のもの。
+- 注記（親）: 同じ名前のテンプレート（sinks/eval.tmpl と sources/postMessage/eval.tmpl など）があるため、修正ファイルの名前は「fix01_」の後にパスの / を _ に置き換えた名前にしている（エージェントの判断）。
+
+### 修正コードの説明
+
+#### No.18 google/firing-range ToxicDomScripts.java の修正（DOM-based XSS）
+
+対象コミット: `4f991a6418b07a66cd63006f4a2bec27c84b72f4`
+
+##### 1. 修正の方針
+
+###### 防ぐ脆弱性（source → sink）
+
+`ToxicDomScripts.java`（`/dom/toxicdomscripts/<source>/<accessType>/<sink>`）は、リクエストパスで選んだ 2 つのテンプレート `src/tests/dom/data/sources/<source>/<accessType>.tmpl` と `src/tests/dom/data/sinks/<sink>.tmpl` を連結し（L61-70）、`text/javascript` として返します（L49）。このスクリプトは `/dom/toxicdom/external/...` のページ（`toxicdomexternal.tmpl` L4）から `<script src>` で読み込まれ、Firing Range のオリジンで実行されます。
+
+| source（攻撃者が操作できる値） | sink（危険な出力先） |
+|---|---|
+| `window.name`、`document.referrer`、`document.cookie`、`localStorage`／`sessionStorage` の `badValue`（`var payload = …` と `trigger(…)` で sink に渡る） | `sinks/eval.tmpl` の `eval`、`sinks/innerHtml.tmpl` の `innerHTML`、`sinks/documentWrite.tmpl` の `document.write`、`sinks/js_html_sanitize_eval.tmpl` の（誤ったエスケープ付きの）`eval` |
+| `postMessage` の `msg.data`（送信元を確認しない、または確認が不完全） | `sources/postMessage/*.tmpl` の中にある `eval`／`innerHTML`／`document.write` |
+
+###### どこで、どう防ぐか
+
+- **sink 側（主な対策）**: 4 つの sink テンプレートで、`eval`・`innerHTML`・`document.write` を `textContent`／`document.createTextNode` に置き換えます。値を「コード」や「HTML」として解釈させず、「文字列」として扱います。
+- **postMessage 系（source 側と sink 側の両方）**: 6 つのテンプレートで、
+  1. 送信元オリジンを**完全一致**で確認し、許可していないオリジンからのメッセージを無視します（同じオリジンだけ、または `https://www.google.com` だけ）。
+  2. 受け取ったデータを `eval`・`innerHTML`・`document.write` に渡さず、`JSON.parse`・`textContent`・DOM API（`createElement`／`setAttribute`／`src` プロパティ）で扱います。
+- **`ToxicDomScripts.java` は変更しません**。このサーブレットはユーザー入力を応答に埋め込みません。パスの値はテンプレートの選択にだけ使われ、`..` は `Templates.getTemplate`（Templates.java L61）で拒否されます。エラー応答も `text/plain` で HTML エスケープ済みです。XSS を起こすのは、サーブレットが配信する JavaScript（テンプレート）の中身なので、そこを直します。
+
+###### この方法を選んだ理由
+
+- DOM-based XSS では、サーバはユーザー入力に触れません。そのため、サーバ側のエスケープでは防げず、ブラウザ側で「信頼できない値を危険な sink に渡さない」ことが根本的な対策になります。
+- `eval` に渡す文字列は、HTML エスケープしても無害になりません（`js_html_sanitize_eval.tmpl` がその失敗例です）。文脈に合ったエスケープを毎回考えるより、**値を解釈しない API（`textContent` など）に切り替える**ほうが確実で、修正も 1 行ずつで済みます。
+- すべての source（window.name・referrer・Cookie・Storage）は sink テンプレートを通ります。そのため、sink の 4 ファイルを直せば、source と sink のどの組み合わせでも XSS が起きなくなります。postMessage 系だけは sink がテンプレートの中にあるので、個別に直します。
+- postMessage では、送信元を確認しないと、どのサイトからでもメッセージを送れます。そのため、オリジンの完全一致による確認を最初の防御とし、データを解釈しない sink を 2 つ目の防御とする、2 段の構成にしました。
+
+##### 2. 変更箇所ごとの説明
+
+修正ファイルは `fixes/` に置きました。元のファイル名には同じ名前のものがある（`sinks/eval.tmpl` と `sources/postMessage/eval.tmpl` など）ため、パスの `/` を `_` に置き換えた名前にしています。
+
+###### 2-1. `src/tests/dom/data/sinks/eval.tmpl` → `fix01_sinks_eval.tmpl`
+
+修正前（L2、L5-7）:
+```js
+eval(payload);
+...
+function trigger(payload) {
+  eval(payload);
+};
+```
+修正後（L3-4、L8、L11-14）:
+```js
+var evalOutput = document.createElement('div');
+document.documentElement.appendChild(evalOutput);
+...
+evalOutput.textContent = payload;
+...
+function trigger(payload) {
+  evalOutput.textContent = payload;
+};
+```
+- L3-4: 値を表示するための `div` を作り、ページに追加します。
+- L8（同期で呼ばれる部分）: `eval(payload)` の代わりに、`textContent` に代入します。`textContent` は文字列をそのままテキストノードにするだけなので、JavaScript としても HTML としても解釈されません。
+- L13（`setTimeout` から呼ばれる `trigger`）: 同様に `textContent` に代入します。
+- XSS が防げる理由: `window.name` などに JavaScript のコードを入れられても、画面に文字として出るだけで実行されません。`payload` が `undefined` の場合（Cookie が無いとき）は空文字になり、エラーにもなりません。
+
+###### 2-2. `src/tests/dom/data/sinks/innerHtml.tmpl` → `fix01_sinks_innerHtml.tmpl`
+
+修正前（L5、L9）: `div.innerHTML = payload;`
+修正後（L6、L11）: `div.textContent = payload;`
+- `innerHTML` は代入された文字列を HTML として解析します。そのため、`<img src=x onerror=…>` のようなタグを入れると、イベントハンドラが実行されます。
+- `textContent` に変えると、`<` や `>` も文字として表示されるだけになり、要素も属性も作られません。
+
+###### 2-3. `src/tests/dom/data/sinks/documentWrite.tmpl` → `fix01_sinks_documentWrite.tmpl`
+
+修正前（L2、L6）: `document.write(payload);`
+修正後（L6、L11）: `document.documentElement.appendChild(document.createTextNode(payload));`
+- `document.write` は文字列を HTML としてページに書き込むので、`<script>` やイベント属性を入れられます。
+- `document.createTextNode(payload)` は文字列からテキストノードを作るだけです。これを `appendChild` でページに追加しても、HTML として解釈されません。
+- L1-2 には、この方針を説明するコメントを追加しました。
+
+###### 2-4. `src/tests/dom/data/sinks/js_html_sanitize_eval.tmpl` → `fix01_sinks_js_html_sanitize_eval.tmpl`
+
+修正前（L3-5）:
+```js
+eval(payload.replace(/</g, '&lt;')
+            .replace(/&/g, '&amp;')
+            .replace(/>/g, '&gt;'));
+```
+修正後（L7-9）:
+```js
+var sanitizedOutput = document.createElement('div');
+sanitizedOutput.textContent = payload;
+document.documentElement.appendChild(sanitizedOutput);
+```
+- 元のコードは HTML 用のエスケープ（`<`・`&`・`>` の置き換え）をしてから `eval` しています。JavaScript のコードは `<`・`>`・`&` を使わなくても書けるので、このエスケープでは防げません。しかも `&lt;` に置き換えた後で `&` を `&amp;` に置き換えるため、処理の順序も間違っています。
+- L7-9: `eval` をやめ、値を `textContent` でテキストとして表示します。
+- L4-6 には、修正の理由をコメントで追加しました。
+
+###### 2-5. `src/tests/dom/data/sources/postMessage/eval.tmpl` → `fix01_sources_postMessage_eval.tmpl`
+
+修正前（L1-5）:
+```js
+var postMessageHandler = function(msg) {
+  var content = msg.data;
+  var msgObj = eval(content);
+
+  if (msgObj.isActive) {
+```
+修正後（L3-5、L9-14、L17）:
+```js
+  if (msg.origin !== window.location.origin) {
+    return;
+  }
+  ...
+  var msgObj;
+  try {
+    msgObj = JSON.parse(content);
+  } catch (e) {
+    return;
+  }
+  ...
+  if (msgObj && msgObj.isActive) {
+```
+- L3-5: 送信元オリジン（`msg.origin`）が自分のページのオリジンと完全に一致しない場合は、何もせずに終わります。これで、攻撃者のサイトから `window.open` や `iframe` 経由で送られたメッセージは処理されません。
+- L9-14: `eval(content)` を `JSON.parse(content)` に変えます。`JSON.parse` はデータ（オブジェクト・文字列・数値など）を作るだけで、関数呼び出しなどのコードは実行しません。JSON として読めないメッセージは `catch` で無視します。
+- L17: `JSON.parse('null')` の結果は `null` になるので、`msgObj` が存在するかも確認します（例外を防ぐための確認です）。
+
+###### 2-6. `src/tests/dom/data/sources/postMessage/innerHtml.tmpl` → `fix01_sources_postMessage_innerHtml.tmpl`
+
+修正前（L4）: `div.innerHTML = content.html;`
+修正後（L3-5、L10）:
+```js
+  if (msg.origin !== window.location.origin) {
+    return;
+  }
+  ...
+  div.textContent = content.html;
+```
+- L3-5: 2-5 と同じく、送信元オリジンを確認します。
+- L10: `innerHTML` を `textContent` に変え、受け取った `html` を HTML として解釈しないようにします。
+
+###### 2-7. `src/tests/dom/data/sources/postMessage/documentWrite.tmpl` → `fix01_sources_postMessage_documentWrite.tmpl`
+
+修正前（L3）:
+```js
+document.write('<scr' + 'ipt src="' + content.url +'"></scr' + 'ipt>');
+```
+修正後（L3-5、L10-18）:
+```js
+  if (msg.origin !== window.location.origin) {
+    return;
+  }
+  ...
+  var url = new URL(content.url, window.location.href);
+  if (url.origin !== window.location.origin) {
+    return;
+  }
+  var script = document.createElement('script');
+  script.src = url.href;
+  document.documentElement.appendChild(script);
+```
+- 元のコードには 2 つの問題があります。攻撃者が指定した URL のスクリプトを読み込むこと（外部の任意のコードが実行される）と、`content.url` に `"` を入れると属性を閉じて別の属性やタグを足せることです。
+- L3-5: 送信元オリジンを確認します。
+- L10: `new URL()` で URL を解析します。相対 URL は、今のページを基準に絶対 URL にします。
+- L11-13: 読み込むスクリプトのオリジンが自分のオリジンと同じでなければ中止します。`javascript:` や `data:` の URL はオリジンが `"null"` になるので、ここで弾かれます。
+- L16-18: HTML 文字列を連結せず、`createElement('script')` で要素を作り、`src` プロパティに URL を設定します。属性値を HTML として組み立てないので、引用符を閉じて別の属性やタグを足す攻撃はできません。
+
+###### 2-8. `src/tests/dom/data/sources/postMessage/complexMessageDocumentWriteEval.tmpl` → `fix01_sources_postMessage_complexMessageDocumentWriteEval.tmpl`
+
+修正前（L4、L6、L8）:
+```js
+    eval(msg.data.payload);
+    ...
+    document.write('<img href='+ msg.data.source + '>');
+    ...
+    document.write(msg.data.html);
+```
+修正後（L3-5、L10、L15-17、L20）:
+```js
+  if (msg.origin !== window.location.origin) {
+    return;
+  }
+  ...
+    console.debug('exec is not supported');
+  ...
+    const img = document.createElement('img');
+    img.setAttribute('href', msg.data.source);
+    document.body.appendChild(img);
+  ...
+    document.body.appendChild(document.createTextNode(msg.data.html));
+```
+- L3-5: 送信元オリジンを確認します。
+- L10（`exec`）: 受け取った文字列を `eval` で実行する命令は、受け付けないようにします。任意のコードを実行する機能は、安全には提供できないためです。
+- L15-17（`addImage`）: `'<img href=' + 値 + '>'` という HTML 文字列を作るのをやめます。元のコードでは、引用符のない属性値に空白や `>` を入れることで、`onerror` 属性や別のタグを足せました。`createElement('img')` と `setAttribute('href', …)` を使うと、値はただの属性値として扱われ、HTML として解析されません。元のコードの動作（`img` に `href` 属性を付ける）は変えていません。
+- L20（`addHtml`）: `document.write(HTML)` の代わりにテキストノードとして追加し、HTML として解釈しないようにします。
+
+###### 2-9. `src/tests/dom/data/sources/postMessage/improperOriginValidationWithPartialStringComparison.tmpl` → `fix01_sources_postMessage_improperOriginValidationWithPartialStringComparison.tmpl`
+
+修正前（L2-3）:
+```js
+  if (msg.origin.includes('www.google.com')) {
+    eval(msg.data);
+```
+修正後（L4、L6-8）:
+```js
+  if (msg.origin === 'https://www.google.com') {
+    var div = document.createElement('div');
+    div.textContent = msg.data;
+    document.documentElement.appendChild(div);
+```
+- L4: `includes`（部分一致）では、`https://www.google.com.attacker.example`（攻撃者のドメインのサブドメイン名に `www.google.com` を含むもの）や `https://www.google.com-attacker.example`（ドメイン名の途中に `www.google.com` を含むもの）も通ってしまいます。そのため、許可するオリジンと完全一致（`===`）で比較します。
+- L6-8: 許可したオリジンからのデータでも `eval` はせず、テキストとして表示します。許可したサイトに問題があった場合にも、こちらでコードが実行されないようにするためです。
+
+###### 2-10. `src/tests/dom/data/sources/postMessage/improperOriginValidationWithRegExp.tmpl` → `fix01_sources_postMessage_improperOriginValidationWithRegExp.tmpl`
+
+修正前（L2-4）:
+```js
+  const originRegExp = /https?:\/\/www.google.com/
+  if (msg.origin.match(originRegExp)) {
+    eval(msg.data);
+```
+修正後（L6-7、L9-11）:
+```js
+  const originRegExp = /^https:\/\/www\.google\.com$/;
+  if (originRegExp.test(msg.origin)) {
+    var div = document.createElement('div');
+    div.textContent = msg.data;
+    document.documentElement.appendChild(div);
+```
+- L6: 元の正規表現には、先頭 `^` と末尾 `$` がありませんでした。そのため、`https://www.google.com.attacker.example` のように前後に文字が付いたオリジンにも一致しました。また、`.` をエスケープしていないので任意の 1 文字に一致し、`https://wwwXgoogle.com` なども通りました。`^…$` で全体一致にし、`.` を `\.` にします。あわせて、通信路で改ざんされうる `http` は許可せず、`https` だけにします。
+- L7: 一致したかどうかの判定には `test` を使います（意味は元の `match` と同じです）。
+- L9-11: 2-9 と同じく、`eval` をやめてテキストとして表示します。
+
+##### 3. 修正の結果
+
+###### 攻撃例の入力が修正後にどう扱われるか
+
+- **window.name ＋ eval／innerHtml／documentWrite**: 攻撃者が `window.name` に JavaScript のコードや `<img src=x onerror=…>` を入れ、`/dom/toxicdom/external/window/name/eval` などに移動させても、`textContent`／`createTextNode` によって、その文字列がそのまま画面に表示されるだけです。コードは実行されず、`img` 要素も作られません。
+- **document.referrer ＋ eval**: `referrer = '…'` という文字列が表示されるだけで、Referer の URL に引用符やコードを入れても実行されません。
+- **Cookie／Storage**: 同様に、値は文字列として表示されるだけです。
+- **postMessage 系**: 攻撃者のサイトから送ったメッセージは、オリジンの確認（`msg.origin !== window.location.origin`、または `https://www.google.com` との完全一致）で無視されます。`www.google.com` を含む攻撃者のドメイン（`https://www.google.com.attacker.example` など）も、完全一致と全体一致の正規表現で弾かれます。仮に確認を通ったとしても、データは `JSON.parse`・`textContent`・`setAttribute` で扱われるので、コードとしては実行されません。
+
+###### 正常な入力での動作への影響
+
+- **変わらない点**: URL の形式（`/dom/toxicdomscripts/<source>/<accessType>/<sink>`）、応答の Content-Type（`text/javascript`）、エラー時の 400 応答、source テンプレートの動作（値の読み出し・`setTimeout` による非同期の呼び出し・Storage の後片付け）は変わりません。`ToxicDomScripts.java` は変更していません。
+- **変わる点**:
+  - sink はどれも「値を文字列としてページに表示する」動作になります。値をコードとして実行したり、HTML として描画したりはしなくなります。そのため、`eval` で `badvalue='a'` のような代入を実行したり、`document.write` でマークアップを描画したりする元の動作はなくなります。
+  - `document.write` を使わなくなったので、ページの読み込みが終わった後に呼ばれても、ページ全体が書き換わることはなくなります（テキストが追加されるだけです）。
+  - postMessage 系は、同じオリジン（improperOrigin 系は `https://www.google.com` だけ）からのメッセージしか処理しません。`exec` 命令は実行されなくなります。`documentWrite` 系のスクリプト読み込みは、同じオリジンの URL に限られます。
+  - Firing Range は脆弱性スキャナを試すための「意図的に脆弱な」テストベッドです。この修正を本番に入れると、スキャナの検出対象（toxic DOM XSS）としての役割はなくなります。
+
+##### 4. 注意点
+
+- **修正していないもの**:
+  - `ToxicDomScripts.java` と `ToxicDom.java` は変更していません。どちらも、パスで選んだ固定のテンプレートを連結するだけで、ユーザー入力を応答に埋め込みません。なお、`ToxicDom.java` は同じ source と sink のテンプレートをインラインの `<script>` として配信するので、今回の sink 修正はそちらにも効きます。
+  - `request.getPathInfo()` が `null`（`/dom/toxicdomscripts` に末尾の `/` なしでアクセスした場合）のときに L45 で `NullPointerException` になる点と、`Responses.sendJavaScript` が `X-Content-Type-Options: nosniff` を付けない点は、XSS ではないため直していません（防御を重ねるなら、パスの各要素を `^\w+$` で許可リスト検査することと、`nosniff` の付与を推奨します）。
+  - `sources/document/formSubmission.tmpl`・`inputTyping.tmpl` は、ページ上の入力欄にユーザー自身が入力した値を使うもので、修正後の sink では文字列として表示されるだけです。これらが呼ぶ `deferredPayload()` はどの sink にも定義されていませんが、XSS とは関係ないので、そのままにしています。
+- **残る制約**:
+  - `js_html_sanitize_eval.tmpl` は `<html>` などの HTML タグを含むので、JavaScript として連結して配信すると構文エラーになり、元のコードでも修正後のコードでも実行されません。今回は、危険な `eval` の行だけを直しました。テンプレートの形式の問題は残っています。
+  - `sources/postMessage/eval.tmpl` などの postMessage 系では `payload` 変数が宣言されないので、連結された sink の同期部分（`… = payload`）で `ReferenceError` になります。これは元のコードと同じ動作で、メッセージハンドラはその前に登録されるので、処理には影響しません。
+  - postMessage 系で許可するオリジン（同じオリジン、`https://www.google.com`）を信頼できることが前提です。同じオリジンの別のページに XSS があると、そこから送られたメッセージは確認を通ります。ただし、その場合もデータはコードとして実行されません（`documentWrite` 系は、同じオリジンのスクリプトを読み込むことだけは許します）。
+  - `JSON.parse` に失敗する入力（`innerHtml`・`documentWrite` 系）は、元のコードと同じく例外になって処理が止まるだけで、安全です。
+
+### 修正したコード: sinks_documentWrite.tmpl
+
+```html
+// 【修正】document.write は渡した文字列を HTML として解釈するため使わない。
+//         代わりにテキストノードとして追加する（タグや属性は文字として表示されるだけで実行されない）。
+
+// Sync trigger.
+// 【修正】document.write(payload) → テキストノードの追加
+document.documentElement.appendChild(document.createTextNode(payload));
+
+// Async trigger.
+function trigger(payload) {
+  // 【修正】document.write(payload) → テキストノードの追加
+  document.documentElement.appendChild(document.createTextNode(payload));
+}
+```
+
+### 修正したコード: sinks_eval.tmpl
+
+```html
+// 【修正】payload（window.name・document.referrer・Cookie・Storage など攻撃者が操作できる値）を
+//         eval でコードとして実行しない。テキストとして画面に表示するだけにする。
+var evalOutput = document.createElement('div');
+document.documentElement.appendChild(evalOutput);
+
+// Sync trigger.
+// 【修正】eval(payload) → textContent への代入（文字列として扱われ、JavaScript として実行されない）
+evalOutput.textContent = payload;
+
+// Async trigger.
+function trigger(payload) {
+  // 【修正】eval(payload) → textContent への代入
+  evalOutput.textContent = payload;
+};
+```
+
+### 修正したコード: sinks_innerHtml.tmpl
+
+```html
+var div = document.createElement('div');
+document.documentElement.appendChild(div);
+
+// Sync trigger.
+// 【修正】innerHTML → textContent（payload を HTML として解釈せず、文字列として表示する）
+div.textContent = payload;
+
+// Async trigger.
+function trigger(payload) {
+  // 【修正】innerHTML → textContent
+  div.textContent = payload;
+};
+```
+
+### 修正したコード: sinks_js_html_sanitize_eval.tmpl
+
+```html
+<html>
+  <body>
+    <script>
+      // 【修正】< & > を HTML エスケープしてから eval しても、JavaScript の文脈では防御にならない
+      //         （英数字と ( ) ; ' などだけのコードはそのまま実行される）。
+      //         eval をやめ、値をテキストとして表示する。textContent は HTML としても JS としても解釈しない。
+      var sanitizedOutput = document.createElement('div');
+      sanitizedOutput.textContent = payload;
+      document.documentElement.appendChild(sanitizedOutput);
+</script>
+  </body>
+</html>
+```
+
+### 修正したコード: sources_postMessage_complexMessageDocumentWriteEval.tmpl
+
+```html
+const postMessageHandler = function(msg) {
+  // 【修正】送信元オリジンを確認し、自分と同じオリジン以外から届いたメッセージは無視する。
+  if (msg.origin !== window.location.origin) {
+    return;
+  }
+
+  let action = msg.data.action;
+  if(action === 'exec') {
+    // 【修正】受け取った文字列を eval で実行しない（コードを実行する命令は受け付けない）。
+    console.debug('exec is not supported');
+  } else if (action === 'addImage') {
+    // 【修正】HTML 文字列の連結 + document.write をやめ、img 要素を DOM API で作る。
+    //         setAttribute で設定した値は属性値として扱われ、HTML として解釈されないので、
+    //         ">" や引用符で別のタグや onerror 属性を足すことはできない（元のコードと同じ href 属性を設定する）。
+    const img = document.createElement('img');
+    img.setAttribute('href', msg.data.source);
+    document.body.appendChild(img);
+  } else if (action === 'addHtml') {
+    // 【修正】document.write(HTML) → テキストノードとして追加する（HTML として解釈しない）。
+    document.body.appendChild(document.createTextNode(msg.data.html));
+  } else {
+    console.debug('unsupported command');
+  }
+};
+
+window.addEventListener('message', postMessageHandler, false);
+```
+
+### 修正したコード: sources_postMessage_documentWrite.tmpl
+
+```html
+var postMessageHandler = function(msg) {
+  // 【修正】送信元オリジンを確認し、自分と同じオリジン以外から届いたメッセージは無視する。
+  if (msg.origin !== window.location.origin) {
+    return;
+  }
+
+  var content = JSON.parse(msg.data);
+  // 【修正】URL を解析し、自分と同じオリジンのスクリプトだけを読み込む。
+  //         javascript: や data: の URL はオリジンが "null" になるので、ここで弾かれる。
+  var url = new URL(content.url, window.location.href);
+  if (url.origin !== window.location.origin) {
+    return;
+  }
+  // 【修正】文字列連結した HTML を document.write するのをやめる（引用符を閉じてタグや属性を足せたため）。
+  //         DOM API で script 要素を作り、src プロパティに URL を設定する。
+  var script = document.createElement('script');
+  script.src = url.href;
+  document.documentElement.appendChild(script);
+};
+
+window.addEventListener('message', postMessageHandler, false);
+```
+
+### 修正したコード: sources_postMessage_eval.tmpl
+
+```html
+var postMessageHandler = function(msg) {
+  // 【修正】送信元オリジンを確認し、自分と同じオリジン以外から届いたメッセージは無視する。
+  if (msg.origin !== window.location.origin) {
+    return;
+  }
+
+  var content = msg.data;
+  // 【修正】eval(content) → JSON.parse(content)。データとして解析するだけで、コードとして実行しない。
+  var msgObj;
+  try {
+    msgObj = JSON.parse(content);
+  } catch (e) {
+    return;  // 【修正】JSON として読めないメッセージは無視する。
+  }
+
+  // 【修正】JSON.parse の結果が null の場合に備えて msgObj の存在も確認する。
+  if (msgObj && msgObj.isActive) {
+    document.write("PostMessage arrived!");
+  }
+}
+
+window.addEventListener('message', postMessageHandler, false);
+```
+
+### 修正したコード: sources_postMessage_improperOriginValidationWithPartialStringComparison.tmpl
+
+```html
+var postMessageHandler = function(msg) {
+  // 【修正】includes による部分一致をやめ、許可するオリジンと完全一致で比較する。
+  //         （部分一致では https://www.google.com.attacker.example なども通ってしまう）
+  if (msg.origin === 'https://www.google.com') {
+    // 【修正】eval(msg.data) → テキストとして表示する（受け取ったデータをコードとして実行しない）。
+    var div = document.createElement('div');
+    div.textContent = msg.data;
+    document.documentElement.appendChild(div);
+  }
+}
+
+window.addEventListener('message', postMessageHandler, false);
+```
+
+### 修正したコード: sources_postMessage_improperOriginValidationWithRegExp.tmpl
+
+```html
+var postMessageHandler = function(msg) {
+  // 【修正】先頭 ^ と末尾 $ で文字列全体の一致にし、"." を \. でエスケープする。
+  //         （元の正規表現は前後に何が付いても一致し、"." が任意の 1 文字に一致したため、
+  //           https://www.google.com.attacker.example や https://wwwXgoogle.com も通ってしまった）
+  //         あわせて、通信路で改ざんされうる http は許可せず https だけにする。
+  const originRegExp = /^https:\/\/www\.google\.com$/;
+  if (originRegExp.test(msg.origin)) {
+    // 【修正】eval(msg.data) → テキストとして表示する（受け取ったデータをコードとして実行しない）。
+    var div = document.createElement('div');
+    div.textContent = msg.data;
+    document.documentElement.appendChild(div);
+  }
+}
+
+window.addEventListener('message', postMessageHandler, false);
+```
+
+### 修正したコード: sources_postMessage_innerHtml.tmpl
+
+```html
+var postMessageHandler = function(msg) {
+  // 【修正】送信元オリジンを確認し、自分と同じオリジン以外から届いたメッセージは無視する。
+  if (msg.origin !== window.location.origin) {
+    return;
+  }
+
+  var content = JSON.parse(msg.data);
+  var div = document.createElement('div');
+  // 【修正】innerHTML → textContent（content.html を HTML として解釈せず、文字列として表示する）
+  div.textContent = content.html;
+  document.documentElement.appendChild(div);
+};
+
+window.addEventListener('message', postMessageHandler, false);
+```
+
+---
