@@ -1,0 +1,214 @@
+## No.4 OWASP-Benchmark/BenchmarkJava BenchmarkTest00013.java
+- 対象: https://github.com/OWASP-Benchmark/BenchmarkJava/blob/master/src/main/java/org/owasp/benchmark/testcode/BenchmarkTest00013.java
+- XSS 種別: 反射型（source・sink は "第2回xssの詳細"）
+- 修正したファイル: BenchmarkTest00013.java
+
+### 修正コードの説明
+
+#### No.4 BenchmarkTest00013.java の修正コードの説明
+
+対象: OWASP-Benchmark/BenchmarkJava（コミット 8b67a88d73b2594570fc21150705283de884620b）
+`src/main/java/org/owasp/benchmark/testcode/BenchmarkTest00013.java`
+修正ファイル: `fix01_BenchmarkTest00013.java`（ライセンスヘッダ 1〜17 行目を省略。このため、変更していない行の番号は元の行番号から 17 を引いた値になる）
+
+#### 1. 修正の方針
+
+- **防ぐ脆弱性（source → sink）**: 反射型 XSS（CWE-79）。
+  - source: 元の 45〜48 行目 `request.getHeaders("Referer")` → `headers.nextElement()`（Referer ヘッダの先頭の値）
+  - 伝播: 元の 52 行目 `URLDecoder.decode(param, "UTF-8")` で `%3C` などが `<` などに戻る
+  - sink: 元の 56 行目 `response.getWriter().format(java.util.Locale.US, param, obj)`（`text/html` 応答の本文）
+- **どこで防ぐか**: sink（元の 56 行目、出力の直前）で防ぐ。
+- **どのように防ぐか**:
+  1. ユーザー入力 `param` を **書式文字列として使うのをやめ**、書式文字列は固定の `"%s"` にする。
+  2. `param` は **HTML エスケープ**（`& < > " '` を文字参照に置き換え）してから、`%s` の引数として渡す。
+- **この方法を選んだ理由**:
+  - XSS の根本原因は「HTML の文脈に、エスケープせずに入力を出力していること」なので、出力する箇所で出力先の文脈（HTML 本文）に合わせてエスケープするのが最も確実で、ほかの経路の影響を受けない。
+  - source（Referer）は攻撃者に制御されうる値で、入力の時点で「安全な値だけを許す」規則を決めにくい（URL として正しい値でも `<` を含められる）。入力側で弾く方法より、出力側でエスケープする方法のほうが、正常な値を壊さない。
+  - 書式文字列を固定にすることで、同じ行にある書式文字列の外部制御（CWE-134、`%d` などによる例外や出力の改変）も同時に解消できる。
+  - エスケープ処理は、外部ライブラリ（ESAPI、Spring の HtmlUtils など）に頼らず、クラス内の小さな private メソッドとして追加した。依存関係を増やさず、このファイルだけで修正を完結させるため。
+
+#### 2. 変更箇所ごとの説明
+
+##### 変更箇所 1: 出力部分（元の 55〜56 行目 → 修正後 38〜41 行目）
+
+修正前（元のコード 55〜56 行目）:
+
+```java
+        Object[] obj = {"a", "b"};
+        response.getWriter().format(java.util.Locale.US, param, obj);
+```
+
+修正後（修正ファイル 38〜41 行目）:
+
+```java
+        // 【修正】ユーザー入力（Referer）を書式文字列として使わない。
+        // 書式文字列は固定の "%s" にし、param は HTML エスケープしてから引数として渡す。
+        // （元の Object[] obj = {"a", "b"}; は書式の引数として不要になったため削除）
+        response.getWriter().format(java.util.Locale.US, "%s", htmlEscape(param));
+```
+
+各行の働き:
+
+- 38〜40 行目: 修正内容を説明する日本語コメント。
+- `Object[] obj = {"a", "b"};` を削除: もとは `param` を書式文字列とみなしたときの `%s` などに差し込む引数だった。書式文字列を固定の `"%s"` にしたため不要になった。
+- 41 行目 `format(java.util.Locale.US, "%s", htmlEscape(param))`:
+  - 書式文字列は定数 `"%s"` なので、入力に `%` が含まれても書式指定子として解釈されない（CWE-134 の解消）。
+  - `%s` に差し込まれるのは `htmlEscape(param)` の戻り値で、`<` `>` `"` `'` `&` はすべて文字参照に置き換わっている。そのため、ブラウザはこれをタグや属性ではなく、ただの文字として表示する。これで XSS が防げる。
+
+##### 変更箇所 2: HTML エスケープ用メソッドの追加（修正ファイル 44〜74 行目、新規）
+
+修正前: なし（新規追加）
+
+修正後:
+
+```java
+    // 【修正】HTML 本文に出力する文字列をエスケープする補助メソッド（追加）。
+    // HTML で特別な意味を持つ & < > " ' を文字参照に置き換え、タグや属性として解釈されないようにする。
+    private static String htmlEscape(String s) {
+        if (s == null) {
+            return "";
+        }
+        StringBuilder sb = new StringBuilder(s.length() + 16);
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            switch (c) {
+                case '&':
+                    sb.append("&amp;");
+                    break;
+                case '<':
+                    sb.append("&lt;");
+                    break;
+                case '>':
+                    sb.append("&gt;");
+                    break;
+                case '"':
+                    sb.append("&quot;");
+                    break;
+                case '\'':
+                    sb.append("&#x27;");
+                    break;
+                default:
+                    sb.append(c);
+            }
+        }
+        return sb.toString();
+    }
+```
+
+各行の働き:
+
+- 46 行目 `private static String htmlEscape(String s)`: このクラスの中だけで使う、状態を持たないエスケープ関数。
+- 47〜49 行目: `null` が渡されたときは空文字を返し、`NullPointerException` を防ぐ（現在の呼び出し元では `param` は `null` にならないが、念のため）。
+- 50 行目: 結果を組み立てる `StringBuilder`。置き換えで長くなる分を見込んで少し大きめに確保する。
+- 51〜72 行目: 1 文字ずつ調べ、HTML で特別な意味を持つ文字だけを置き換える。
+  - `&` → `&amp;`: `&lt;` のような文字参照を入力に書かれても、文字参照として再解釈されず、そのまま表示されるようにする。
+  - `<` → `&lt;`、`>` → `&gt;`: `<script>` や `<img ...>` などのタグを作れないようにする（本文の文脈での XSS を防ぐ主な部分）。
+  - `"` → `&quot;`、`'` → `&#x27;`: 今回の出力先は HTML 本文だが、将来この値が属性値の中に出力されても、引用符を閉じて新しい属性（`onerror=` など）を足せないようにする。
+  - それ以外の文字（日本語などの多バイト文字を含む）はそのまま追加する。
+- 73 行目: エスケープ済みの文字列を返す。
+
+これで XSS が防げる理由: HTML の構文（タグ・属性・文字参照）を作るのに必要な文字がすべて文字参照になるため、Referer に何が入っていても、ブラウザは HTML の本文の文字としてしか扱わず、スクリプトは実行されない。
+
+#### 3. 修正の結果
+
+- **攻撃例の入力の扱い**: 罠ページの URL に `<script>…</script>` や `<img src=x onerror=…>` のようなタグを入れ、それが Referer として送られた場合、
+  - 52 行目（修正後 35 行目）の URL デコードで `<` などに戻るところまでは修正前と同じ。
+  - その後 `htmlEscape` で `&lt;script&gt;…&lt;/script&gt;` のように変換されて出力される。ブラウザには `<script>` という文字列が画面に表示されるだけで、スクリプトは実行されない。
+  - 入力に `%d` や `%n` などの書式指定子が含まれても、書式文字列ではなく引数として扱われるので、`IllegalFormatConversionException` などの例外は起きず、そのまま文字として表示される。
+- **正常な入力での動作への影響**:
+  - 変わらない点: 通常の URL（英数字、`/`、`:`、`?`、`=` など）の Referer は、修正前と同じ文字列がそのまま表示される。Content-Type、`X-XSS-Protection` ヘッダ、Referer の取得と URL デコードの処理は変更していない。
+  - 変わる点:
+    - Referer に `&`、`<`、`>`、`"`、`'` が含まれる場合、応答の HTML ソースでは文字参照（`&amp;` など）になる。ブラウザの表示上は元の文字と同じに見える。たとえばクエリ文字列の `a=1&b=2` は、ソースでは `a=1&amp;b=2`、画面では `a=1&b=2` になる。
+    - 修正前は Referer の中の `%s` が `a` に置き換わるなど、書式指定子として処理されていた。修正後は `%s` がそのまま表示される（書式文字列として扱われていたのは不具合なので、こちらが本来の動作）。
+
+#### 4. 注意点
+
+- **修正していないもの**:
+  - 52 行目（修正後 35 行目）の `URLDecoder.decode` は、`%` のあとに 16 進数 2 桁が続かない不正な入力で `IllegalArgumentException` を投げ、エラー応答になる。XSS ではないため、今回は修正していない（必要なら例外を捕まえて空文字にするなどの対応が考えられる）。
+  - 54 行目（修正後 37 行目）の `response.setHeader("X-XSS-Protection", "0")` は残している。現在の主なブラウザは XSS フィルタ自体を持たないため、出力エスケープで防ぐ今回の修正には影響しない。
+  - アプリ全体の CSP（`HTTPResponseHeaderFilter` で設定）は `default-src` に `'unsafe-inline'` と `'unsafe-eval'` を含み、XSS の緩和としては弱い。これはアプリ全体の設定でこのファイルの範囲外のため、変更していない。
+- **残る制約**:
+  - `htmlEscape` は **HTML 本文（および引用符で囲んだ属性値）** の文脈向けのエスケープである。将来この値を `<script>` の中（JavaScript の文脈）、`href` などの URL 属性、CSS の中に出力する場合は、その文脈に合ったエスケープや検証（たとえば URL の `javascript:` スキームの拒否）が別に必要になる。
+  - 自作のエスケープ関数を使っている。プロジェクトで ESAPI（`ESAPI.encoder().encodeForHTML`）や Spring の `HtmlUtils.htmlEscape` などの実績あるライブラリを使える場合は、そちらに置き換えてもよい。
+
+### 修正したコード: BenchmarkTest00013.java
+
+```java
+package org.owasp.benchmark.testcode;
+
+import java.io.IOException;
+import javax.servlet.ServletException;
+import javax.servlet.annotation.WebServlet;
+import javax.servlet.http.HttpServlet;
+import javax.servlet.http.HttpServletRequest;
+import javax.servlet.http.HttpServletResponse;
+
+@WebServlet(value = "/xss-00/BenchmarkTest00013")
+public class BenchmarkTest00013 extends HttpServlet {
+
+    private static final long serialVersionUID = 1L;
+
+    @Override
+    public void doGet(HttpServletRequest request, HttpServletResponse response)
+            throws ServletException, IOException {
+        doPost(request, response);
+    }
+
+    @Override
+    public void doPost(HttpServletRequest request, HttpServletResponse response)
+            throws ServletException, IOException {
+        // some code
+        response.setContentType("text/html;charset=UTF-8");
+
+        String param = "";
+        java.util.Enumeration<String> headers = request.getHeaders("Referer");
+
+        if (headers != null && headers.hasMoreElements()) {
+            param = headers.nextElement(); // just grab first element
+        }
+
+        // URL Decode the header value since req.getHeaders() doesn't. Unlike req.getParameters().
+        param = java.net.URLDecoder.decode(param, "UTF-8");
+
+        response.setHeader("X-XSS-Protection", "0");
+        // 【修正】ユーザー入力（Referer）を書式文字列として使わない。
+        // 書式文字列は固定の "%s" にし、param は HTML エスケープしてから引数として渡す。
+        // （元の Object[] obj = {"a", "b"}; は書式の引数として不要になったため削除）
+        response.getWriter().format(java.util.Locale.US, "%s", htmlEscape(param));
+    }
+
+    // 【修正】HTML 本文に出力する文字列をエスケープする補助メソッド（追加）。
+    // HTML で特別な意味を持つ & < > " ' を文字参照に置き換え、タグや属性として解釈されないようにする。
+    private static String htmlEscape(String s) {
+        if (s == null) {
+            return "";
+        }
+        StringBuilder sb = new StringBuilder(s.length() + 16);
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            switch (c) {
+                case '&':
+                    sb.append("&amp;"); // 最初に & を置き換え、既存の文字参照の再解釈も防ぐ
+                    break;
+                case '<':
+                    sb.append("&lt;"); // タグの開始を無効化
+                    break;
+                case '>':
+                    sb.append("&gt;"); // タグの終了を無効化
+                    break;
+                case '"':
+                    sb.append("&quot;"); // 属性値（二重引用符）からの脱出を防ぐ
+                    break;
+                case '\'':
+                    sb.append("&#x27;"); // 属性値（単引用符）からの脱出を防ぐ
+                    break;
+                default:
+                    sb.append(c);
+            }
+        }
+        return sb.toString();
+    }
+}
+```
+
+---
