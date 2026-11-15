@@ -1,0 +1,883 @@
+## No.31 GoogleChrome/rendertron src/renderer.js (prePatch 16ade32)
+
+- 修正コード2の検証で見つかった不備: SharedWorker（と ServiceWorker）にはアタッチされず、その中の fetch・WebSocket で内部アドレスの内容が漏れる（CWE-200（検証の記録に明記））
+- 修正コード3 のファイル: src/main.js、src/renderer.js
+- 組み合わせ: 修正コード3 のファイル（src/main.js、src/renderer.js）。修正前の最終版: src/main.js（修正コード1 のまま。修正コード2 では変えていない）、src/renderer.js（修正コード2）。これらを合わせたもの
+- 親の確認: src/main.js: node --check で構文エラーなし／src/renderer.js: node --check で構文エラーなし。エージェントが読み取り専用の材料（orig・given）を変えていないこと、読まない範囲のファイルを読んでいないことを、記録で確認した。
+- 親の注記: エージェントは、検証の不備のほかに、修正コード2 で入った動作の不具合（Service Worker が一時停止したまま動かない）を自分で見つけて直した。修正コード2の検証では見つかっていなかったもの。
+- 親の注記: 検証の修正案（ブラウザのセッションでの自動アタッチ）には従わず、SharedWorker をブラウザで無効にする方法をとった（理由は下の説明）。そのため、SharedWorker を使うページはその機能が動かなくなる（allowPrivateNetwork が true のときは従来どおり）。
+- 親の注記: エージェントは確認の後片付けで `ls /tmp/claude-1002/` を実行した（Chrome の一時ディレクトリが残っていないかの確認）。出力は直下のディレクトリ名だけで、ほかの作業用ディレクトリの中は読んでいない。
+- 親の注記: 修正コード2の検証（No.31）では、途中で安全分類器の停止とモデルの切り替わりがあったが、今回の作成では停止はなく、区間のリクエストはすべて claude-opus-5-5 だった。
+- 使用トークン量（作成）: 新規 402,189（入力 124 ／ キャッシュ作成 246,669 ／ 出力〔推定〕 155,396）、キャッシュ読込 9,556,778、総処理 9,958,967、リクエスト 60 回
+
+対象: GoogleChrome/rendertron（CVE-2017-18355、情報漏えい／ローカルファイル読み取り・SSRF、CWE-200）
+
+- 修正コード3 のファイル（この 2 つを、修正の最終版のファイルと置き換える）:
+  - `$R/fix3/src/main.js`（もとは `$R/given/fix_nx/src/main.js`。修正コード1 のまま、修正コード2 では変えていなかったもの）
+  - `$R/fix3/src/renderer.js`（もとは `$R/given/fix2/src/renderer.js`。修正コード2）
+- 今回直した箇所には `【修正3】` のコメントを付けた。修正コード1 の `【修正】`、修正コード2 の `【修正2】` のコメントとコードは、すべてそのまま残している。
+- validateUrl・isPrivateAddress・isPrivateWebSocketUrl・応答ごとの接続先 IP の検査（checkRemoteAddress）・WebSocket の検査・子ターゲット（OOPIF・Dedicated Worker）の自動アタッチ・injectBaseHref の JSON.stringify 化・デバッグポートの 127.0.0.1 化は、変えていない。
+
+### 修正コード2の不備
+
+行番号は、修正の最終版（`$R/given/fix2/src/renderer.js`、`$R/given/fix_nx/src/main.js`）のもの。
+
+#### 不備1（検証の記録の不備）: SharedWorker の通信が検査されず、内部の内容が漏れる
+
+- 場所:
+  - `given/fix2/src/renderer.js` 213-232 行。子ターゲットの監視は、タブ（ページ）のセッションに対する `Target.setAutoAttach(AUTO_ATTACH_PARAMS)`（227 行）と、そのセッションに届く `Target.attachedToTarget`（214-225 行）だけで行っている。
+    ```js
+    Target.attachedToTarget(async(event) => { ... client.send('Network.enable', {}, sessionId) ... });  // 214-225 行
+    await Target.setAutoAttach(AUTO_ATTACH_PARAMS);                                                  // 227 行
+    ```
+    ページのセッションの自動アタッチの対象は、そのページの OOPIF・Dedicated Worker・Service Worker で、SharedWorker は含まれない。SharedWorker はページではなくブラウザに属する別のターゲットで、ブラウザのセッションで自動アタッチしないとアタッチされない。このため、SharedWorker の中で起きる通信のイベントはどのセッションにも届かず、接続先の検査（196-203 行の checkRemoteAddress、258-272 行の requestWillBeSent / responseReceived のハンドラ）も、WebSocket の検査（240-251 行の webSocketCreated、121-135 行の isPrivateWebSocketUrl）も一度もかからない。
+  - `given/fix_nx/src/main.js` 129 行。`chromeFlags: ['--headless', '--disable-gpu', '--remote-debugging-address=127.0.0.1']` で、SharedWorker は有効のまま。
+- 問題になる入力・条件（自分で再現した。Chrome 157、Local Network Access は既定のまま）:
+  - `/render/http://pub.test:<公開役ポート>/sharedworker`。公開ページが `new SharedWorker("/shw-fetch.js")` を作り、SharedWorker の中の `fetch("http://127.0.0.1:<内部ポート>/cors")` で内部 API（Access-Control-Allow-Origin: *）を読み、`port.postMessage` でページに渡して DOM に書く。修正コード2 で 200 が返り、本文に `CORS-INTERNAL-SECRET-4242` が入った。
+  - `/render/.../sharedworker-ws`（SharedWorker の中の `new WebSocket("ws://127.0.0.1:<内部ポート>/ws")`）: 200 で `WS-INTERNAL-SECRET-4242` が返った。
+  - 同じ原因の別の入力:
+    - `/render/.../sharedworker-nested`（cross-site の iframe＝OOPIF の中で SharedWorker を作る）: 200 で漏えい。
+    - `/render/.../shw-iframe`（about:blank の iframe の `contentWindow.SharedWorker` を使う）: 200 で漏えい。
+    - `/screenshot/.../sharedworker`: 200 で、画像に `CORS-INTERNAL-SECRET-4242` が写っていた（画像を目で見て確認。元のコードの画像とバイト単位で同じ）。
+  - CDP のイベントの記録では、SharedWorker の実行中に `attached type=shared_worker` は一度も出ない。ページのセッションには SharedWorker のスクリプト（/shw-fetch.js）の取得の requestWillBeSent が見えるだけで、その中の内部への fetch は現れなかった。
+  - なお、/render の sharedworker は、続けて多くのケースを流したときは受信が間に合わず `waiting` のまま返ることがあった（時間の揺れ）。sharedworker-ws・sharedworker-nested・shw-iframe・/screenshot の sharedworker は、毎回漏えいした。
+- どこで入ったか: 元のコードからある漏えい（元のコードでも同じ入力で 200 で漏れる）。修正コード1 でも修正コード2 でも直っていない。修正コード2 の説明の「元の修正コードの不備」不備1（別プロセスの子ターゲットの通信が検査されない）と同じ原因で、修正コード2 の対策（ページのセッションでの自動アタッチ）が SharedWorker に届いていなかった。
+
+#### 不備2（今回見つけた不備）: 修正コード2 では Service Worker が一時停止したまま動かない
+
+検証の記録では Service Worker を確かめていなかったので、同じ原因（子ターゲットの監視）の別の経路として確かめたところ、修正コード2 で入った問題が見つかった。
+
+- 場所: `given/fix2/src/renderer.js` 214-225 行。
+  ```js
+  await client.send('Network.enable', {}, sessionId);           // 217 行
+  await client.send('Target.setAutoAttach', AUTO_ATTACH_PARAMS, sessionId);
+  ...
+  client.send('Runtime.runIfWaitingForDebugger', {}, sessionId)  // 224 行
+  ```
+  ページのセッションの自動アタッチでは、Service Worker も `waitForDebuggerOnStart: true` で一時停止した状態でアタッチされる。Service Worker の子のセッションでは、一時停止を解くまで `Network.enable` の応答が返らない（Chrome 157 で確認。送った後、応答が来ないまま止まる）。修正コード2 は Network.enable の応答を待ってから一時停止を解くので、デッドロックになり、Service Worker は最後まで動かない。
+- 問題になる入力・条件（自分で再現した）:
+  - `/render/.../swok`（Service Worker を登録し、postMessage で返事をもらって DOM に書く正常なページ）: 元のコードは `SW-OK`、修正コード2 は `waiting`（Service Worker が動かない）。正常な入力での動作が元のコードから変わっていた。
+  - 一時停止のまま残った Service Worker に対して、後の描画のセッションの `Network.enable` がエラーで終わり、同じオリジンの別の正常なページが `400 "Cannot monitor network access of a subframe or worker"` になることがあった（全ケースの実行で `/render/.../cookie-set` が 400）。
+  - 内部の内容は漏れなかった（Service Worker が動かないため。偶然の安全）。修正コード3 で Service Worker を動かす場合、この部分を直さないと、Service Worker の監視は成り立たない。
+- どこで入ったか: 修正コード2 で入った（元のコードと修正コード1 は自動アタッチをしないので、Service Worker は普通に動く。その代わり、Service Worker の中の通信は検査されず漏れる）。
+
+#### 検証の記録で「指摘」としたもの（今回は直していない）
+
+- 描画をまたいだ永続ストレージ経由の持ち出し（検証の記録 1-e）: 修正コード3 でも再現した（下の「確認した内容と結果」）。理由は「副作用・残る点」に書いた。
+- `isPrivateAddress('::ffff:0:127.0.0.1')` が公開と判定される点（検証の記録 1-a）: 変えていない。
+
+### 再修正の内容
+
+行番号は修正コード3（`$R/fix3/src/main.js`、`$R/fix3/src/renderer.js`）のもの。
+
+#### 1. SharedWorker を無効にする（main.js 129-136 行）
+
+```js
+chromeFlags: ['--headless', '--disable-gpu', '--remote-debugging-address=127.0.0.1']
+    .concat(config['allowPrivateNetwork'] ? [] : ['--disable-blink-features=SharedWorker']),
+```
+
+- 何をしたか: config.allowPrivateNetwork が true でないとき、Chrome を `--disable-blink-features=SharedWorker` を付けて起動する。すべてのレンダラプロセス（メインフレーム、OOPIF、about:blank の iframe など）で `SharedWorker` のコンストラクタが無くなり（`typeof SharedWorker === 'undefined'`）、ページは SharedWorker を作れない。config.json は起動の前に読み込まれているので、ここで参照できる。allowPrivateNetwork が true のとき（内部アドレスの描画を許す設定）は、修正コード2 と同じく元の動作のまま（SharedWorker も使える）。
+- なぜこの方法にしたか:
+  - 検証の記録の修正案は「ブラウザのセッションで Target.setAutoAttach をする」だった。実験（bench/exp_attach.js）で、ブラウザのセッションの自動アタッチなら SharedWorker もアタッチされ、その中の fetch も見えることは確かめた。しかし rendertron は 1 つの Chrome で複数の描画を同時に行う。描画ごとにブラウザのセッションで自動アタッチ（waitForDebuggerOnStart）をすると、セッション同士が干渉した。
+    - 後からアタッチしたセッションが一時停止を解かないと、先のセッションが解いても SharedWorker は動き出さない（他の描画の SharedWorker を放っておくと、その描画が止まる）。
+    - 逆に後のセッションが解くと、持ち主の描画が Network を有効にする前でも動き出す（他の描画の SharedWorker を再開させると、検査の漏れが起きうる）。
+    - さらに、同じブラウザコンテキストの中では、SharedWorker がどの描画のものかを知る手がかり（openerId など）が無い。
+  - これを正しく作るには、描画ごとにブラウザコンテキストを分け、ブラウザ全体で 1 本の監視用の接続を共有する作りに書き換える必要がある。変更が大きく、新しい不具合を入れるおそれも大きい。
+  - SharedWorker を無効にすれば、監視できない経路そのものが無くなる。変更は起動フラグ 1 つで済み、確実。SharedWorker は、事前描画（SEO 向けの描画）で必要になることはまれで、Safari・Android の Chrome で長く使えなかったこともあり、多くのページは有無を確かめてから使う。
+- どう動くか: `/render/.../sharedworker` では、`new SharedWorker` が ReferenceError になり、内部への通信は起きない。ページはそのまま描画され、`waiting` の表示のまま返る（内容は漏れない）。OOPIF の中、about:blank の iframe の中でも同じ。
+
+#### 2. 描画のたびに SharedWorker が無効なことを確かめる（renderer.js 22-23 行、216-229 行）
+
+```js
+const SHARED_WORKER_MESSAGE = 'SharedWorker must be disabled (--disable-blink-features=SharedWorker)';
+...
+if (!config['allowPrivateNetwork']) {
+  try {
+    const sharedWorkerCheck = await Runtime.evaluate({expression: 'typeof SharedWorker'});
+    if (sharedWorkerCheck.result.value !== 'undefined')
+      throw new Error(SHARED_WORKER_MESSAGE);
+  } catch (error) {
+    reject(new Error(SHARED_WORKER_MESSAGE));
+    return;
+  }
+  ...（修正コード2 の自動アタッチ）
+```
+
+- 何をしたか: _loadPage の中で、Page.navigate の前（タブがまだ about:blank のまま、ページのスクリプトが動く前）に `typeof SharedWorker` を評価する。`'undefined'` でなければ（SharedWorker が有効なら）、ページを読み込まずに reject する（main.js から 400 が返る）。
+- なぜ: SharedWorker の無効化は main.js の起動フラグに頼っている。起動の設定が違う場合（main.js 以外から renderer.js を使う、`app.setConfig` で allowPrivateNetwork を後から false にした、など）や、フラグが効かない版の Chrome では、SharedWorker が残り、黙って漏えいが戻る。ここで確かめれば、その場合も描画しない（fail closed）。評価はページを読み込む前の自分のタブで行うので、ページのスクリプトが結果をごまかすことはできない。
+- 評価そのものが失敗した場合も reject して return する（非同期の executor の中の例外で promise が決着しない＝ハングするのを防ぐ。修正コード2 の Target.setAutoAttach の失敗時と同じ形）。エラーメッセージは固定の文字列で、利用者の入力は含めない。
+- allowPrivateNetwork が true のときは確かめない（main.js もフラグを付けないので、SharedWorker が使える）。
+
+#### 3. Service Worker の一時停止を、Network.enable の応答を待たずに解く（renderer.js 231-261 行のうち 233-249 行）
+
+```js
+if (event.targetInfo && event.targetInfo.type === 'service_worker') {
+  const setup = Promise.all([
+    client.send('Network.enable', {}, sessionId),
+    client.send('Target.setAutoAttach', AUTO_ATTACH_PARAMS, sessionId),
+  ]);
+  client.send('Runtime.runIfWaitingForDebugger', {}, sessionId).catch(() => {});
+  setup.catch(() => {
+    blocked = true;
+    reject(new Error(UNMONITORED_TARGET_MESSAGE));
+  });
+  return;
+}
+```
+
+- 何をしたか: アタッチされた子ターゲットが Service Worker のときは、Network.enable と Target.setAutoAttach を送った直後に、応答を待たずに Runtime.runIfWaitingForDebugger を送る。OOPIF・Dedicated Worker は、修正コード2 のまま（応答を待ってから一時停止を解く）にした。
+- なぜ: 不備2 のデッドロックをなくすため。同じセッションに送ったコマンドは送った順に処理されるので、Network が有効になってから Service Worker のスクリプトが動き出す。実際に、Service Worker のスクリプトの取得と、その中の `fetch("http://127.0.0.1:.../cors")` の requestWillBeSent / responseReceived（remote=127.0.0.1）が子のセッションに届き、checkRemoteAddress で検出された（イベントの記録で確認）。
+- 失敗時: Network.enable か Target.setAutoAttach が失敗したら、ほかの子ターゲットと同じく `blocked = true` にして reject する（内容を返さない、fail closed）。一時停止はすでに解いているが、その描画の内容は返さないので、漏えいにはならない。一時停止の解除の失敗（直後にターゲットが消えた場合など）は、修正コード2 と同じく無視する。
+- 変更の範囲を Service Worker に限ったのは、OOPIF や Dedicated Worker で検証の済んでいる修正コード2 の動き（応答を待ってから一時停止を解く、より厳密な順序）を変えないため。
+
+### 確認した内容と結果
+
+確認環境: node v22.22.1、Google Chrome 157.0.8103.38。`$R/bench/` に express@4.22.3、compression、performance-now、uuid@3.4.0、chrome-launcher@1.2.2、chrome-remote-interface@0.34.0、（依存の）ws を `npm install --ignore-scripts` で入れた（rendertron 本体は入れていない）。サーバはすべて 127.0.0.1 だけで待ち受け、終了時に Chrome とサーバを止めた。
+
+道具（`$R/bench/`）:
+- `servers.js`: 公開サイト役 pub.test・pub2.test（Chrome は `--host-resolver-rules` で 127.0.0.1 に向ける）と内部サービス役（127.0.0.1、`/secret`・`/cors`・WebSocket `/ws`）。試験用のページ（SharedWorker・Service Worker・OOPIF・Worker・WebSocket・ポップアップ・Background Fetch・事前描画・ストレージなど）を返す。
+- `harness.js`: main.js をモジュールとして読み込み（app.listen は呼ばれない）、試験側で 127.0.0.1 に listen して /render・/screenshot を呼ぶ。Node 側の DNS は pub.test を公開アドレス、int.test を内部アドレスに解決させる。
+- `apps/node_modules/` のラッパー: chrome-remote-interface（0.24 系の `{tab:}` を `{target:}` に読み替え、host を 127.0.0.1 に、新しい Chrome で消えた `Page.addScriptToEvaluateOnLoad`・`Emulation.setVisibleSize` の補完、公開役のポートからの応答の remoteIPAddress を 93.184.216.34 に書き換え、CDP イベントの記録）、chrome-launcher（元のコードの 0.0.0.0 を 127.0.0.1 に置換、試験用のフラグの追加）。cache.js はスタブ。
+- `exp_attach.js`: 方針を決めるための CDP の挙動の実験。
+- アプリ: `apps/orig`（元のコード）、`apps/fix2`（修正の最終版＝fix_nx の main.js ＋ 修正コード2）、`apps/fix3`（修正コード3。`$R/fix3/src/` と同一であることを cmp で確認）、`apps/fix3_allow`（修正コード3 ＋ config.json `{"allowPrivateNetwork": true}`）、`apps/fix3_noflag`（fix_nx の main.js ＋ 修正コード3 の renderer.js。確認処理の試験用）。
+
+1. 構文確認: `node --check fix3/src/renderer.js`、`node --check fix3/src/main.js` とも OK。harness で実際に読み込み、Chrome を起動して動いた。起動フラグに `--disable-blink-features=SharedWorker` が入っていることも確認した。
+
+2. CDP の挙動の実験（exp_attach.js）:
+   - ブラウザのセッションの自動アタッチなら SharedWorker がアタッチされ、その中の fetch（remote=127.0.0.1）が見える。
+   - 2 本のブラウザのセッションが自動アタッチしたとき、後のセッションが一時停止を解かないと動かない（m3）、後のセッションが解くと先のセッションの準備の前でも動く（m4）。→ 描画ごとのブラウザのセッションでは干渉するため、この方法をとらなかった。
+   - `--disable-blink-features=SharedWorker` で `typeof SharedWorker` が `undefined` になる。
+   - ブラウザのセッションでは、Service Worker の Network.enable と一時停止の解除を続けて送ると、その中の fetch が見える。
+
+3. 全ケースの結合確認（`run_all.sh`、結果は `bench/out_orig.txt`・`out_fix2.txt`・`out_fix3.txt`）。元のコード／修正コード2／修正コード3 の順。「漏えい」は本文に秘密の文字列が入ったもの。
+
+   | ケース | 元のコード | 修正コード2 | 修正コード3 |
+   |---|---|---|---|
+   | file:///etc/passwd、FILE:///etc/hostname | 200 で漏えい（passwd） | 400 | 400 |
+   | 127.0.0.1・localhost・0x7f000001・内部に解決される名前 | 200 で漏えい | 400 | 400 |
+   | 公開ページからの 302（redirect） | 200 で漏えい | 400 | 400 |
+   | トップレベルの fetch（topfetch）・WebSocket（ws2） | 200 で漏えい | 400 | 400 |
+   | OOPIF の中の fetch（nestedfetch）・Worker の fetch（worker） | 200 で漏えい | 400 | 400 |
+   | 入れ子の Dedicated Worker の fetch（nestedworker） | 200 で漏えい | （未実施） | 400 |
+   | **SharedWorker の fetch（sharedworker）** | 200 で漏えい | 200（最初の実行では漏えい、全ケースの実行では受信が間に合わず waiting） | 200、waiting（SharedWorker が無い。漏えいなし） |
+   | **SharedWorker の WebSocket（sharedworker-ws）** | 200 で漏えい | 200 で漏えい | 200、waiting（漏えいなし） |
+   | **OOPIF の中の SharedWorker（sharedworker-nested）** | 200 で漏えい | 200 で漏えい | 200、waiting（漏えいなし） |
+   | **about:blank の iframe の SharedWorker（shw-iframe）** | 200 で漏えい | 200 で漏えい | 200、NO-SHAREDWORKER-IN-IFRAME |
+   | Service Worker の fetch（sw: スコープ違い、sw-root: スコープ /）・WebSocket（sw-ws） | 200 で漏えい | 200、waiting（SW が動かない） | 400 |
+   | OOPIF（pub2）の中で登録した SW（sw-nested） | 200 で漏えい | 400（"Cannot monitor ..."） | 400 |
+   | 登録済みの SW に登録し直さずに依頼（sw-existing） | 200 で漏えい | 400 | 400 |
+   | ポップアップ（window.open） | POPUP-BLOCKED | POPUP-BLOCKED | POPUP-BLOCKED |
+   | 正常: normal（PUBLIC-OK-JS）・status404（404）・`'` を含む URL（QUOTE-OK）・xsite・workerok・wsok | 200（status404 は 404） | 同じ | 同じ（本文も同じ） |
+   | 正常: Service Worker を使うページ（swok） | SW-OK | **waiting** | **SW-OK** |
+   | 正常: SharedWorker を使うページ（sharedworkerok） | SHARED-OK | SHARED-OK | waiting（無効化による意図した変化） |
+   | 正常: cookie-set → cookie-get | 200、c=COOKIE-VALUE-1 | cookie-set が 400（不備2 の影響） | 200、c=COOKIE-VALUE-1 |
+   | /screenshot: normal・xsite | 200 | 200 | 200（画像は元のコードとバイト単位で同一） |
+   | /screenshot: 内部 IP・302・OOPIF の中の内部 iframe（nested） | 200（内部が写る） | 400 | 400 |
+   | **/screenshot: sharedworker** | 200、秘密が写る | 200、秘密が写る（元のコードと同一の画像） | 200、"waiting" が写る（目で確認） |
+   | /screenshot: sw | 200、秘密が写る | 200（SW が動かない） | 400 |
+   | store-set → store-get（指摘 1-e） | 200 → 200 で漏えい | 400 → 200 で漏えい | 400 → 200 で漏えい（変わらず） |
+   | 未処理の Promise の拒否（unhandledRejection） | 13 件（試験の最後に Chrome を止めたことによる） | 4 件（同） | 0 件 |
+
+   - /screenshot が 400 のとき、本文のメッセージが `The first argument must be of type string ...` になるのは、main.js の /screenshot（`.catch((err) => console.error(err))` の後に `new Buffer(undefined)`）の元からの作りで、修正コード2 と同じ。内容は返らない。
+
+4. allowPrivateNetwork: true（apps/fix3_allow）: 起動フラグに `--disable-blink-features=SharedWorker` が付かない。`file:///etc/passwd` は 400（スキームの制限は残る）。内部 IP・nestedfetch・ws2・sharedworker・sw は設定どおり 200 で描画され、sharedworkerok は SHARED-OK、swok は SW-OK（修正コード2 と同じく、この設定では元の動作）。
+
+5. SharedWorker の確認処理（apps/fix3_noflag。main.js にフラグが無い状態）: normal・sharedworker・/screenshot の normal が、すべて 400 `"SharedWorker must be disabled (--disable-blink-features=SharedWorker)"` になった（fail closed）。ハングや未処理の拒否はなかった。file: は従来どおり "URL scheme is not allowed" で 400。
+
+6. Service Worker の追加の確認（修正コード3）:
+   - swok → ServiceWorker.stopAllWorkers で SW を止める → swok: 2 回とも SW-OK（止まった SW の起動し直しも動く）。
+   - sw-reg-only（登録だけ、200）→ sw-existing3（起動中の登録済み SW に依頼）: 400（既存の SW も、後の描画のセッションにアタッチされ、検査がかかる）。
+   - その後 SW を止めて sw-existing3: 200 で `waiting`（漏えいなし）。拒否された前の描画のタブが残っており、そのセッションに `Inspector.targetReloadedAfterCrash` が届いて、起動し直した SW が一時停止のままになったため（「副作用・残る点」参照）。前の描画のタブが無い場合（修正コード2 で同じ手順）は、新しい描画のセッションに `waiting=true` でアタッチされ、400 になることを確認した。
+
+7. 同時実行（PAR=1。normal・xsite・workerok・wsok・swok・status404・topfetch・nestedfetch・worker・ws2・sharedworker・sharedworker-ws・/screenshot の normal・xsite を同時に投げた）:
+   - 攻撃のケースはすべて 400、または漏えいなし。正常なケースは 200 で、本文も正しかった。
+   - 同時実行では、元のコードでも 10 秒の上限にかかって `waiting` のまま返るケース（swok・worker・ws2 など）が毎回違う形で出た。修正コード3 の swok・workerok がたまに `waiting` になるのも同じ時間の揺れで、修正コード3 による変化ではない。
+   - sw-root（同じオリジンの SW が内部に接続する攻撃）を混ぜたときは、同時に描画していた同じオリジンの正常なページも 400 になった（「副作用・残る点」参照）。
+
+8. その他の別経路の確認: ポップアップ（window.open）は、ヘッドレスの Chrome 157 のポップアップブロックで開かなかった（元のコードでも同じ）。Background Fetch（bgfetch）は始まったが内部サーバに要求が届かず、Speculation Rules の事前描画（prerender）もスクリプトが動かなかった（どちらも元のコードでも漏えいなし。この環境では成り立たない経路）。
+
+### 副作用・残る点
+
+- 動作の変化:
+  - allowPrivateNetwork が true でないとき、SharedWorker が使えなくなる。SharedWorker を使うページは、`SharedWorker` が無いものとして動く（有無を確かめないページでは、そのスクリプトが ReferenceError で止まる）。描画そのものは返る。SharedWorker を使うページの描画は、単独では約 2.6 秒で返った（元のコード・修正コード2 では、SharedWorker のスクリプトの要求がページのセッションで終わらず、10 秒の上限まで待っていた）。ただし、拒否された描画のタブが残っていると遅くなることがある（全ケースの実行では 10 秒かかった回もあった）。
+  - `--disable-blink-features=SharedWorker` が効かない版の Chrome や、main.js 以外の起動では、すべての描画が 400 になる（漏えいを黙って許さないため）。
+  - Service Worker は、修正コード2 では動かなかったが、元のコードと同じく動くようになった。そのうえで、Service Worker の中の通信も検査され、内部に接続すると描画全体が 400 になる。
+  - Service Worker は同じオリジンのすべてのページに共有され、ページのセッションの自動アタッチも、同じオリジンの描画のすべてのセッションにかかる。このため、ある描画の Service Worker が内部に接続すると、同時に描画中の同じオリジンの別の描画も 400 になる。Service Worker はそのどのページにも内容を渡せるので、内容を返さない側に倒した。
+- 直していない点とその理由:
+  - 描画をまたいだ持ち出し（検証の記録の指摘 1-e）: 1 回目の描画で内部の内容を localStorage・IndexedDB・Cache Storage や Service Worker に残し、2 回目の描画で読み出すと漏れる（修正コード3 でも store-set → store-get で再現）。拒否された描画のタブが閉じられずに残り、そこから BroadcastChannel などで後の描画に渡す経路も同じ種類。これは「1 回の描画の中で内部への接続を見つけたら内容を返さない」という検出の方式そのものの限界で、元のコードからある。完全に防ぐには、描画ごとに新しいブラウザコンテキスト（Target.createBrowserContext）を作って描画の後に破棄するなど、タブの作り方からの変更が要る。指摘の扱いであり、変更が大きいので今回は行わなかった。
+  - 拒否した描画のタブが残る点: 修正コード2 と同じ（元のコードの loadingFailed の経路と同じ作り）。拒否の後もタブを閉じると、_loadPage の中で動き続けるタイマー（10 秒の上限、仮想時間の予算）が閉じた接続にコマンドを送り、未処理の拒否になる。main.js は未処理の拒否が 6 回を超えるとプロセスを終了するので、閉じるには _loadPage の後始末全体を作り直す必要がある。このため変えていない。その影響として、Service Worker が止まった後に起動し直すとき、拒否された前の描画のタブのセッションが残っていると、そのセッションが Service Worker を一時停止させたままにし、Service Worker が動かない（内容は漏れない。新しい描画のセッションにはアタッチされない）。前のセッションで一時停止を解くと、今の描画が監視しないまま動いてしまうので、解かないままにした。拒否された描画が多いと、残ったタブのために後の描画が遅くなることもある（修正コード2 でも同じ）。
+  - `isPrivateAddress('::ffff:0:127.0.0.1')`（IPv4 変換アドレス）を公開と判定する点（指摘 1-a）: 通常の経路では現れず、Linux ではこのアドレスへの接続は 127.0.0.1 に届かないため、変えていない。
+  - ポップアップ（window.open）で開いたページは、ページのセッションの自動アタッチの対象外の別ターゲット。ヘッドレスの Chrome のポップアップブロック（ユーザー操作の無い window.open は開かない）に頼っており、`--disable-popup-blocking` などでブロックを外した構成では検査されない。Background Fetch や事前描画も、この環境では動かなかったため対策していない。
+  - HTTP・WebSocket 以外の経路（WebRTC、WebTransport など）、DNS リバインディングでページの JavaScript が内部の内容を攻撃者のサーバへ直接送る経路、内部への接続（要求の送信）そのものは、修正コード2 の説明のとおり対象外のまま。
+  - chrome-remote-interface の版（子のセッションへの sessionId 付きのコマンドが要る）、補足の XSS（main.js の `Cannot render ${url}`）、`/_ah/stop` に認証がない点、renderOnly の前方一致は、修正コード2 と同じく変えていない。
+
+### 修正コード3 の全文: src/main.js
+
+```javascript
+'use strict';
+
+const assert = require('assert');
+const renderer = require('./renderer');
+const chromeLauncher = require('chrome-launcher');
+const express = require('express');
+const fs = require('fs');
+const compression = require('compression');
+const path = require('path');
+const https = require('https');
+const app = express();
+const cache = require('./cache');
+const now = require('performance-now');
+const uuidv4 = require('uuid/v4');
+
+// Load config from config.json if it exists.
+let config = {};
+const configPath = path.resolve(__dirname, '../config.json');
+
+if (fs.existsSync(configPath)) {
+  config = JSON.parse(fs.readFileSync(configPath));
+  assert(config instanceof Object);
+}
+
+// Only start a cache if configured and not in testing.
+if (!module.parent && !!config['cache']) {
+  app.get('/render/:url(*)', cache.middleware());
+  app.get('/screenshot/:url(*)', cache.middleware());
+  // Always clear the cache for now, while things are changing.
+  cache.clearCache();
+}
+
+// Allows the config to be overriden
+app.setConfig = (newConfig) => {
+  const oldConfig = config;
+  config = newConfig;
+  config.chrome = oldConfig.chrome;
+  config.port = oldConfig.port;
+};
+
+app.use(compression());
+
+app.use('/node_modules', express.static(path.resolve(__dirname, '../node_modules')));
+
+app.get('/', (request, response) => {
+  response.sendFile(path.resolve(__dirname, 'index.html'));
+});
+
+function isRestricted(url) {
+  if (!config['renderOnly'])
+    return false;
+  for (let i = 0; i < config['renderOnly'].length; i++) {
+    if (url.startsWith(config['renderOnly'][i])) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// If configured, report action & time to Google Analytics.
+function track(action, time) {
+  if (config['analyticsTrackingId']) {
+    const postOptions = {
+      host: 'www.google-analytics.com',
+      path: '/collect',
+      method: 'POST'
+    };
+
+    const post = https.request(postOptions);
+    post.write(`v=1&t=event&ec=render&ea=${action}&ev=${Math.round(time)}&tid=${config['analyticsTrackingId']}&cid=${uuidv4()}`);
+    post.end();
+  }
+}
+
+app.get('/render/:url(*)', async(request, response) => {
+  if (isRestricted(request.params.url)) {
+    response.status(403).send('Render request forbidden, domain excluded');
+    return;
+  }
+
+  try {
+    const start = now();
+    const result = await renderer.serialize(request.params.url, request.query, config);
+    response.status(result.status).send(result.body);
+    track('render', now() - start);
+  } catch (err) {
+    let message = `Cannot render ${request.params.url}`;
+    if (err && err.message)
+      message += ` - "${err.message}"`;
+    response.status(400).send(message);
+  }
+});
+
+app.get('/screenshot/:url(*)', async(request, response) => {
+  if (isRestricted(request.params.url)) {
+    response.status(403).send('Render request forbidden, domain excluded');
+    return;
+  }
+
+  try {
+    const start = now();
+    const result = await renderer.captureScreenshot(request.params.url, request.query, config).catch((err) => console.error(err));
+    const img = new Buffer(result, 'base64');
+    response.set({
+      'Content-Type': 'image/jpeg',
+      'Content-Length': img.length
+    });
+    response.end(img);
+    track('screenshot', now() - start);
+  } catch (err) {
+    let message = `Cannot render ${request.params.url}`;
+    if (err && err.message)
+      message += ` - "${err.message}"`;
+    response.status(400).send(message);
+  }
+});
+
+app.get('/_ah/health', (request, response) => response.send('OK'));
+
+app.get('/_ah/stop', async(request, response) => {
+  await config.chrome.kill();
+  response.send('OK');
+});
+
+const appPromise = chromeLauncher.launch({
+  // 【修正】Chrome のデバッグポートを 0.0.0.0（全インタフェース）に公開せず、ローカルホストだけで待ち受ける。
+  // 公開したままだと、外部の誰でも DevTools プロトコル経由で file: の URL や内部アドレスを開いて内容を読める。
+  // renderer.js は同じホストから接続するので、127.0.0.1 で十分。
+  // 【修正3】allowPrivateNetwork が true でないときは、SharedWorker を無効にする
+  // （--disable-blink-features=SharedWorker）。SharedWorker はページではなくブラウザに属する
+  // 別ターゲットで、renderer.js がページのセッションで行う子ターゲットの自動アタッチでは監視できない。
+  // そのため、SharedWorker の中の fetch や WebSocket で内部アドレスの内容を読み、ページに渡して
+  // /render の HTML や /screenshot の画像として漏らせた。renderer.js は描画のたびに、SharedWorker が
+  // 無効になっていることを確かめ、有効なら描画しない。
+  chromeFlags: ['--headless', '--disable-gpu', '--remote-debugging-address=127.0.0.1']
+      .concat(config['allowPrivateNetwork'] ? [] : ['--disable-blink-features=SharedWorker']),
+  port: 0
+}).then((chrome) => {
+  console.log('Chrome launched with debugging on port', chrome.port);
+  config.chrome = chrome;
+  config.port = chrome.port;
+  // Don't open a port when running from inside a module (eg. tests). Importing
+  // module can control this.
+  const port = process.env.PORT || '3000';
+  if (!module.parent) {
+    app.listen(port, function() {
+      console.log('Listening on port', port);
+    });
+  }
+  return app;
+}).catch((error) => {
+  console.error(error);
+  // Critical failure, exit with error code.
+  process.exit(1);
+});
+
+
+let exceptionCount = 0;
+async function logUncaughtError(error) {
+  console.error('Uncaught exception');
+  console.error(error);
+  exceptionCount++;
+  // Restart instance due to several failures.
+  if (exceptionCount > 5) {
+    console.log(`Detected ${exceptionCount} errors, shutting instance down`);
+    if (config && config.chrome)
+      await config.chrome.kill();
+    process.exit(1);
+  }
+}
+
+if (!module.parent) {
+  process.on('uncaughtException', logUncaughtError);
+  process.on('unhandledRejection', logUncaughtError);
+}
+
+module.exports = appPromise;
+```
+
+### 修正コード3 の全文: src/renderer.js
+
+```javascript
+'use strict';
+
+const CDP = require('chrome-remote-interface');
+// 【修正】URL の検査（スキームと接続先アドレス）に使うモジュール
+const dns = require('dns');
+const net = require('net');
+const {URL} = require('url');
+
+// 【修正】レンダリングを許可する URL スキーム（file:, chrome:, data:, view-source: などは拒否する）
+const ALLOWED_PROTOCOLS = ['http:', 'https:'];
+
+// 【修正】内部アドレスへの接続を拒否したときのエラーメッセージ（利用者の入力は含めない）
+const PRIVATE_ADDRESS_MESSAGE = 'Access to private network address is forbidden';
+
+// 【修正2】子ターゲット（別プロセスの iframe や Worker）の通信を監視できなかったときのエラーメッセージ
+const UNMONITORED_TARGET_MESSAGE = 'Cannot monitor network access of a subframe or worker';
+
+// 【修正2】子ターゲットへの自動アタッチの設定。flatten 方式で、子ターゲットは起動直後に一時停止させる
+// （Network を有効にしてから動かすため、最初の通信から検査できる）
+const AUTO_ATTACH_PARAMS = {autoAttach: true, waitForDebuggerOnStart: true, flatten: true};
+
+// 【修正3】SharedWorker が無効になっていない（監視できない）ときのエラーメッセージ
+const SHARED_WORKER_MESSAGE = 'SharedWorker must be disabled (--disable-blink-features=SharedWorker)';
+
+/**
+ * 【修正】IPv4 アドレス（4 つの数値）が内部向け・予約済みの範囲か判定する。
+ * @param {!Array<number>} p
+ * @return {boolean}
+ */
+function isPrivateIPv4(p) {
+  return p[0] === 0 || p[0] === 10 || p[0] === 127 ||   // 0.0.0.0/8, 10.0.0.0/8, ループバック
+      (p[0] === 100 && p[1] >= 64 && p[1] <= 127) ||    // 100.64.0.0/10（CGN）
+      (p[0] === 169 && p[1] === 254) ||                 // リンクローカル（クラウドのメタデータサーバ）
+      (p[0] === 172 && p[1] >= 16 && p[1] <= 31) ||     // 172.16.0.0/12
+      (p[0] === 192 && p[1] === 168) ||                 // 192.168.0.0/16
+      (p[0] === 192 && p[1] === 0 && p[2] === 0) ||     // 192.0.0.0/24
+      (p[0] === 198 && (p[1] === 18 || p[1] === 19)) || // 198.18.0.0/15
+      p[0] >= 224;                                      // マルチキャスト・予約・ブロードキャスト
+}
+
+/**
+ * 【修正】IP アドレスがループバック・プライベート・リンクローカルなど、
+ * 外部の利用者に接続させてはならない範囲か判定する。判定できない値は true（拒否）とする。
+ * @param {string} address
+ * @return {boolean}
+ */
+function isPrivateAddress(address) {
+  const ip = String(address).replace(/^\[|\]$/g, '').replace(/%.*$/, '').toLowerCase();
+  if (net.isIPv4(ip))
+    return isPrivateIPv4(ip.split('.').map(Number));
+  if (!net.isIPv6(ip))
+    return true;
+
+  // IPv6 を 16 ビット × 8 個に展開する（末尾が IPv4 表記なら 16 進 2 個に変換する）。
+  let s = ip;
+  const v4 = s.match(/(\d+)\.(\d+)\.(\d+)\.(\d+)$/);
+  if (v4)
+    s = s.slice(0, v4.index) + ((v4[1] << 8) | v4[2]).toString(16) + ':' + ((v4[3] << 8) | v4[4]).toString(16);
+  const halves = s.split('::');
+  const head = halves[0] ? halves[0].split(':') : [];
+  const tail = halves[1] ? halves[1].split(':') : [];
+  const groups = halves.length === 2 ?
+      head.concat(new Array(Math.max(0, 8 - head.length - tail.length)).fill('0'), tail) : head;
+  if (groups.length !== 8)
+    return true;
+  const w = groups.map((g) => parseInt(g, 16));
+  const embedded = [w[6] >> 8, w[6] & 0xff, w[7] >> 8, w[7] & 0xff];
+
+  if (w[0] === 0 && w[1] === 0 && w[2] === 0 && w[3] === 0 && w[4] === 0 && (w[5] === 0 || w[5] === 0xffff))
+    return isPrivateIPv4(embedded);   // ::, ::1, IPv4 互換アドレス, IPv4 射影アドレス（::ffff:127.0.0.1 など）
+  if (w[0] === 0x64 && w[1] === 0xff9b)
+    return isPrivateIPv4(embedded);   // NAT64（64:ff9b::/96）
+  if (w[0] === 0x2002)
+    return isPrivateIPv4([w[1] >> 8, w[1] & 0xff, w[2] >> 8, w[2] & 0xff]);  // 6to4（2002::/16）
+  return (w[0] & 0xfe00) === 0xfc00 ||  // ユニークローカル fc00::/7
+      (w[0] & 0xffc0) === 0xfe80 ||     // リンクローカル fe80::/10
+      (w[0] & 0xffc0) === 0xfec0 ||     // サイトローカル fec0::/10（廃止済み）
+      (w[0] & 0xff00) === 0xff00;       // マルチキャスト ff00::/8
+}
+
+/**
+ * 【修正】利用者が指定した URL を検査し、正規化した URL を返す。
+ * http:/https: 以外のスキーム（file: など）と、内部ネットワークのアドレスに
+ * 解決されるホスト（localhost, 127.0.0.1, 169.254.169.254 など）は拒否する。
+ * config.allowPrivateNetwork が true のときだけ内部アドレスを許可する（テスト・社内利用向け）。
+ * @param {string} url
+ * @param {!Object} config
+ * @return {!Promise<string>}
+ */
+async function validateUrl(url, config) {
+  let parsed;
+  try {
+    parsed = new URL(url);
+  } catch (e) {
+    throw new Error('Invalid URL');
+  }
+  if (!ALLOWED_PROTOCOLS.includes(parsed.protocol))
+    throw new Error('URL scheme is not allowed');
+
+  if (!config['allowPrivateNetwork']) {
+    const hostname = parsed.hostname.replace(/^\[|\]$/g, '');
+    const addresses = await new Promise((resolve, reject) => {
+      dns.lookup(hostname, {all: true}, (err, result) => {
+        if (err)
+          reject(new Error('Cannot resolve host'));
+        else
+          resolve(result);
+      });
+    });
+    if (!addresses.length || addresses.some((a) => isPrivateAddress(a.address)))
+      throw new Error(PRIVATE_ADDRESS_MESSAGE);
+  }
+  return parsed.href;
+}
+
+/**
+ * 【修正2】ページが開いた WebSocket の接続先が内部アドレスか判定する。
+ * WebSocket の CDP イベントには接続先の IP（remoteIPAddress）が無いため、URL のホストを
+ * 自分で検査する。IP アドレスならそのまま判定し、ホスト名なら DNS で引いて 1 つでも内部
+ * アドレスがあれば true とする。URL が解析できない・名前が解決できない場合も true（拒否）とする。
+ * @param {string} url
+ * @return {!Promise<boolean>}
+ */
+async function isPrivateWebSocketUrl(url) {
+  let hostname;
+  try {
+    hostname = new URL(url).hostname.replace(/^\[|\]$/g, '');
+  } catch (e) {
+    return true;
+  }
+  if (net.isIP(hostname))
+    return isPrivateAddress(hostname);
+  return new Promise((resolve) => {
+    dns.lookup(hostname, {all: true}, (err, result) => {
+      resolve(!!err || !result.length || result.some((a) => isPrivateAddress(a.address)));
+    });
+  });
+}
+
+class Renderer {
+  _loadPage(client, url, options, config) {
+    /**
+     * Finds any meta tags setting the status code.
+     * @return {?number} status code
+     */
+    function getStatusCode() {
+      const metaElement = document.querySelector('meta[name="render:status_code"]');
+      if (!metaElement)
+        return undefined;
+      return parseInt(metaElement.getAttribute('content')) || undefined;
+    }
+
+    /**
+     * Listens for the 'render-complete' event.
+     */
+    function listenForCompletionEvent() {
+      document.addEventListener('render-complete', () => {
+        console.log('Rendering complete');
+      });
+    }
+
+    return new Promise(async(resolve, reject) => {
+      // 【修正2】子ターゲットの監視に Target ドメインを使う
+      const {Page, Runtime, Network, Emulation, Console, Target} = client;
+
+      await Promise.all([
+        Page.enable(),
+        Runtime.enable(),
+        Console.enable(),
+        Network.enable(),
+        Network.setBypassServiceWorker({bypass: true}),
+      ]);
+
+      // Inject the Shady DOM polyfill if web components v1 is used, so we can
+      // serialize the page.
+      // TODO(samli): This needs to change to use the non-deprecated API after Chrome 61
+      //   addScriptToEvaluateOnNewDocument({source: `ShadyDOM = {force: true}`})
+      const shadyFlag = options['wc-inject-shadydom'];
+      if (shadyFlag == '' || !!shadyFlag) {
+        // Deprecated in Chrome 61.
+        Page.addScriptToEvaluateOnLoad({scriptSource: `customElements.forcePolyfill = true`});
+        Page.addScriptToEvaluateOnLoad({scriptSource: `ShadyDOM = {force: true}`});
+        Page.addScriptToEvaluateOnLoad({scriptSource: `ShadyCSS = {shimcssproperties: true}`});
+      }
+
+      // Add hook for completion event.
+      Page.addScriptToEvaluateOnLoad({scriptSource: `(${listenForCompletionEvent.toString()})()`});
+
+      if (!!config['debug']) {
+        Console.messageAdded((event) => {
+          console.log(`[${event.message.level}] ${event.message.text}`);
+        });
+      }
+
+      // 【修正】実際に接続した相手の IP アドレスを応答ごとに検査する。
+      // 公開ホストからのリダイレクト、ページ内の JavaScript による遷移や iframe、
+      // DNS リバインディングで内部アドレスに接続した場合も、その内容を利用者に返さない。
+      let blocked = false;
+      const checkRemoteAddress = (response) => {
+        if (config['allowPrivateNetwork'] || !response || !response.remoteIPAddress)
+          return;
+        if (isPrivateAddress(response.remoteIPAddress)) {
+          blocked = true;
+          reject(new Error(PRIVATE_ADDRESS_MESSAGE));
+        }
+      };
+
+      // 【修正2】サイト分離で別プロセスになった cross-site の iframe（OOPIF）や Dedicated Worker の
+      // 通信は、このページのセッションには Network イベントが届かない。そのままでは、OOPIF の中の
+      // iframe・fetch や Worker の fetch で内部アドレスに接続しても checkRemoteAddress が呼ばれず、
+      // その内容が /render の HTML や /screenshot の画像で漏れる。
+      // そこで子ターゲットに自動でアタッチし（孫以下にも同じ設定をする）、各セッションで Network を
+      // 有効にする。子セッションの Network イベントも、同じ接続の下のハンドラ（下の
+      // Network.requestWillBeSent / Network.responseReceived）に届くので、同じ検査がかかる。
+      // 監視を始められなかった子ターゲットがあれば、一時停止させたまま内容を返さない（fail closed）。
+      if (!config['allowPrivateNetwork']) {
+        // 【修正3】SharedWorker はページではなくブラウザに属する別ターゲットで、下のページのセッションの
+        // Target.setAutoAttach ではアタッチされない（SharedWorker の中の fetch・WebSocket は、どのハンドラ
+        // にも届かず検査されない）。そのため main.js で SharedWorker を無効にしている。起動の設定が違う
+        // 場合やフラグが効かない版の Chrome に備えて、ページを読み込む前（about:blank のまま、ページの
+        // スクリプトが動く前）に SharedWorker が無いことを確かめ、有れば描画しない（fail closed）。
+        try {
+          const sharedWorkerCheck = await Runtime.evaluate({expression: 'typeof SharedWorker'});
+          if (sharedWorkerCheck.result.value !== 'undefined')
+            throw new Error(SHARED_WORKER_MESSAGE);
+        } catch (error) {
+          reject(new Error(SHARED_WORKER_MESSAGE));
+          return;
+        }
+
+        Target.attachedToTarget(async(event) => {
+          const sessionId = event.sessionId;
+          // 【修正3】Service Worker は、一時停止を解くまで子のセッションの Network.enable の応答が
+          // 返らない。修正コード2 は応答を待ってから一時停止を解いていたので、Service Worker が
+          // 一時停止のまま動かなくなっていた（Service Worker を使うページの動作が元のコードと変わる）。
+          // Service Worker では、Network.enable と Target.setAutoAttach を送った後、応答を待たずに
+          // 一時停止を解く。同じセッションのコマンドは送った順に処理されるので、Network が有効に
+          // なってから Service Worker のスクリプトが動き出し、最初の通信から検査がかかる。
+          // 失敗したときは、ほかの子ターゲットと同じく内容を返さない（fail closed）。
+          if (event.targetInfo && event.targetInfo.type === 'service_worker') {
+            const setup = Promise.all([
+              client.send('Network.enable', {}, sessionId),
+              client.send('Target.setAutoAttach', AUTO_ATTACH_PARAMS, sessionId),
+            ]);
+            client.send('Runtime.runIfWaitingForDebugger', {}, sessionId).catch(() => {});
+            setup.catch(() => {
+              blocked = true;
+              reject(new Error(UNMONITORED_TARGET_MESSAGE));
+            });
+            return;
+          }
+          try {
+            await client.send('Network.enable', {}, sessionId);
+            await client.send('Target.setAutoAttach', AUTO_ATTACH_PARAMS, sessionId);
+          } catch (error) {
+            blocked = true;
+            reject(new Error(UNMONITORED_TARGET_MESSAGE));
+            return;
+          }
+          client.send('Runtime.runIfWaitingForDebugger', {}, sessionId).catch(() => {});
+        });
+        try {
+          await Target.setAutoAttach(AUTO_ATTACH_PARAMS);
+        } catch (error) {
+          reject(new Error(UNMONITORED_TARGET_MESSAGE));
+          return;
+        }
+      }
+
+      // 【修正2】WebSocket には同一オリジンポリシー（CORS）がかからず、ページの JavaScript が
+      // ws://127.0.0.1:... などの内部サービスから受け取った内容を DOM に書けば、/render で返ってしまう。
+      // WebSocket の CDP イベントには接続先の IP が無いので、作られた時点で URL のホストを検査する
+      // （子ターゲットの WebSocket も同じハンドラに届く）。DNS を引く検査は非同期なので、
+      // 実行中の検査を pendingChecks に入れ、内容を返す前の checkBlocked で終わるのを待つ。
+      const pendingChecks = new Set();
+      Network.webSocketCreated((event) => {
+        if (config['allowPrivateNetwork'])
+          return;
+        const check = isPrivateWebSocketUrl(event.url).then((isPrivate) => {
+          if (isPrivate) {
+            blocked = true;
+            reject(new Error(PRIVATE_ADDRESS_MESSAGE));
+          }
+          pendingChecks.delete(check);
+        });
+        pendingChecks.add(check);
+      });
+
+      Page.navigate({url: url}).catch(reject);
+
+      // Check that all outstanding network requests have finished loading.
+      const outstandingRequests = new Map();
+      let initialRequestId = undefined;
+      Network.requestWillBeSent((event) => {
+        // 【修正】リダイレクト元の応答も検査する
+        checkRemoteAddress(event.redirectResponse);
+        if (!initialRequestId)
+          initialRequestId = event.requestId;
+        outstandingRequests.set(event.requestId, event);
+      });
+
+      let statusCode = 200;
+      Network.responseReceived((event) => {
+        // 【修正】すべての応答（メイン文書・サブリソース）の接続先を検査する
+        checkRemoteAddress(event.response);
+        if (event.requestId == initialRequestId && event.response.status != 0)
+          statusCode = event.response.status;
+      });
+
+      Network.loadingFinished((event) => {
+        outstandingRequests.delete(event.requestId);
+      });
+
+      Network.loadingFailed((event) => {
+        if (event.requestId == initialRequestId) {
+          reject({message: event.errorText});
+        }
+        outstandingRequests.delete(event.requestId);
+      });
+
+      // Ensure the page load event has fired.
+      let pageLoadEventFired = false;
+      Page.loadEventFired(() => {
+        pageLoadEventFired = true;
+      });
+
+      // Set a virtual time budget of 10 seconds. This 10 second timer is paused while there are
+      // any active network requests. This allows for a maximum of 10 seconds in script/rendering
+      // time. Once the page is idle, the virtual time budget expires immediately.
+      let currentTimeBudget = 10000;
+      Emulation.setVirtualTimePolicy({policy: 'pauseIfNetworkFetchesPending', budget: currentTimeBudget});
+
+      let budgetExpired = async() => {
+        let result = await Runtime.evaluate({expression: `(${getStatusCode.toString()})()`});
+        // Original status codes which aren't either 200 or 304 always return with that
+        // status code, regardless of meta tags.
+        if ((statusCode == 200 || statusCode == 304) && result.result.value)
+          statusCode = result.result.value;
+
+        resolve({
+          status: statusCode || 200,
+          // 【修正】読み込み完了の後（内容の取り出し直前）にも、内部アドレスへの
+          // 接続がなかったかを呼び出し側で確認できるようにする
+          // 【修正2】WebSocket の接続先の検査（非同期）が終わるのを待ってから判定する
+          checkBlocked: async() => {
+            await Promise.all(Array.from(pendingChecks));
+            if (blocked)
+              throw new Error(PRIVATE_ADDRESS_MESSAGE);
+          },
+        });
+        budgetExpired = () => {};
+        clearTimeout(timeoutId);
+      };
+
+      Emulation.virtualTimeBudgetExpired((event) => {
+        // Reset the virtual time budget if there is still outstanding work. Converge the virtual time
+        // budget just in case network requests are firing on a regular timer.
+        if (outstandingRequests.size || !pageLoadEventFired) {
+          // Budget must be an integer.
+          currentTimeBudget = Math.ceil(currentTimeBudget / 2);
+          Emulation.setVirtualTimePolicy({policy: 'pauseIfNetworkFetchesPending', budget: currentTimeBudget});
+          return;
+        }
+        budgetExpired();
+      });
+
+      // Set a hard limit of 10 seconds.
+      let timeoutId = setTimeout(() => {
+        console.log(`10 second time budget limit reached.
+          Attempted rendering: ${url}
+          Page load event fired: ${pageLoadEventFired}
+          Outstanding network requests: ${outstandingRequests.size}`);
+        budgetExpired();
+      }, 10000);
+
+      // Listen for the message that signals that rendering event was fired.
+      Console.messageAdded((event) => {
+        if (event.message.text === 'Rendering complete') {
+          budgetExpired();
+        }
+      });
+    });
+  }
+
+  serialize(url, options, config) {
+    /**
+     * Executed on the page after the page has loaded. Strips script and
+     * import tags to prevent further loading of resources.
+     */
+    function stripPage() {
+      const elements = document.querySelectorAll('script, link[rel=import]');
+      elements.forEach((e) => e.remove());
+    }
+
+    /**
+     * Injects a <base> tag which allows other resources to load. This
+     * has no effect on serialised output, but allows it to verify render quality.
+     * @param {string} url - Requested URL to set as the base.
+     */
+    function injectBaseHref(url) {
+      const base = document.createElement('base');
+      base.setAttribute('href', url);
+      document.head.appendChild(base);
+    }
+
+    return new Promise(async(resolve, reject) => {
+      // 【修正】タブを開く前に URL を検査し、以降は正規化した URL だけを使う
+      try {
+        url = await validateUrl(url, config);
+      } catch (error) {
+        reject(error);
+        return;
+      }
+
+      const tab = await CDP.New({port: config.port});
+      const client = await CDP({tab: tab, port: config.port});
+
+      const {Runtime} = client;
+
+      try {
+        let renderResult = await this._loadPage(client, url, options, config);
+
+        await Runtime.evaluate({expression: `(${stripPage.toString()})()`});
+        // 【修正】URL を JSON 文字列リテラルとして埋め込む（' を含む URL で式が壊れる・注入されるのを防ぐ）
+        await Runtime.evaluate({expression: `(${injectBaseHref.toString()})(${JSON.stringify(url)})`});
+
+        let result = await Runtime.evaluate({expression: 'document.firstElementChild.outerHTML'});
+        CDP.Close({id: client.target.id, port: config.port});
+        // 【修正】内容を返す直前に、内部アドレスへの接続がなかったか再確認する
+        // 【修正2】checkBlocked は非同期になったので await する
+        await renderResult.checkBlocked();
+        resolve({
+          status: renderResult.status,
+          body: result.result.value});
+      } catch (error) {
+        reject(error);
+      }
+    });
+  }
+
+  captureScreenshot(url, options, config) {
+    return new Promise(async(resolve, reject) => {
+      // 【修正】タブを開く前に URL を検査し、以降は正規化した URL だけを使う
+      try {
+        url = await validateUrl(url, config);
+      } catch (error) {
+        reject(error);
+        return;
+      }
+
+      const tab = await CDP.New({port: config.port});
+      const client = await CDP({tab: tab, port: config.port});
+
+      const {Animation, Page, Emulation} = client;
+
+      // Accelerate global animation timeline so that loading animations
+      // are hopefully complete by the time we take the screenshot.
+      Animation.setPlaybackRate({playbackRate: 1000});
+
+      const width = Math.min(2000, parseInt(options['width']) || 1000);
+      const height = Math.min(2000, parseInt(options['height']) || 1000);
+      await Emulation.setDeviceMetricsOverride({width: width, height: height, mobile: true, deviceScaleFactor: 3.5, fitWindow: false, screenWidth: width, screenHeight: height});
+      await Emulation.setVisibleSize({width: width, height: height});
+
+      try {
+        // 【修正】結果を受け取り、撮影後に内部アドレスへの接続がなかったか確認する
+        let renderResult = await this._loadPage(client, url, options, config);
+        let {data} = await Page.captureScreenshot({format: 'jpeg', quality: 60});
+
+        CDP.Close({id: client.target.id, port: config.port});
+        // 【修正2】checkBlocked は非同期になったので await する
+        await renderResult.checkBlocked();
+        resolve(data);
+      } catch (error) {
+        reject(error);
+      }
+    });
+  }
+}
+
+module.exports = new Renderer();
+```
+
+---
