@@ -1,0 +1,25 @@
+### No.10 OWASP-Benchmark/BenchmarkPython testcode/BenchmarkTest00097.py
+- 対象: https://github.com/OWASP-Benchmark/BenchmarkPython/blob/main/testcode/BenchmarkTest00097.py（GitHub のコード（第1回で取得したときのコミットに固定））
+- 判定: **脆弱性あり**（クロスサイトスクリプティング（反射型 XSS）・CWE-79）
+- XSS に該当: 種別・source・sink は "第2回xssの詳細"、修正コードは "第2回修正版コード" を参照
+- 根拠（エージェントの判定記録から）:
+  - 根拠: testcode/BenchmarkTest00097.py の BenchmarkTest00097_post()（GET でも同じ関数を呼ぶ）で、31 行目 request.form.get("BenchmarkTest00097") で受け取ったフォームの値 param を、37 行目で空白で区切った先頭部分 bar = param.split(' ')[0] にし、41〜43 行目の f 文字列で RESPONSE にそのまま埋め込み、45 行目で return RESPONSE している。
+  - Flask は str を返すと Content-Type: text/html; charset=utf-8 で応答するため、bar はブラウザで HTML として解釈される。
+  - 19 行目で helpers.utils.escape_for_html を import しているが使っていない。他に HTML エスケープ・検証の処理はない。app.py にも after_request や CSP などの防御はない（同じコミットの app.py・helpers/utils.py を確認）。
+  - 空白で区切った先頭部分だけが使われるが、空白を含まない形のタグ（属性の区切りに / を使うなど）でイベントハンドラ付きの要素を書けるので、防御にならない。
+  - テストページ（templates/web/xss-00/BenchmarkTest00097.html）ではチェックボックスの固定値（SafeText など）を送るが、値はクライアント側で自由に変えられる。
+- 使用トークン量（判定）: 新規 9,529（入力 10 ／ キャッシュ作成 6,494 ／ 出力〔推定〕 3,025）、キャッシュ読込 105,621、総処理 115,150、リクエスト 5 回（出力の記録値 3,005）
+
+---
+## No.10 OWASP-Benchmark/BenchmarkPython testcode/BenchmarkTest00097.py
+- 対象: https://github.com/OWASP-Benchmark/BenchmarkPython/blob/main/testcode/BenchmarkTest00097.py
+
+- **XSS 種別**: 反射型。リクエストのフォームパラメータの値が、保存されずに同じリクエストの応答にそのまま出力されるため。
+- **source**: testcode/BenchmarkTest00097.py 31 行目 param = request.form.get("BenchmarkTest00097")（POST のフォームパラメータ。GET ルート 23〜25 行目も同じ処理に入る）
+- **伝播経路**: 31 行目 param → 32〜33 行目（空なら ""）→ 37 行目 bar = param.split(' ')[0]（空白より前の部分。エスケープなし）→ 41〜43 行目 RESPONSE += f'bar is \'{bar}\' and otherarg is \'{otherarg}\'' → 45 行目 return RESPONSE
+- **sink**: testcode/BenchmarkTest00097.py 45 行目 return RESPONSE（42 行目の f 文字列で bar を埋め込んだ文字列を text/html の応答本文として返す）
+- **脆弱性の位置**: sink 側。source（31 行目）から sink（42・45 行目）までの間に HTML エスケープがなく、出力の直前（42 行目で埋め込むとき）に出力先の文脈（HTML 本文）に合わせたエスケープをしていないことが原因。
+- **攻撃例**: 攻撃者が、パラメータ BenchmarkTest00097 に空白を含まないスクリプト実行用のタグ（例: 画像タグの読み込みエラー時にスクリプトを実行するもの）を入れたフォームを自動送信する罠ページを用意し、被害者に開かせる。被害者のブラウザから対象 URL へ POST が送られ、応答の HTML にタグがそのまま入るため、対象サイトのオリジンでスクリプトが実行され、Cookie の窃取や画面の改ざんなどができる。
+  - 修正案: 42 行目で埋め込む前に bar を helpers.utils.escape_for_html（または markupsafe.escape / html.escape）でエスケープする。
+
+---
