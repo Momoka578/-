@@ -1,0 +1,239 @@
+## No.14 CVE-2016-1000229 swagger-ui (src/main/javascript/helpers/handlebars.js の renderTextParam ヘルパー)
+- 対象: https://github.com/ossf-cve-benchmark/ossf-cve-benchmark/blob/main/CVEs/CVE-2016-1000229.json
+- XSS 種別: DOM-base（source・sink は "第2回xssの詳細"）
+- 修正したファイル: handlebars.js
+
+### 修正コードの説明
+
+#### No.14 CVE-2016-1000229 swagger-ui 修正コードの説明
+
+対象ファイル: `src/main/javascript/helpers/handlebars.js`（prePatch コミット 14fad2b4c76efe249db515c98432eb609aa77691）
+修正ファイル: `fix01_handlebars.js`（全文）
+
+#### 1. 修正の方針
+
+- 防ぐ脆弱性（source → sink）
+  - source: 攻撃者が用意した Swagger 定義（index.html 36〜38 行目の `?url=` で読み込み先を指定できる）の `parameters[].default` と `x-data-*` プロパティ。
+  - sink: `renderTextParam` ヘルパーが文字列連結で組み立てた `<input ... value='...'>` / `<textarea>...</textarea>` の HTML。`Handlebars.SafeString`（元の 68 行目）で返されるため自動エスケープが効かず、ParameterView.js 61 行目の `$(this.el).html(...)` で DOM に書き込まれる。
+- どこで防ぐか: sink の直前、HTML 文字列を組み立てている `renderTextParam`（handlebars.js）の中で防ぐ。
+- どのように防ぐか: 外部由来の値を HTML に連結する前に、`Handlebars.Utils.escapeExpression` で HTML エスケープする。属性名として使う `x-data-*` のプロパティ名は、安全な文字（英数字・`_`・`-`）だけのものに限る（ホワイトリスト）。
+- この方法を選んだ理由
+  - default 値は「入力欄の初期値」というただの文字列で、HTML として解釈させる必要がない。このため、タグを残しつつ危険な部分を消す「サニタイズ」ではなく、すべての特殊文字を文字参照に置き換える「エスケープ」が正しい対策になる（CWE-116 の「出力先に合ったエンコード」）。
+  - 元の `sanitize` は正規表現のブラックリストで、`'`・`<`・`>` を残すうえ、`onerror=alert(document.domain)` のような形や `<scr<script></script>ipt>` のような入れ子を除去できない。ブラックリストを強化しても漏れが残りやすい。
+  - `escapeExpression` は Handlebars に組み込みの関数で、同じ関数内の `name`・`valueId`・`paramType`（元の 33〜35 行目）でもすでに使われている。新しいライブラリが不要で、修正は 1 ファイル数行で済む。
+  - 呼び出し元のテンプレート（param.handlebars、param_required.handlebars）と、コンパイル済みの templates.js を変更しなくてよい。
+
+#### 2. 変更箇所ごとの説明
+
+##### 変更 1: default 値のエスケープ（元の 53 行目 → 修正後 57〜61 行目）
+
+修正前:
+
+```js
+    defaultValue = sanitize(defaultValue);
+```
+
+修正後:
+
+```js
+    // 【修正】default 値は「入力欄の初期値（ただの文字列）」なので、ブラックリスト型の sanitize ではなく
+    //         HTML エスケープ（& < > " ' ` = を文字参照に変換）を行う。
+    //         sanitize は ' や < > を残すため、value='...' や <textarea> から抜け出してタグを挿入できた。
+    //         エスケープ後は、属性値・textarea 本文のどちらに入れても、ただの文字として表示される。
+    defaultValue = Handlebars.Utils.escapeExpression(defaultValue);
+```
+
+- 61 行目: `escapeExpression` は `&`→`&amp;`、`<`→`&lt;`、`>`→`&gt;`、`"`→`&quot;`、`'`→`&#x27;`、`` ` ``→`&#x60;`、`=`→`&#x3D;` に置き換えた文字列を返す。`undefined`・`null` は空文字列、数値・真偽値は文字列にする。
+- XSS が防げる理由
+  - 修正後 74 行目 `value='...'`（単一引用符の属性）: `'` が `&#x27;` になるので属性値を閉じられない。`<`・`>` も文字参照になるのでタグを閉じたり新しいタグを書いたりできない。
+  - 修正後 66 行目 `<textarea>...</textarea>` の本文: `<` が `&lt;` になるので `</textarea>` で要素を閉じられず、新しいタグも作れない。
+  - 文字参照はブラウザが解析時に元の文字へ戻すので、入力欄には元の文字列がそのまま表示される（コードとしては解釈されない）。
+
+##### 変更 2: x-data-* 拡張プロパティの名前の制限（元の 37〜40 行目 → 修正後 37〜41 行目）
+
+修正前:
+
+```js
+    var dataVendorExtensions = Object.keys(param).filter(function(property) {
+        // filter X-data- properties
+        return property.match(/^X-data-/i) !== null;
+```
+
+修正後:
+
+```js
+    var dataVendorExtensions = Object.keys(param).filter(function(property) {
+        // filter X-data- properties
+        // 【修正】属性名として連結するので、名前は英数字・_・- だけからなるものに限る。
+        //         空白・引用符・= などを含む名前で、別の属性（onmouseover など）を追加されるのを防ぐ。
+        return property.match(/^X-data-[\w-]+$/i) !== null;
+```
+
+- 41 行目: 正規表現を `/^X-data-/i`（先頭が一致すればよい）から `/^X-data-[\w-]+$/i`（`X-data-` の後ろが英数字・`_`・`-` だけで最後まで続く）に変えた。条件に合わないプロパティは属性にしない。
+- XSS が防げる理由: プロパティ名は `data-...` という属性名として HTML に直接書かれる（46 行目）。名前に空白を含めると `data-x onmouseover` のように別の属性を書き足せ、値と組み合わせてイベントハンドラを作れる。属性名はエスケープしても空白で区切られてしまうため、エスケープではなく使える文字を限定する方法をとった。
+
+##### 変更 3: x-data-* 拡張プロパティの値のエスケープ（元の 42 行目 → 修正後 43〜46 行目）
+
+修正前:
+
+```js
+        return result += ' ' + property.substring(2, property.length) + '=\'' + param[property] + '\'';
+```
+
+修正後:
+
+```js
+        // 【修正】値は API 定義から来る信頼できない文字列なので、HTML エスケープしてから属性値に入れる。
+        //         ' が &#x27; になり、属性値 '...' から抜け出せなくなる。
+        return result += ' ' + property.substring(2, property.length) + '=\'' + Handlebars.Utils.escapeExpression(param[property]) + '\'';
+```
+
+- 46 行目: `param[property]` を `escapeExpression` で包んだだけで、属性の組み立て方は変えていない。
+- XSS が防げる理由: 値は単一引用符の属性値 `data-foo='...'` に入る。`'` が `&#x27;` になるので属性値を閉じられず、後ろに `onfocus=...` などの属性や `>` 以降のタグを書けない。
+
+##### 変更 4: コメントの追加（修正後 76〜77 行目）
+
+```js
+    // result に入る外部由来の値（name・valueId・paramType・default・x-data-* の値）はすべてエスケープ済みなので、
+    // SafeString で返しても安全になる。
+    return new Handlebars.SafeString(result);
+```
+
+- 78 行目の `return new Handlebars.SafeString(result);` は変更していない。SafeString で返すこと自体は、ヘルパーが作ったタグ（`<input>`・`<textarea>`）をそのまま出すために必要である。その前提として、連結する外部由来の値がすべてエスケープ済みになったことをコメントで明記した。
+
+#### 3. 修正の結果
+
+- 攻撃例の入力の扱い
+  - query パラメータの default が「`x'` のあとに `>` と、onerror 付きの img タグ」の場合: 修正前は `value='x'` で属性が閉じ、`>` で input タグが閉じ、続く img 要素が DOM に入って onerror が実行された。修正後は `'`・`>`・`<`・`=` が文字参照になり、全体が value 属性の中に収まる。入力欄にはその文字列がそのまま表示され、img 要素は作られず、スクリプトは実行されない。
+  - 配列型パラメータの default が「`</textarea>` のあとに img タグ」の場合: `<` が `&lt;` になるので textarea は閉じず、文字列は textarea の中に文字として表示される。
+  - `x-data-foo` の値に `'` と onfocus 属性を入れた場合: `'` がエスケープされるので、全体が `data-foo` 属性の値になるだけで、新しい属性は作られない。
+  - `x-data-foo onmouseover` のように名前に空白を含めた場合: ホワイトリストに合わないので属性として出力されない。
+- 正常な入力での動作への影響
+  - 変わらない点: 通常の default 値（英数字、日本語、URL、JSON 文字列など）は、入力欄・textarea に修正前と同じ文字列で表示される。`&` や `<`、`"` などを含む値も、ブラウザが文字参照を元に戻すので見た目は同じで、送信される値も同じ。`x-data-foo`・`x-data-my-attr` のような通常の拡張プロパティは、修正前と同じく `data-foo='...'` 属性として出力される。input の種類（text/password）、required、id、name、placeholder の扱いも変わらない。
+  - 変わる点: (1) 修正前は default に `<script>...</script>` や `onxxx="..."` が含まれると sanitize がその部分を消していたが、修正後は消さずに文字として表示する（値を勝手に書き換えなくなる）。(2) default が未定義（`undefined`）・`null` のとき、修正前は SafeString の文字列化で `undefined`・`null` という文字が value に入っていたが、修正後は空文字列になる。(3) `x-data-` の後ろに英数字・`_`・`-` 以外の文字（`.` や `:` など）を含むプロパティ名は属性として出力されなくなる。
+
+#### 4. 注意点
+
+- 修正したのは `renderTextParam`（CVE で示された位置）だけである。次の同種の問題は修正していない。
+  - `sanitize` ヘルパー（handlebars.js 4〜24 行目）は正規表現のブラックリストのままで、バイパスできる。これを使ってマークダウン・HTML を出力している箇所（main.handlebars の `info.description`・`info.title`、operation.handlebars の `description`、param*.handlebars の `description`・`default`（読み取り専用表示）など）は、攻撃者の定義で XSS になりうる。根本的に直すには DOMPurify などの、DOM を使うホワイトリスト型サニタイザに置き換える必要がある（ライブラリの追加が必要なため、今回の最小修正の範囲外とした）。
+  - `sanitize` の結果を属性値に入れている箇所（operation.handlebars の `href='#!/{{sanitize ...}}'`・`id='...'`、resource.handlebars の `href='{{{sanitize url}}}'`・`data-id="..."`、param_list.handlebars の `name="..."`・`value='...'` など）は、引用符で属性から抜け出せる。`{{{escape ...}}}` に変える必要がある（`href` は `javascript:` URL の拒否も必要）。
+  - param_list.handlebars 17 行目の `{{{description}}}` は無加工で出力している。
+  - SwaggerUi.js の `renderGFM`（236〜244 行目）は `.markdown` 要素の内容を marked で変換して `.html()` に戻しており、marked の出力も無害化されていない。
+- テンプレート（*.handlebars）はコンパイル済みの `templates.js` と、gulp でビルドした `dist/swagger-ui.js` から使われる。今回の修正は handlebars.js だけなので、配布物に反映するにはビルドし直す必要がある。
+- 根本的には、`?url=` で任意の定義を読み込める設計のため、信頼できない定義の内容はすべて「攻撃者の入力」として扱い、出力のたびに文脈に合ったエスケープを行う必要がある。
+
+### 修正したコード: handlebars.js
+
+```javascript
+'use strict';
+/*jslint eqeq: true*/
+
+var _sanitize = function(html) {
+    // Strip the script tags from the html and inline evenhandlers
+    html = html.replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, '');
+    html = html.replace(/(on\w+="[^"]*")*(on\w+='[^']*')*(on\w+=\w*\(\w*\))*/gi, '');
+
+    return html;
+};
+
+var sanitize =function (html) {
+    var _html;
+    if( _.isUndefined(html) || _.isNull(html) || _.isNumber(html))  {
+        return new Handlebars.SafeString(html);
+    }
+
+    if (_.isObject(html)){
+        _html = JSON.stringify(html);
+        return new Handlebars.SafeString(JSON.parse(_sanitize(_html)));
+    }
+
+    return new Handlebars.SafeString(_sanitize(html));
+};
+
+Handlebars.registerHelper('sanitize', sanitize);
+
+Handlebars.registerHelper('renderTextParam', function(param) {
+    var result, type = 'text', idAtt = '';
+    var paramType = param.type || param.schema && param.schema.type || '';
+    var isArray = paramType.toLowerCase() === 'array' || param.allowMultiple;
+    var defaultValue = isArray && Array.isArray(param.default) ? param.default.join('\n') : param.default;
+    var name = Handlebars.Utils.escapeExpression(param.name);
+    var valueId = Handlebars.Utils.escapeExpression(param.valueId);
+    paramType = Handlebars.Utils.escapeExpression(paramType);
+
+    var dataVendorExtensions = Object.keys(param).filter(function(property) {
+        // filter X-data- properties
+        // 【修正】属性名として連結するので、名前は英数字・_・- だけからなるものに限る。
+        //         空白・引用符・= などを含む名前で、別の属性（onmouseover など）を追加されるのを防ぐ。
+        return property.match(/^X-data-[\w-]+$/i) !== null;
+    }).reduce(function(result, property) {
+        // remove X- from property name, so it results in html attributes like data-foo='bar'
+        // 【修正】値は API 定義から来る信頼できない文字列なので、HTML エスケープしてから属性値に入れる。
+        //         ' が &#x27; になり、属性値 '...' から抜け出せなくなる。
+        return result += ' ' + property.substring(2, property.length) + '=\'' + Handlebars.Utils.escapeExpression(param[property]) + '\'';
+    }, '');
+
+    if(param.format && param.format === 'password') {
+        type = 'password';
+    }
+
+    if(valueId) {
+        idAtt = ' id=\'' + valueId + '\'';
+    }
+
+    // 【修正】default 値は「入力欄の初期値（ただの文字列）」なので、ブラックリスト型の sanitize ではなく
+    //         HTML エスケープ（& < > " ' ` = を文字参照に変換）を行う。
+    //         sanitize は ' や < > を残すため、value='...' や <textarea> から抜け出してタグを挿入できた。
+    //         エスケープ後は、属性値・textarea 本文のどちらに入れても、ただの文字として表示される。
+    defaultValue = Handlebars.Utils.escapeExpression(defaultValue);
+
+    if(isArray) {
+        result = '<textarea class=\'body-textarea' + (param.required ? ' required' : '') + '\' name=\'' + name + '\'' + idAtt + dataVendorExtensions;
+        result += ' placeholder=\'Provide multiple values in new lines' + (param.required ? ' (at least one required).' : '.') + '\'>';
+        result += defaultValue + '</textarea>';
+    } else {
+        var parameterClass = 'parameter';
+        if(param.required) {
+          parameterClass += ' required';
+        }
+        result = '<input class=\'' + parameterClass + '\' minlength=\'' + (param.required ? 1 : 0) + '\'';
+        result += ' name=\'' + name +'\' placeholder=\'' + (param.required ? '(required)' : '') + '\'' + idAtt + dataVendorExtensions;
+        result += ' type=\'' + type + '\' value=\'' + defaultValue + '\'/>';
+    }
+    // result に入る外部由来の値（name・valueId・paramType・default・x-data-* の値）はすべてエスケープ済みなので、
+    // SafeString で返しても安全になる。
+    return new Handlebars.SafeString(result);
+});
+
+Handlebars.registerHelper('ifCond', function (v1, operator, v2, options) {
+
+    switch (operator) {
+        case '==':
+            return (v1 == v2) ? options.fn(this) : options.inverse(this);
+        case '===':
+            return (v1 === v2) ? options.fn(this) : options.inverse(this);
+        case '<':
+            return (v1 < v2) ? options.fn(this) : options.inverse(this);
+        case '<=':
+            return (v1 <= v2) ? options.fn(this) : options.inverse(this);
+        case '>':
+            return (v1 > v2) ? options.fn(this) : options.inverse(this);
+        case '>=':
+            return (v1 >= v2) ? options.fn(this) : options.inverse(this);
+        case '&&':
+            return (v1 && v2) ? options.fn(this) : options.inverse(this);
+        case '||':
+            return (v1 || v2) ? options.fn(this) : options.inverse(this);
+        default:
+            return options.inverse(this);
+    }
+});
+
+Handlebars.registerHelper('escape', function (value) {
+    var text = Handlebars.Utils.escapeExpression(value);
+
+    return new Handlebars.SafeString(text);
+});
+```
+
+---
