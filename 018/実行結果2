@@ -1,0 +1,30 @@
+### No.18 google/firing-range ToxicDomScripts.java（+ 配信する src/tests/dom/data/sources/*/*.tmpl・sinks/*.tmpl）
+- 対象: https://github.com/google/firing-range/blob/master/src/tests/dom/ToxicDomScripts.java（GitHub のコード（第1回で取得したときのコミットに固定））
+- 判定: **脆弱性あり**（DOM-based XSS・CWE-79／eval によるコードインジェクション CWE-95、postMessage の送信元検証の欠如・不備 CWE-346 を含む）
+- XSS に該当: 種別・source・sink は "第2回xssの詳細"、修正コードは "第2回修正版コード" を参照
+- 根拠（エージェントの判定記録から）:
+  - 根拠:
+  - ToxicDomScripts.java（/dom/toxicdomscripts/* にマップ、web.xml L206-213）は、パス /<source>/<accessType>/<sink> を L45・L47-50 で 3 つに分け、generateTemplate（L61-70）で "sources/<source>/<accessType>.tmpl"（L63-64）と "sinks/<sink>.tmpl"（L65-66）を読み込み、L69 で「source テンプレート + sink テンプレート」を連結し、L49 の Responses.sendJavaScript で text/javascript として返す。
+  - 連結される JavaScript は、攻撃者が操作できる DOM 上の値（window.name、document.referrer、document.cookie、localStorage／sessionStorage、postMessage の msg.data）を、検証・エスケープなしで危険な sink（eval、document.write、innerHTML）に渡すコードそのものである。
+    例1: /dom/toxicdomscripts/window/name/eval → sources/window/name.tmpl L5「var payload = window.name;」の直後に sinks/eval.tmpl L2「eval(payload);」が実行され、さらに L8 の trigger(window.name) から sinks/eval.tmpl L6「eval(payload)」が実行される。
+    例2: /dom/toxicdomscripts/window/name/innerHtml → sinks/innerHtml.tmpl L5・L9「div.innerHTML = payload」で HTML として解釈される。documentWrite.tmpl L2・L6 の document.write も同様。
+    例3: /dom/toxicdomscripts/document/referrer/eval → sources/document/referrer.tmpl L5・L8 で document.referrer を「referrer = '…'」という JS コード文字列の中にそのまま連結し eval する（引用符を閉じて任意コードを足せる）。
+    例4: /dom/toxicdomscripts/postMessage/eval/<任意sink> → sources/postMessage/eval.tmpl L1-3 は msg.origin を確認せずに eval(msg.data) する。postMessage/innerHtml.tmpl L4（innerHTML）、documentWrite.tmpl L3（攻撃者指定 URL の <script src> を書き込む）、complexMessageDocumentWriteEval.tmpl L4・L6・L8（eval／document.write）も送信元を確認しない。improperOriginValidationWithPartialStringComparison.tmpl L2（origin.includes('www.google.com')）と improperOriginValidationWithRegExp.tmpl L2-3（アンカーなし・ドット未エスケープの正規表現）は、https://www.google.com.attacker.example のような攻撃者のオリジンを通してしまい、L3 で eval する。
+    例5: sinks/js_html_sanitize_eval.tmpl L3-5 は < & > を HTML エスケープしてから eval しており、JavaScript の文脈に対して誤ったエスケープなので防御にならない（英数字と記号だけのコードはそのまま実行される）。
+  - このスクリプトは ToxicDom.java L94-105 と toxicdomexternal.tmpl L4 で、Firing Range のオリジンのページ（/dom/toxicdom/external/<source>/<accessType>/<sink>）から <script src="/dom/toxicdomscripts/…"> として読み込まれるため、攻撃者の値がそのオリジンで実行される。
+  - サーバ側の確認: Templates.getTemplate（Templates.java L61）が ".." を拒否するのでパストラバーサルはない。エラー応答は Responses.sendError（Responses.java L85-91）で text/plain かつ HTML エスケープ済みなので、反射型 XSS もない。脆弱性はサーバが返す JavaScript の中にある。
+  - 補足: Firing Range は脆弱性スキャナ用に意図的に脆弱にしたテストベッドで、この servlet もクラスコメント（L27-38）のとおり「toxic DOM based XSS を提供する」ことが目的。それでも、コード自体には実際に悪用できる DOM-based XSS がある。
+- 使用トークン量（判定）: 新規 33,061（入力 14 ／ キャッシュ作成 19,178 ／ 出力〔推定〕 13,869）、キャッシュ読込 166,055、総処理 199,116、リクエスト 7 回（出力の記録値 14,182）
+
+---
+## No.18 google/firing-range ToxicDomScripts.java（+ 配信する src/tests/dom/data/sources/*/*.tmpl・sinks/*.tmpl）
+- 対象: https://github.com/google/firing-range/blob/master/src/tests/dom/ToxicDomScripts.java
+
+- **XSS 種別**: DOM-base（サーバは固定のテンプレートをつなげて返すだけで、ユーザー入力をサーバ側で応答に埋め込まない。ブラウザ上の JavaScript が DOM の source を読み、DOM の sink に書き込んだり eval したりして発生する）
+- **source**: sources/window/name.tmpl L5・L8（window.name）、sources/document/referrer.tmpl L5・L8（document.referrer）、sources/document/cookie.tmpl L5・L13 と cookie_set.tmpl L19・L22（document.cookie）、sources/localStorage/*.tmpl・sessionStorage/*.tmpl L4-8（Web Storage の badValue）、sources/postMessage/*.tmpl の msg.data（eval.tmpl L2、innerHtml.tmpl L2、documentWrite.tmpl L2、complexMessageDocumentWriteEval.tmpl L2・L4・L6・L8、improperOrigin*.tmpl L3）。どの source を使うかは ToxicDomScripts.java L45・L50・L63-64 でリクエストパスから選ばれる。
+- **伝播経路**: リクエストパス → ToxicDomScripts.java L45 pathInfo → L50 split → generateTemplate L63-66 で source／sink テンプレートを選ぶ → L69 で連結 → L49 sendJavaScript（text/javascript）→ toxicdomexternal.tmpl L4 の <script src> で読み込まれる → ブラウザで source の値が var payload（同期）と trigger(<値>)（setTimeout による非同期）を通して sink に渡る。postMessage 系は message イベントのハンドラの中で msg.data が直接 sink に渡る。
+- **sink**: sinks/eval.tmpl L2・L6（eval）、sinks/innerHtml.tmpl L5・L9（innerHTML）、sinks/documentWrite.tmpl L2・L6（document.write）、sinks/js_html_sanitize_eval.tmpl L3（eval）、sources/postMessage/eval.tmpl L3、innerHtml.tmpl L4、documentWrite.tmpl L3、complexMessageDocumentWriteEval.tmpl L4・L6・L8、improperOriginValidationWithPartialStringComparison.tmpl L3、improperOriginValidationWithRegExp.tmpl L4。これらを応答として出すのは ToxicDomScripts.java L49・L69。
+- **脆弱性の位置**: 主に sink 側。信頼できない値を、無害化せずに eval／innerHTML／document.write に渡している（js_html_sanitize_eval は文脈に合わないエスケープ）。source 側にも問題があり、postMessage のハンドラが送信元オリジンを確認しない、または確認が不完全（部分一致や不完全な正規表現）。ToxicDomScripts.java は、それらを検証なしで組み合わせて配信する箇所（L63-69）。
+- **攻撃例**: 攻撃者は自分のページで window.name に JavaScript のコード（または onerror 付きの img タグ）を入れ、同じタブを Firing Range の /dom/toxicdom/external/window/name/eval（または …/innerHtml）に移動させる。読み込まれた /dom/toxicdomscripts/window/name/eval が window.name を eval（または innerHTML）するので、攻撃者のコードが Firing Range のオリジンで実行され、Cookie・Storage の読み取りや画面の改ざんができる。postMessage 系では、攻撃者のページが対象ページを window.open や iframe で開き、postMessage でコード文字列を送るだけで eval される（improperOrigin 系は www.google.com を含む攻撃者ドメインから送る）。
+
+---
