@@ -1,0 +1,25 @@
+## No.16 google/firing-range src/tests/dom/EventTriggering.java
+- 対象: https://github.com/google/firing-range/blob/master/src/tests/dom/EventTriggering.java（GitHub のコード（第1回で取得したときのコミットに固定））
+- 判定: **脆弱性あり**（DOM-based XSS・CWE-79／eval シンクは CWE-95 も該当）
+- XSS に該当: 種別・source・sink は "第2回xssの詳細"、修正コードは "第2回修正版コード" を参照
+- 根拠（エージェントの判定記録から）:
+  - 根拠: EventTriggering.java（/dom/eventtriggering/* にマップ、web.xml 225-231行）は、パスの3要素（source/accessType/sink）でテンプレートを選び（64-67行）、deferred.tmpl でシンクを関数 deferredPayload() に包んだうえで「deferredPayload + ソーステンプレート + シンクテンプレート」を toxicdom.tmpl の <script> 内に連結し（69-73行）、Responses.sendXssed（55行。Responses.java 73行で X-XSS-Protection: 0 を付与）で text/html として返す。
+  - 想定されている組み合わせ（dom/index.html に掲載の document/formSubmission・document/inputTyping × eval/innerHtml/documentWrite）では、利用者が入力欄に打ち込んだ値（inputTyping.tmpl 8行 payload = e.target.value／formSubmission.tmpl 15行 payload = document.getElementById('userInput').value）が、keyup/change/submit イベントで deferredPayload() を経由し、無害化されないまま eval(payload)（sinks/eval.tmpl 2・6行）、div.innerHTML = payload（sinks/innerHtml.tmpl 5・9行）、document.write(payload)（sinks/documentWrite.tmpl 2・6行）に渡る。入力文字列がスクリプトや HTML としてサイトのオリジンで実行される。
+  - さらにサーブレットは source/sink の名前を検証しない（".." の禁止は Templates.java 61行のみ）。そのため sources/ 以下のどのテンプレートでも組み合わせられ、他サイトから値を仕込めるソースにも到達できる。例: /dom/eventtriggering/window/name/eval では window.name（sources/window/name.tmpl 5・8行）がページ読み込み時に eval される（同期トリガー）。/dom/eventtriggering/postMessage/eval/<任意のsink> では、origin を検証しない message ハンドラ内の eval(msg.data)（sources/postMessage/eval.tmpl 2-3行）が有効になる。
+  - サーバ側でパス文字列を HTML に反射する箇所はない（エラーは Responses.sendError で text/plain＋HTML エスケープ）。脆弱性はクライアント側の JavaScript（DOM）にある。
+  - 補足: Firing Range は脆弱性スキャナ評価用に、意図的に脆弱に作られたテスト用アプリ。ただしコードとしては、上記のとおり XSS が成立する。
+- 使用トークン量（判定）: 新規 40,912（入力 16 ／ キャッシュ作成 26,434 ／ 出力〔推定〕 14,462）、キャッシュ読込 210,990、総処理 251,902、リクエスト 8 回（出力の記録値 15,491）
+
+---
+# No.16 google/firing-range src/tests/dom/EventTriggering.java
+- 対象: https://github.com/google/firing-range/blob/master/src/tests/dom/EventTriggering.java
+
+- **XSS 種別**: DOM-base（サーバは固定テンプレートを返すだけで、利用者の入力をレスポンスに埋め込まない。ブラウザ内の JavaScript が DOM 上の値（入力欄の値、window.name、postMessage など）を読み、eval・innerHTML・document.write に渡して初めて成立するため）
+- **source**: 入力欄の値 sources/document/inputTyping.tmpl 8行（e.target.value）、sources/document/formSubmission.tmpl 15行（#userInput の value）。このサーブレット経由で到達できる他のソース: sources/window/name.tmpl 5・8行（window.name）、sources/postMessage/eval.tmpl 2行（msg.data）など。選択は EventTriggering.java 46・53-54・64-65行（パス情報がそのままテンプレート名になる）
+- **伝播経路**: 入力値 → グローバル変数 payload（inputTyping.tmpl 8行／formSubmission.tmpl 15行）→ イベントハンドラから deferredPayload() を呼ぶ（inputTyping.tmpl 9行・12-13行／formSubmission.tmpl 16行）→ deferred.tmpl 2行に埋め込まれたシンクテンプレートの同期トリガーが payload を参照。ページ組み立ては EventTriggering.java 72-73行（Templates.replacePayload で toxicdom.tmpl 5行の <script> 内に連結）、送信は 55行。window.name の場合は、ページ読み込み時にトップレベルのシンク（EventTriggering.java 73行で連結した sinkTemplate）が直接 payload を使う
+- **sink**: sinks/eval.tmpl 2・6行 eval(payload)、sinks/innerHtml.tmpl 5・9行 div.innerHTML = payload、sinks/documentWrite.tmpl 2・6行 document.write(payload)。（postMessage 系ソースはテンプレート内に独自のシンクを持つ。例: sources/postMessage/eval.tmpl 3行 eval(content)）
+- **脆弱性の位置**: sink 側（主因）。入力値を、コード実行や HTML として解釈する API に、エスケープや検証なしで渡している（sinks/*.tmpl）。加えて、テンプレートを組み立てる EventTriggering.java の generateTemplate（62-74行）が source/sink 名を許可リストで制限していない。そのため、他サイトから値を仕込めるソース（window.name、origin を確認しない postMessage）とも組み合わせられ、攻撃面が広がっている（source 側の入口の問題）
+- **攻撃例**: (1) 攻撃者は自分のページに iframe を置き、name 属性に悪意ある JavaScript を入れて /dom/eventtriggering/window/name/eval を読み込ませる。被害者が攻撃者のページを開くだけで、iframe 内でサイトのオリジンとして eval が実行され、Cookie の窃取などができる。(2) /dom/eventtriggering/postMessage/eval/eval を iframe や window.open で開き、postMessage で任意の文字列を送ると eval される。(3) 想定されている入力欄（inputTyping／formSubmission）では、攻撃者がソーシャルエンジニアリングで被害者に細工した文字列を貼り付けさせると、入力やフォーム送信のイベントで eval・innerHTML・document.write が発火し、スクリプトが実行される
+  - 修正方針（概要）: シンクテンプレートを、テキストとして出力する安全な処理に置き換える（eval → テキストノード表示、innerHTML → textContent、document.write → HTML エスケープしてから書き込む）。さらに EventTriggering.java で source/sink を許可リストに限定する。
+
+---
