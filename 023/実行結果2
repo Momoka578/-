@@ -1,0 +1,17 @@
+### No.23 CVE-2017-1000219 windows-cpu 0.1.4 (index.js)
+- 対象: https://github.com/ossf-cve-benchmark/ossf-cve-benchmark/blob/main/CVEs/CVE-2017-1000219.json（ossf-cve-benchmark のテストケース（prePatch のコミットのコード））
+- 判定: **脆弱性あり**（OS コマンドインジェクション・CWE-78 / 引数インジェクション CWE-88）
+- 根拠（エージェントの判定記録から）:
+  - 根拠:
+  - 対象: KyleRoss/windows-cpu prePatch da656c1a の index.js。Windows 用 CPU 負荷取得ライブラリ。
+  - index.js 77 行目の公開 API `exports.findLoad(arg, cb)` は、利用側から渡された `arg`（プロセス名または PID）を検証・エスケープせずに、81 行目で文字列連結してシェルコマンドを組み立てている:
+    `var cmd = "wmic path Win32_PerfFormattedData_PerfProc_Process get Name,PercentProcessorTime,IDProcess | findstr /i /c:" + arg;`
+  - 82 行目で `child_process.exec(cmd, ...)` に渡している。exec はシェル（Windows では cmd.exe /d /s /c）経由で実行するため、`arg` に含まれる `&`、`&&`、`|`、`||`、`>`、`<` などのメタ文字がシェルに解釈される。
+  - 起きること: 例えば、Web アプリなどがユーザーの入力したプロセス名をそのまま `cpu.findLoad(name, cb)` に渡すと、`chrome & <任意のコマンド>` のような値で、findstr の後に任意の OS コマンドが Node プロセスの権限で実行される（任意コマンド実行）。また空白を含む値で findstr に別のオプションやファイル名を追加でき（CWE-88、引数インジェクション）、`> ファイル` でファイルの上書きもできる。
+  - 84 行目のエラーメッセージにも `arg` がそのまま入るが、これは文字列を返すだけで、それ自体は実行には関係しない。
+  - 他の箇所: nodeLoad（174 行目）は固定値 'node'、processLoad（202 行目）は process.pid（数値）なので、ここからの注入はない。totalLoad（136 行目）と cpuInfo（231 行目）は execFile と固定引数、totalMemoryUsage（270 行目）は固定文字列の exec なので、問題なし。
+  - 修正案（XSS ではないので修正コードは作らない）: `exec` をやめ、`execFile(wmic, ['path', 'Win32_PerfFormattedData_PerfProc_Process', 'get', 'Name,PercentProcessorTime,IDProcess'])` でシェルを通さずに実行し、絞り込みは findstr ではなく Node 側で `arg` と比較して行う。あるいは `arg` を数値（PID）か英数字・`.`・`_`・`-`・`#` だけのプロセス名に限定する許可リスト検証を入れる。
+  - XSS ではない（HTML への出力はない）。
+- 使用トークン量（判定）: 新規 8,704（入力 8 ／ キャッシュ作成 6,501 ／ 出力〔推定〕 2,195）、キャッシュ読込 78,517、総処理 87,221、リクエスト 4 回（出力の記録値 2,196）
+
+---
