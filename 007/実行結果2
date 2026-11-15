@@ -1,0 +1,23 @@
+### No.7 OWASP-Benchmark/BenchmarkJava BenchmarkTest00036.java
+- 対象: https://github.com/OWASP-Benchmark/BenchmarkJava/blob/master/src/main/java/org/owasp/benchmark/testcode/BenchmarkTest00036.java（GitHub のコード（第1回で取得したときのコミットに固定））
+- 判定: **脆弱性あり**（クロスサイトスクリプティング（反射型 XSS）・CWE-79）
+- XSS に該当: 種別・source・sink は "第2回xssの詳細"、修正コードは "第2回修正版コード" を参照
+- 根拠（エージェントの判定記録から）:
+  - 根拠: BenchmarkTest00036.java（コミット 8b67a88d）の doPost は、リクエストの全パラメータを走査し（46〜59行目）、値が文字列 "BenchmarkTest00036" と一致したパラメータの「名前」を param に代入する（53〜55行目）。パラメータ名はクエリ文字列や POST 本文で利用者が自由に決められる値であり、検証もエスケープもされていない。
+  - その param を、Content-Type を text/html;charset=UTF-8 に設定した応答（42行目）へ、response.getWriter().write(param.toCharArray(), 0, length) でそのまま書き出している（65行目）。さらに 61行目で X-XSS-Protection: 0 を設定してブラウザの XSS フィルタを無効化している。
+  - web.xml で全 URL に掛かる HTTPResponseHeaderFilter は CSP を付けるが、default-src に 'unsafe-inline' と 'unsafe-eval' を含むため、応答に埋め込まれたインラインスクリプトやイベントハンドラ属性は実行される。入力を無害化するフィルタは存在しない。
+  - したがって、名前に HTML タグやスクリプトを含み、値が "BenchmarkTest00036" のパラメータを送らせると、その名前が HTML として解釈され、被害者のブラウザ上で任意の JavaScript が実行される。
+- 使用トークン量（判定）: 新規 7,814（入力 8 ／ キャッシュ作成 5,123 ／ 出力〔推定〕 2,683）、キャッシュ読込 81,579、総処理 89,393、リクエスト 4 回（出力の記録値 3,056）
+
+---
+## No.7 OWASP-Benchmark/BenchmarkJava BenchmarkTest00036.java
+- 対象: https://github.com/OWASP-Benchmark/BenchmarkJava/blob/master/src/main/java/org/owasp/benchmark/testcode/BenchmarkTest00036.java
+
+- **XSS 種別**: 反射型。攻撃者が細工したリクエスト（URL のクエリ文字列や自動送信フォーム）に含まれる値が、保存されずに同じリクエストの応答へそのまま返されるため。サーバー側で出力しているので DOM-base ではない。
+- **source**: BenchmarkTest00036.java 46行目 request.getParameterNames() で得るパラメータ名（48行目 name）。49〜53行目で値が "BenchmarkTest00036" と一致するかを調べ、一致した名前を採用する。
+- **伝播経路**: 46行目 request.getParameterNames() → 48行目 String name = names.nextElement() → 53行目 値が "BenchmarkTest00036" と一致 → 54行目 param = name → 63〜64行目 length = param.length() → 65行目 param.toCharArray() → response.getWriter().write(...)。途中にエスケープや検証は一切ない。
+- **sink**: BenchmarkTest00036.java 65行目 response.getWriter().write(param.toCharArray(), 0, length)（42行目で text/html を指定した HTML 応答への出力。61行目で X-XSS-Protection: 0）。
+- **脆弱性の位置**: sink 側。source（パラメータ名）は利用者が自由に決められる入力で、それ自体は避けられない。問題は 65行目で HTML 応答に書き出すときに HTML エスケープ（出力エンコード）をしていないことにある。
+- **攻撃例**: 攻撃者は、名前の部分に script 要素やイベントハンドラ付きの img 要素などの HTML を（URL エンコードして）入れ、値を "BenchmarkTest00036" にしたパラメータを持つ /xss-00/BenchmarkTest00036 への URL（または自動送信される POST フォーム）を作り、被害者に開かせる。サーバーはその名前を HTML としてそのまま返すので、被害者のブラウザで攻撃者のスクリプトが当該サイトのオリジンで実行され、Cookie やセッション情報の窃取、画面の改ざん、利用者になりすました操作などが行われる。
+
+---
