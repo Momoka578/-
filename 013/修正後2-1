@@ -1,0 +1,255 @@
+## No.13 find-sec-bugs/juliet-test-suite CWE80_XSS__Servlet_PropertiesFile_01.java
+- 対象: https://github.com/find-sec-bugs/juliet-test-suite/blob/master/src/testcases/CWE80_XSS/s02/CWE80_XSS__Servlet_PropertiesFile_01.java
+- XSS 種別: ストア型（source・sink は "第2回xssの詳細"）
+- 修正したファイル: CWE80_XSS__Servlet_PropertiesFile_01.java
+
+### 修正コードの説明
+
+#### No.13 CWE80_XSS__Servlet_PropertiesFile_01.java の修正の説明
+
+- 対象: find-sec-bugs/juliet-test-suite（コミット b2c6df3733e2176fe7097e4784895c6891632b4c）の `src/testcases/CWE80_XSS/s02/CWE80_XSS__Servlet_PropertiesFile_01.java`
+- 修正ファイル: `fix01_CWE80_XSS__Servlet_PropertiesFile_01.java`
+- 脆弱性: ストア型 XSS（CWE-80）。外部の .properties ファイルに保存された値を、HTML エンコードせずに HTML 応答へ出力している。
+
+#### 1. 修正の方針
+
+- **防ぐ流れ（source → sink）**
+  - source: 元コード 48 行目 `data = properties.getProperty("data");`（44〜45 行目で `../common/config.properties` を読み込んだもの）
+  - sink: 元コード 74 行目 `response.getWriter().println("<br>bad(): data = " + data);`
+- **どこで防ぐか**: sink 側。HTML に出力する直前で `data` を HTML エンコードする。
+- **どのように防ぐか**: HTML で特別な意味を持つ 5 文字（`&` `<` `>` `"` `'`）を文字参照（`&amp;` `&lt;` `&gt;` `&quot;` `&#x27;`）に置き換える。そのための小さなヘルパーメソッド `htmlEncode()` をクラスに追加する。
+- **この方法を選んだ理由**
+  - XSS は「データが HTML の構文として解釈される」ことで起きる。出力先（HTML 本文）に合わせて出力時にエンコードするのが、根本的で確実な対策になる。
+  - source 側の入力チェック（例: 数字だけを許す）は、設定値の正しい形式がコードから決まらないので、正常な値まで拒否するおそれがある。一方、出力時のエンコードは値の中身を変えずに表示だけを安全にできる。
+  - OWASP Java Encoder や Apache Commons Text などの外部ライブラリは、このリポジトリのビルド設定で使える保証がない。依存関係を増やさず、変更を最小限にするため、エンコード処理をクラス内に自前で実装した。
+
+#### 2. 変更箇所ごとの説明
+
+##### 変更 1: bad() の出力箇所（sink）
+
+- ファイル: `fix01_CWE80_XSS__Servlet_PropertiesFile_01.java`
+- 位置: 元コード 73〜74 行目 → 修正後 73〜75 行目
+
+修正前:
+
+```java
+            /* POTENTIAL FLAW: Display of data in web page without any encoding or validation */
+            response.getWriter().println("<br>bad(): data = " + data);
+```
+
+修正後:
+
+```java
+            /* 修正: 外部ファイル（config.properties）から読んだ data は信頼できないので、
+             * HTML エンコード（htmlEncode）してから HTML 応答に出力する。 */
+            response.getWriter().println("<br>bad(): data = " + htmlEncode(data));
+```
+
+- 73〜74 行目: 修正の理由を書いた日本語コメント。元の「POTENTIAL FLAW」コメントは、欠陥がなくなったので置き換えた。
+- 75 行目: `data` を直接連結せず、`htmlEncode(data)` の戻り値を連結する。固定の文字列 `"<br>bad(): data = "` はプログラムが書いた信頼できる HTML なので、そのまま残す。外部から来た部分だけをエンコードする。
+- XSS を防げる理由: `data` の中の `<` は `&lt;` になるため、ブラウザは新しいタグの開始として扱わず、文字の「<」として表示する。このため、script 要素やイベントハンドラ付きの要素を差し込めない。
+- `data` が null の場合は 71 行目の `if (data != null)` で出力自体が行われないので、`htmlEncode()` に null が渡ることはない。
+
+##### 変更 2: ヘルパーメソッド htmlEncode() の追加
+
+- ファイル: `fix01_CWE80_XSS__Servlet_PropertiesFile_01.java`
+- 位置: 修正後 101〜120 行目（`goodG2B()` の後、`main()` の前に追加。元コードには該当する行がない）
+
+修正前: なし（新規追加）
+
+修正後:
+
+```java
+    /* 修正: HTML の特殊文字を文字参照に置き換えるヘルパーメソッドを追加。
+     * 外部ライブラリに依存しないよう、このクラスの中に最小限の実装を置く。 */
+    private static String htmlEncode(String input)
+    {
+        StringBuilder encoded = new StringBuilder(input.length());
+        for (int i = 0; i < input.length(); i++)
+        {
+            char c = input.charAt(i);
+            switch (c)
+            {
+            case '&':  encoded.append("&amp;");  break; /* & → &amp;（文字参照の誤解釈を防ぐ） */
+            case '<':  encoded.append("&lt;");   break; /* < → &lt;（タグの開始を無効化） */
+            case '>':  encoded.append("&gt;");   break; /* > → &gt; */
+            case '"':  encoded.append("&quot;"); break; /* " → &quot;（属性値の区切りを無効化） */
+            case '\'': encoded.append("&#x27;"); break; /* ' → &#x27;（属性値の区切りを無効化） */
+            default:   encoded.append(c);        break; /* それ以外の文字はそのまま */
+            }
+        }
+        return encoded.toString();
+    }
+```
+
+各行の役割:
+
+- 101〜102 行目: 追加の理由を書いた日本語コメント。
+- 103 行目: `private static` にして、このクラスの中だけで使う。インスタンスの状態を使わない純粋な変換処理なので static にした。
+- 105 行目: 結果を組み立てる `StringBuilder` を、元の文字列の長さを初期容量にして作る。
+- 106〜108 行目: 入力を 1 文字ずつ取り出す。
+- 109〜117 行目: 特殊文字ごとに置き換える。
+  - `&` → `&amp;`: 元の値に `&lt;` のような文字列があっても、ブラウザが文字参照として解釈して別の文字に変えないようにする。
+  - `<` → `&lt;`: タグの開始として解釈されるのを防ぐ。XSS 対策で最も重要。
+  - `>` → `&gt;`: タグの終了として解釈されるのを防ぐ。
+  - `"` → `&quot;`、`'` → `&#x27;`: 今の出力先は属性値ではなく HTML 本文だが、将来この関数が属性値の出力に流用されても、引用符で属性を抜け出せないようにする。
+  - それ以外の文字はそのまま追加する。
+- 119 行目: エンコード後の文字列を返す。
+- 1 文字ずつ 1 回だけ処理するので、`String.replace` を順に重ねる方法で起きやすい「`&` の二重エンコード」などの順序の間違いが起きない。処理時間も入力の長さに比例するだけで済む。
+
+#### 3. 修正の結果
+
+- **攻撃例の入力の扱い**: 攻撃者が `config.properties` の `data` に script 要素やイベントハンドラ属性を持つタグを書き込んでも、修正後は `<` `>` `"` `'` `&` がすべて文字参照に変わる。ブラウザはそれをタグとして解釈せず、画面に文字列として表示するだけになる。スクリプトは実行されず、Cookie の窃取や画面の改ざんは起きない。
+- **正常な入力での動作への影響**
+  - 変わらない点: 今の設定値 `data=123456` のように、HTML の特殊文字を含まない値は、エンコードしても同じ文字列のままなので、出力は修正前とまったく同じ（`<br>bad(): data = 123456`）。プロパティファイルの読み込み方、`data` が null のときに出力しない動作、`good()`／`goodG2B()` の動作も変わらない。
+  - 変わる点: 値に `<` や `&` などが含まれる場合、HTML ソース上は文字参照になる。ただしブラウザでの表示は元の文字のままなので、利用者に見える内容は同じ。値を「HTML として」表示させる使い方（意図的にタグを埋め込む使い方）はできなくなるが、これは XSS を防ぐために意図した変化。
+
+#### 4. 注意点
+
+- **修正していないもの**
+  - `goodG2B()` の 96 行目も `data` をエンコードせずに出力しているが、`data` は固定文字列 `"foo"` なので攻撃者が値を変えられず、脆弱性ではない。最小限の修正にするため変更していない。
+  - 設定ファイルを相対パス `../common/config.properties` で開いている点（作業ディレクトリによって別のファイルを読むおそれ）は、XSS そのものではないので変更していない。運用では絶対パスやクラスパス上のリソースを使い、ファイルの書き込み権限を限定するのが望ましい。
+  - 基底クラス `AbstractTestCaseServlet.runTest()` が例外メッセージやスタックトレースをエンコードせずに HTML に出力している点は、このファイルの範囲外なので修正していない（例外メッセージに外部の値が入る場合は同じ種類の問題になりうる）。
+- **残る制約**
+  - `htmlEncode()` は **HTML 本文（要素の内容）と引用符で囲んだ属性値** 向けのエンコード。JavaScript の文字列の中、URL（href など）、CSS、引用符のない属性値など、別の文脈に出力する場合はその文脈に合ったエンコードや検証が別に必要。
+  - 応答の文字コード（Content-Type の charset）はこのクラスでは指定していない。ページの開始（`<html><body>` の出力）は基底クラスの `runTestSolo()` で先に行われるため、`bad()` の中で設定しても効かない。古いブラウザでの文字コード推測を使う攻撃まで防ぐには、基底クラスやサーバー設定で `text/html; charset=UTF-8` を明示するのが望ましい。
+  - この修正は出力時の対策なので、設定ファイル自体が改ざんされることは防げない。改ざんされた値は無害な文字列として表示されるだけになる。
+
+### 修正したコード: CWE80_XSS__Servlet_PropertiesFile_01.java
+
+```java
+/* TEMPLATE GENERATED TESTCASE FILE
+Filename: CWE80_XSS__Servlet_PropertiesFile_01.java
+Label Definition File: CWE80_XSS__Servlet.label.xml
+Template File: sources-sink-01.tmpl.java
+*/
+/*
+* @description
+* CWE: 80 Cross Site Scripting (XSS)
+* BadSource: PropertiesFile Read data from a .properties file (in property named data)
+* GoodSource: A hardcoded string
+* BadSink:  Display of data in web page without any encoding or validation
+* Flow Variant: 01 Baseline
+*
+* */
+
+package testcases.CWE80_XSS.s02;
+import testcasesupport.*;
+
+import javax.servlet.http.*;
+
+import java.util.Properties;
+
+import java.io.FileInputStream;
+import java.io.IOException;
+
+import java.util.logging.Level;
+
+public class CWE80_XSS__Servlet_PropertiesFile_01 extends AbstractTestCaseServlet
+{
+    /* uses badsource and badsink */
+    public void bad(HttpServletRequest request, HttpServletResponse response) throws Throwable
+    {
+        String data;
+
+        data = ""; /* Initialize data */
+
+        /* retrieve the property */
+        {
+            Properties properties = new Properties();
+            FileInputStream streamFileInput = null;
+
+            try
+            {
+                streamFileInput = new FileInputStream("../common/config.properties");
+                properties.load(streamFileInput);
+
+                /* POTENTIAL FLAW: Read data from a .properties file */
+                data = properties.getProperty("data");
+            }
+            catch (IOException exceptIO)
+            {
+                IO.logger.log(Level.WARNING, "Error with stream reading", exceptIO);
+            }
+            finally
+            {
+                /* Close stream reading object */
+                try
+                {
+                    if (streamFileInput != null)
+                    {
+                        streamFileInput.close();
+                    }
+                }
+                catch (IOException exceptIO)
+                {
+                    IO.logger.log(Level.WARNING, "Error closing FileInputStream", exceptIO);
+                }
+            }
+        }
+
+        if (data != null)
+        {
+            /* 修正: 外部ファイル（config.properties）から読んだ data は信頼できないので、
+             * HTML エンコード（htmlEncode）してから HTML 応答に出力する。 */
+            response.getWriter().println("<br>bad(): data = " + htmlEncode(data));
+        }
+
+    }
+
+    public void good(HttpServletRequest request, HttpServletResponse response) throws Throwable
+    {
+        goodG2B(request, response);
+    }
+
+    /* goodG2B() - uses goodsource and badsink */
+    private void goodG2B(HttpServletRequest request, HttpServletResponse response) throws Throwable
+    {
+        String data;
+
+        /* FIX: Use a hardcoded string */
+        data = "foo";
+
+        if (data != null)
+        {
+            /* POTENTIAL FLAW: Display of data in web page without any encoding or validation */
+            response.getWriter().println("<br>bad(): data = " + data);
+        }
+
+    }
+
+    /* 修正: HTML の特殊文字を文字参照に置き換えるヘルパーメソッドを追加。
+     * 外部ライブラリに依存しないよう、このクラスの中に最小限の実装を置く。 */
+    private static String htmlEncode(String input)
+    {
+        StringBuilder encoded = new StringBuilder(input.length());
+        for (int i = 0; i < input.length(); i++)
+        {
+            char c = input.charAt(i);
+            switch (c)
+            {
+            case '&':  encoded.append("&amp;");  break; /* & → &amp;（文字参照の誤解釈を防ぐ） */
+            case '<':  encoded.append("&lt;");   break; /* < → &lt;（タグの開始を無効化） */
+            case '>':  encoded.append("&gt;");   break; /* > → &gt; */
+            case '"':  encoded.append("&quot;"); break; /* " → &quot;（属性値の区切りを無効化） */
+            case '\'': encoded.append("&#x27;"); break; /* ' → &#x27;（属性値の区切りを無効化） */
+            default:   encoded.append(c);        break; /* それ以外の文字はそのまま */
+            }
+        }
+        return encoded.toString();
+    }
+
+    /* Below is the main(). It is only used when building this testcase on
+     * its own for testing or for building a binary to use in testing binary
+     * analysis tools. It is not used when compiling all the testcases as one
+     * application, which is how source code analysis tools are tested.
+     */
+    public static void main(String[] args) throws ClassNotFoundException,
+           InstantiationException, IllegalAccessException
+    {
+        mainFromParent(args);
+    }
+}
+```
+
+---
