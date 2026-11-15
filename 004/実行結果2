@@ -1,0 +1,22 @@
+### No.4 OWASP-Benchmark/BenchmarkJava BenchmarkTest00013.java
+- 対象: https://github.com/OWASP-Benchmark/BenchmarkJava/blob/master/src/main/java/org/owasp/benchmark/testcode/BenchmarkTest00013.java（GitHub のコード（第1回で取得したときのコミットに固定））
+- 判定: **脆弱性あり**（クロスサイトスクリプティング（反射型）・CWE-79。付随して書式文字列の外部制御・CWE-134）
+- 根拠（エージェントの判定記録から）:
+  - 根拠: BenchmarkTest00013.java（サーブレット /xss-00/BenchmarkTest00013、doGet は doPost に委譲）の doPost で、リクエストヘッダ Referer の先頭の値を取得し（45〜49行目）、52行目で java.net.URLDecoder.decode により URL デコードしたうえで、56行目 response.getWriter().format(Locale.US, param, obj) の「書式文字列」として、そのまま HTML 応答（42行目で Content-Type: text/html;charset=UTF-8）に書き出している。エスケープ・検証・無害化は一切ない。
+  - 54行目で X-XSS-Protection: 0 を明示し、ブラウザの XSS フィルタを無効化している。
+  - 同じコミットの web.xml で全 URL に適用される HTTPResponseHeaderFilter の CSP は default-src に 'unsafe-inline' 'unsafe-eval' を含むため、インラインスクリプトは実行され、緩和にならない。
+  - 52行目の URL デコードにより、ブラウザが Referer 送信時にパーセントエンコードした < > " などが元の文字に戻るため、HTML タグとして解釈される。
+  - 付随する問題（CWE-134）: param が書式文字列として解釈されるため、%d などを含む入力で IllegalFormatConversionException 等の例外が起き、エラー応答になる。また %s が "a" に置き換わるなど出力が改変される。Java の Formatter ではメモリ読み出しなどは起きないので、影響は主に例外（エラー応答）と出力の改変。不正な %xx を含む入力では 52行目の decode も IllegalArgumentException を投げる。
+  - 修正案（CWE-134 側）: format の第2引数を固定の "%s" にし、param は引数として渡す。XSS 修正のコードでこれも合わせて解消できる。
+- 使用トークン量（判定）: 新規 10,827（入力 10 ／ キャッシュ作成 6,192 ／ 出力〔推定〕 4,625）、キャッシュ読込 106,358、総処理 117,185、リクエスト 5 回（出力の記録値 3,929）
+## No.4 OWASP-Benchmark/BenchmarkJava BenchmarkTest00013.java
+- 対象: https://github.com/OWASP-Benchmark/BenchmarkJava/blob/master/src/main/java/org/owasp/benchmark/testcode/BenchmarkTest00013.java
+
+- **XSS 種別**: 反射型。リクエストヘッダ Referer の値が、保存されることなく同じリクエストの応答 HTML にそのまま反映されるため（サーバ側で応答に埋め込まれるので DOM-base ではない）。
+- **source**: 45行目 request.getHeaders("Referer") ／ 48行目 param = headers.nextElement()（Referer ヘッダの先頭の値。ユーザー側から制御できる入力）
+- **伝播経路**: 48行目 param ← Referer 値 → 52行目 param = URLDecoder.decode(param, "UTF-8")（%3C などが < などに戻る）→ 56行目 format の書式文字列として使用（%s 等の書式指定子以外の文字はそのまま出力される）
+- **sink**: 56行目 response.getWriter().format(java.util.Locale.US, param, obj)（text/html の応答本文への出力）
+- **脆弱性の位置**: sink 側。source（Referer ヘッダ）が攻撃者に制御されうるのは避けられないが、HTML 本文に出力する 56行目で HTML エスケープせずに（しかも書式文字列として）出力していることが根本原因。52行目のデコードが攻撃を成立しやすくしている。
+- **攻撃例**: 攻撃者は、パスやクエリにスクリプトを含む HTML タグを入れた URL の罠ページを用意し、そのページから被害者のブラウザを本サーブレットへ遷移・送信させる（リンク、自動送信フォームなど。罠ページ側で referrer ポリシーを緩めて完全な URL を Referer として送らせる）。サーバは Referer をデコードしてそのまま HTML として返すため、被害者のブラウザで対象サイトのオリジンとしてスクリプトが実行され、Cookie やセッション情報の窃取、画面の改ざんなどが行われる。プロキシや攻撃ツールでヘッダを直接書き換えた場合は確実に再現する。最近のブラウザは既定でクロスサイトの Referer をオリジンのみに切り詰めるため、ブラウザ経由の成立条件は限られるが、サーバ側の欠陥であることは変わらない。
+
+
