@@ -1,0 +1,28 @@
+### No.5 OWASP-Benchmark/BenchmarkJava BenchmarkTest00014.java
+- 対象: https://github.com/OWASP-Benchmark/BenchmarkJava/blob/master/src/main/java/org/owasp/benchmark/testcode/BenchmarkTest00014.java（GitHub のコード（第1回で取得したときのコミットに固定））
+- 判定: **脆弱性あり**（クロスサイトスクリプティング（反射型）・CWE-79。付随して書式文字列の外部制御・CWE-134）
+- XSS に該当: 種別・source・sink は "第2回xssの詳細"、修正コードは "第2回修正版コード" を参照
+- 根拠（エージェントの判定記録から）:
+  - 内容: HTTP リクエストの Referer ヘッダの値を、URL デコードしただけでエスケープせずに、Content-Type が text/html の応答本文へそのまま書き出している。
+  - BenchmarkTest00014.java 42 行目: response.setContentType("text/html;charset=UTF-8") で応答を HTML として返す。
+  - 45〜49 行目: request.getHeaders("Referer") の最初の値を param に入れる（攻撃者が制御できる入力）。
+  - 52 行目: java.net.URLDecoder.decode(param, "UTF-8") で URL デコードする。%3C や %3E のような符号化された文字も < や > に戻るため、ブラウザがヘッダ内で符号化した記号も元に戻ってしまう。
+  - 54 行目: response.setHeader("X-XSS-Protection", "0") でブラウザの XSS フィルタを無効化している。
+  - 56 行目: response.getWriter().format(param, obj) で param を書式文字列として応答本文に出力する。<script> などの HTML タグは書式指定子ではないため、そのまま出力される。HTML エスケープ（Encode.forHtml など）はどこにもない。
+  - 同じコミットの web.xml のフィルタ（DataBaseFilter、HTTPResponseHeaderFilter、Tomcat の HttpHeaderSecurityFilter）は入力を無害化しない。HTTPResponseHeaderFilter が付ける CSP は default-src に 'unsafe-inline' と 'unsafe-eval' を含むため、インラインスクリプトは実行される。
+  - どのような入力で何が起きるか: Referer に HTML タグやスクリプト（URL 符号化したものでもよい）を含めてアクセスさせると、その文字列が HTML として解釈され、被害者のブラウザ上で対象サイトのオリジンとしてスクリプトが実行される（Cookie の窃取や画面の改ざんなど）。
+  - 付随する問題（CWE-134）: param を Formatter の書式文字列として使っているため、%s や %n などを入れると出力内容を操作でき、不正な書式指定子（例: %q）では例外（UnknownFormatConversionException など）が発生してエラー応答になる。
+- 使用トークン量（判定）: 新規 7,993（入力 8 ／ キャッシュ作成 4,676 ／ 出力〔推定〕 3,309）、キャッシュ読込 80,658、総処理 88,651、リクエスト 4 回（出力の記録値 3,385）
+
+---
+## No.5 OWASP-Benchmark/BenchmarkJava BenchmarkTest00014.java
+- 対象: https://github.com/OWASP-Benchmark/BenchmarkJava/blob/master/src/main/java/org/owasp/benchmark/testcode/BenchmarkTest00014.java
+
+- **XSS 種別**: 反射型。リクエストの Referer ヘッダの値がサーバーに保存されず、その同じリクエストに対する応答にそのまま返されるため（DOM 操作ではなくサーバー側で HTML を出力している）。
+- **source**: BenchmarkTest00014.java 45 行目 request.getHeaders("Referer")（48 行目 headers.nextElement() で最初の値を param に代入）
+- **伝播経路**: 45 行目 request.getHeaders("Referer") → 48 行目 param = headers.nextElement() → 52 行目 param = URLDecoder.decode(param, "UTF-8")（URL デコードのみで無害化なし） → 56 行目 response.getWriter().format(param, obj) の第 1 引数（書式文字列）
+- **sink**: BenchmarkTest00014.java 56 行目 response.getWriter().format(param, obj)（42 行目で text/html を指定した応答本文への出力）
+- **脆弱性の位置**: sink 側。source の Referer ヘッダは外部入力なので信頼できないのは当然で、問題は 56 行目で HTML エスケープをせずに出力している点にある。さらに 52 行目の URL デコードで符号化済みの記号が元に戻ることと、54 行目の X-XSS-Protection: 0 が攻撃を成立しやすくしている。
+- **攻撃例**: 攻撃者は、URL のパスやクエリにスクリプトを含むページを自分のサイトに用意し、そこから /xss-00/BenchmarkTest00014 へ遷移させるリンクやフォームを置く。被害者がそのページを経由して対象にアクセスすると、ブラウザが送る Referer にスクリプトが入り、サーバーがそれを URL デコードして HTML としてそのまま返すため、被害者のブラウザで対象サイトの権限でスクリプトが実行される。（ブラウザの Referrer-Policy によっては Referer が切り詰められるが、ヘッダはクライアントが自由に設定できる値であり、プロキシや古いブラウザ、referrerpolicy="unsafe-url" の指定などで全体が送られる場合がある）
+
+---
