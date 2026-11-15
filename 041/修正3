@@ -1,0 +1,529 @@
+## No.41 tj/node-growl lib/growl.js (prePatch dc8aae0)
+
+- 修正コード2の検証で見つかった不備: {"toString":1} などの文字列でない値で、try より前の String(...) が TypeError を投げ、利用側のプロセスが落ちる（CWE-248（検証の記録に明記））
+- 修正コード3 のファイル: lib/growl.js
+- 組み合わせ: 修正コード3 のファイル（lib/growl.js）。修正前の最終版: lib/growl.js（修正コード2）
+- 親の確認: lib/growl.js: node --check で構文エラーなし。エージェントが読み取り専用の材料（orig・given）を変えていないこと、読まない範囲のファイルを読んでいないことを、記録で確認した。
+- 使用トークン量（作成）: 新規 155,387（入力 58 ／ キャッシュ作成 103,804 ／ 出力〔推定〕 51,525）、キャッシュ読込 2,247,252、総処理 2,402,639、リクエスト 29 回
+
+対象: tj/node-growl lib/growl.js（ossf-cve-benchmark CVE-2017-16042、prePatch dc8aae0）
+もとにした最終版: 修正コード2（`$R/given/fix2/lib/growl.js`）
+修正コード3: `$R/fix3/lib/growl.js`（直したのはこのファイルだけ）
+
+根拠の脆弱性（exec と args.join(' ') で /bin/sh を通る OS コマンドインジェクション）は、修正コード1 で直っており、修正コード2 でも直ったままだった。修正コード2 で直した NUL 文字によるプロセスの停止も直っていた。今回直したのは、修正コード2の検証であげた不備 1 件である。toString が関数でないオブジェクトなど、文字列にできない値を msg・title などに渡すと、growl() が try の外で例外を投げ、利用側のプロセスが停止する。あわせて、同じ原因（引数を組み立てる途中で起きる同期的な例外）で停止する別の入力も、まとめて直した。
+
+### 修正コード2の不備
+
+#### 不備1: 文字列にできない msg・title などで、growl() が try の外で TypeError を投げ、利用側のプロセスが停止する（未捕捉の例外、CWE-248。DoS）
+
+- 場所（`$R/given/fix2/lib/growl.js`）: 328 行の `try {` より前で、値を文字列にしている次の行。
+  - 254・259・275・288・290・294 行 `args.push(String(msg));`
+  - 255・262・276・286 行 `args.push(String(options.title));`、266 行 `args.push(String(options.subtitle));`、270 行 `args.push(String(options.url));`
+  - 295・296 行 `args.push(cmd.title + options.title);` / `args.push(cmd.url + options.url);`（Windows）、214 行 `args.push(cmd.icon + image);`（Windows）
+  - 304-306 行（Custom）`var message = String(options.title ? options.title + ': ' + msg : msg);`、308 行 `String(origCommand)`
+- 問題: `String(v)` と、文字列との `+` による連結は、toString が関数でないオブジェクトに対して「TypeError: Cannot convert object to primitive value」を投げる。JSON.parse の結果でも、この形のオブジェクトは作れる（例: `{"toString":1}`、`{"toString":"x"}`、`[{"toString":1}]`、`[[{"toString":"x"}]]`）。Object.create(null) でも同じことが起きる。修正コード2 の try/catch は、329 行の execFile の呼び出しだけを囲んでいた。上の行はその前にあるので、例外は捕まらず、growl() の呼び出し元にそのまま伝わる。growl は結果をコールバックで返す API なので、利用側は普通 try/catch で囲まない。そのため、未捕捉の例外になってプロセスが終了する。
+  - 修正コード2 の説明には「String(args[0]) や args.slice(1).map(String) の文字列化で起きる例外も fn に渡る」とある。しかし、それが当てはまるのは、try の中で初めて文字列になる値（NC と LX の image）だけだった。
+- 問題になる入力・条件: 利用側が、外部から来た JSON の値を、文字列かどうか確かめずに msg・title・subtitle・url・image に渡す場合。空でないかだけを確かめる場合も含む（オブジェクトは真なので、確かめを通り抜ける）。例: チャットのメッセージ `{"from":"c","text":{"toString":1}}` の text をそのまま `growl(data.text, {title: data.from}, cb)` に渡す。
+- 自分で再現したか: 再現した（Node v22.22.1。下の「確認した内容と結果」）。
+  - 不備の 37 の組み合わせ（msg×4 種類×6 モード、title×6 モード、subtitle、url×2、image×4）のうち、修正コード2 は 35 件で TypeError を throw した（コールバックは 0 回）。そのうち 33 件では、元のコードは例外を投げず、通知を出してコールバックを 1 回呼んでいた。残りの 2 件（Custom の title、Darwin-Growl の image）は、元のコードも例外を投げていた。修正コード2 が throw しなかった 2 件（NC・LX の image）は、try の中で初めて文字列になる値だった。
+  - `bench/crash_demo.js`（上の例の利用側）: `{"from":"c","text":{"toString":1}}` を流すと、修正コード2 は `lib/growl.js:288` の `String(msg)` で未捕捉の TypeError になり、exit=1 で停止した。元のコードは exit=0 で、ほかのメッセージの処理も続いた。
+  - `bench/async_demo.js`（async 関数の中で呼ぶ利用側）: `{"text":{"toString":"x"}}` で、修正コード2 は未処理の Promise の reject になり、exit=1 で停止した（254 行）。元のコードは exit=0 だった。
+- いつ入ったか: **修正コード1 で入り、修正コード2 で残っていた**。元のコードは、これらの値を `quote = JSON.stringify` に通していた。JSON から来た値なら必ず JSON.stringify で文字列にでき、例外にはならない。修正コード1 で quote() を String() に変えたことで、この例外が新しく生じた。修正コード2 の try/catch は execFile の呼び出しだけを囲んでいたので、直っていなかった。
+
+#### 同じ原因で起きる別の入力（自分で確かめたもの）
+
+検証の記録にあげられた入力のほかに、「引数を組み立てる途中で、try の外で同期的な例外が起きる」という同じ原因の入力を探した（53 の組み合わせ）。修正コード2 は、そのうち 27 件で throw した。
+
+- 修正コード1 で入ったもの（元のコードでは例外にならず、修正コード2 で throw したもの。12 件）:
+  - title に入れ子の配列 `[[{"toString":"x"}]]`（5 モード）: String() が配列の join を通して中の要素を文字列にしようとし、TypeError になる。
+  - toString が例外を投げるオブジェクトの msg（6 モード）: 元のコードは JSON.stringify で `{}` にしていた。修正コード2 は String() で例外になる（JSON からは作れない値）。
+  - Windows で title が Symbol: `cmd.title + options.title` が TypeError になる（JSON からは作れない値）。
+- 元のコードからあるもの（元のコードも修正コード2 も throw したもの。修正コード2 で throw した 27 件のうち 15 件。この 15 件のほか、元のコードだけが throw した組み合わせもある）:
+  - priority に `{"toString":1}`（NC・DG・LX・WIN）: 227 行 `var priority = options.priority + '';` が TypeError になる（元のコードでは 213 行の同じ式）。
+  - Linux-Growl と Custom で priority を指定: 228 行の `cmd.priority.range` で、cmd.priority が undefined なので TypeError になる（元のコードの 214 行と同じ）。
+  - Darwin-Growl の image に文字列以外（123、`{"a":1}`、`{"toString":1}`）: 197 行の `path.extname(image)` が ERR_INVALID_ARG_TYPE を throw する（元のコードの 186 行と同じ）。
+  - msg が深い入れ子の配列（20 万段）: `String(msg)` が RangeError（Maximum call stack size exceeded）になる。元のコードも、JSON.stringify で同じ RangeError になっていた。
+  - Custom で title に `{"toString":1}` または Symbol: 305 行の `options.title + ': ' + msg` が TypeError になる（元のコードの 279 行と同じ）。options.exec に `{"toString":1}`: 308 行の `String(origCommand)` が TypeError になる（元のコードは 281 行の `origCommand.replace` で TypeError）。
+
+これらも、外部から来た値でプロセスが停止する点は不備1 と同じである。不備1 と同じ直し方で、まとめて直せるので、直した（下の「再修正の内容」）。
+
+#### 検証の記録で「指摘」としたもの（不備ではないもの）
+
+- Darwin-Growl の title と Windows の msg は位置引数で、'-'（Windows では '/'）で始まるとオプションとして解釈される余地がある（元のコードから。コマンドの実行にはならない）。今回は直していない（「副作用・残る点」）。
+- 修正コード2 の説明の「String(args[0]) …の文字列化で起きる例外も fn に渡る」という記述が、msg・title などには当てはまらない点: 修正コード3 では、引数の組み立て全体を try で囲んだので、msg・title・subtitle・url・image のどれで例外が起きても fn に渡る。
+- 167 行あたりの var での options・fn の再宣言、228 行の使われていない checkindexOf: 元のコードからの書き方の問題で、動作に影響しないので直していない。
+
+### 再修正の内容
+
+#### 変更1: 引数の組み立てから execFile の呼び出しまでを、1 つの try/catch で囲む（`$R/fix3/lib/growl.js` 188-352 行）
+
+修正コード3 の growl() の後半は、次の形になっている（コメントは一部省略。【修正】【修正2】のコメントは、そのまま残した）。
+
+```js
+  // noop
+  if (!cmd) return fn(new Error('growl not supported on this platform'));
+
+  // 【修正3】引数の組み立てから execFile の呼び出しまでを、まとめて 1 つの try で囲む（…）
+  try {
+    args = [cmd.pkg];
+
+    // image
+    if (image = options.image) {
+      switch(cmd.type) {
+        case 'Darwin-Growl':
+          var flag, ext = path.extname(image).substr(1)
+          …
+      }
+    }
+    // sticky / priority / sound / name（修正コード2 と同じ）
+    …
+    // 【修正3】この switch の String(...) や文字列の連結が例外を投げても、外側の try で捕まえて fn に渡す。
+    switch(cmd.type) {
+      case 'Darwin-Growl':
+        args.push(cmd.msg);
+        args.push(String(msg));
+        …
+      case 'Custom':
+        …
+    }
+
+    // execute
+    // 【修正】…  【修正2】…
+    // 【修正3】修正コード2 で execFile の呼び出しだけを囲んでいた try/catch は、…外側の try/catch にまとめた
+    execFile(String(args[0]), args.slice(1).map(String), fn);
+  } catch (err) {
+    // 【修正3】引数の組み立てと execFile の呼び出しで同期的に起きた例外を、fn にエラーとして渡す。
+    return fn(err);
+  }
+};
+```
+
+- 何をどう変えたか:
+  - `try {` の位置を、修正コード2 の execFile の直前（328 行）から、「対応していないプラットフォーム」の判定（189 行）の直後に移した。`args = [cmd.pkg];` から execFile の呼び出しまで（image・sticky・priority・sound・name・msg/title/subtitle/url の switch・Custom・execFile）が、1 つの try の中に入る。
+  - 修正コード2 で execFile だけを囲んでいた内側の try/catch は、外側の try/catch とまとめたので削除した。catch の中身（`return fn(err);`）は修正コード2 と同じである。
+  - try の中の行は、字下げを 1 段（空白 2 つ）深くしただけである。式や文は 1 つも変えていない。`diff -w`（空白の違いを無視した比較）では、修正コード2 との違いは、`try {` の位置と【修正3】のコメントだけになる。
+  - 【修正】と【修正2】のコメントは、内容がそのまま当てはまるので、文言を変えずに残した。【修正2】の「例外を捕まえて…fn にエラーとして渡す」は、外側の catch が行う。
+- どう動くか:
+  - 正常な入力: try の中は修正コード2 と同じ順序で同じ処理をする。execFile は子プロセスを起動し、終わったときに `fn(error, stdout, stderr)` を 1 回、非同期に呼ぶ。引数（argv）も修正コード2 と同じである。
+  - 引数を組み立てる途中で例外が起きた場合（`String({"toString":1})` の TypeError、`options.priority + ''` の TypeError、`path.extname(123)` の ERR_INVALID_ARG_TYPE、`cmd.priority.range` の TypeError、深い入れ子の配列の RangeError、Custom の message の組み立ての TypeError など）: その時点で catch に移り、`fn(err)` を 1 回呼んで、growl() は例外を投げずに戻る。execFile は try の最後の文なので、組み立ての途中で例外が起きたときは execFile に届かない。組み立て途中の引数で、コマンドが起動されることはない。
+  - execFile が同期的に例外を投げた場合（NUL 文字の ERR_INVALID_ARG_VALUE、E2BIG、空のコマンド名、Windows の .bat/.cmd の EINVAL）: 修正コード2 と同じく、catch で `fn(err)` を 1 回呼ぶ。
+  - コールバックが 2 回呼ばれないこと: try の中で fn を呼ぶのは execFile だけで、execFile は子プロセスを作った後は fn を必ず非同期に呼ぶ。同期的に例外を投げるのは、子プロセスを作る前（引数の検査や spawn の失敗）なので、fn はまだ呼ばれていない。そのため、catch の fn と二重に呼ばれることはない。fn 自身が例外を投げた場合も、fn は try の外の catch の中で呼ばれるので、その例外は呼び出し元に伝わるだけで、fn がもう一度呼ばれることはない（`bench/fnthrow.js` で確かめた）。
+  - 「対応していないプラットフォーム」の `return fn(new Error(...))`（189 行）は、try の外に残した。try の中に入れると、fn 自身が例外を投げたときに catch でもう一度 fn が呼ばれてしまうからである。
+- なぜこの方法にしたか:
+  - 不備の原因は、「例外が起きうる処理が try の外にあった」ことである。例外が起きうる箇所は、String() と文字列の連結だけで 20 か所近くある。ほかにも priority の照合、path.extname、Custom の組み立てなどがある。try を広げれば、例外の種類や起きる箇所を 1 つずつ数え上げなくても、組み立ての途中で起きた同期的な例外を漏れなく fn に渡せる。今後この中に行が足されても、同じように守られる。
+  - ほかの方法も考えた。
+    - 関数の最初で msg・title・subtitle・url・image の型を確かめ、文字列か数値でなければ `return fn(new TypeError(...))` とする方法: 型を確かめる値と、例外が起きる式を、すべて正しく数え上げる必要がある。priority・path.extname・Custom の組み立てなど、型の確認だけでは防げない例外も残る。また、元のコードや修正コード1・2 で通知が出ていた Symbol や BigInt、`{"a":1}` のような値まで、エラーに変わってしまう。
+    - 文字列でない値を `typeof v === 'string' ? v : JSON.stringify(v)` のような方法で文字列にする方法: 元のコードの表示（`{toString:1}` のような文字列）に近づけられる。しかし JSON.stringify も BigInt・深い入れ子・循環参照で例外を投げるので、結局 try が要る。表示も修正コード1・2 の `[object Object]` から変わり、変更の範囲が広がる。
+    - そこで、変更を「try の位置を前に移す」ことだけにとどめた。検証の記録の修正案のうち、1 つ目の方法である。
+  - 例外をコールバックに渡すのは、growl がエラーを fn で知らせる API だからである。コマンドが見つからない（ENOENT）、対応していないプラットフォーム、NUL 文字（修正コード2）などの失敗も、すでに fn で知らせている。fn を同期的に呼ぶ点は、既存の「対応していないプラットフォーム」の処理と、修正コード2 の catch に合わせた。
+
+ほかのファイル・ほかの行は変えていない。根拠の脆弱性の修正（exec をやめて execFile にし、シェルを通さないこと、修正コード1 の【修正】）と、修正コード2 の【修正2】（NUL 文字などの execFile の同期的な例外を fn に渡すこと）は、そのまま残っている。
+
+### 確認した内容と結果
+
+確認には Node v22.22.1 を使った。`$R/bench/` に次のものを用意した（取得したファイルはない）。
+
+- `osmock.js`: os.type() を環境変数 MOCK_OS で差し替える preload
+- `fakecmd.js` と `bin_NC`・`bin_DG`・`bin_LG`・`bin_LX`・`bin_WIN`: 受け取った argv を JSON で記録するだけの偽コマンド（terminal-notifier、growlnotify、growl、notify-send、customnotify）。PATH は、モードごとにこのディレクトリだけにした。
+- `cases.js`（87 ケース、236 の組み合わせ。正常 27・攻撃 24・NUL 10・不備1 8・同じ原因の別の入力 18 ケース）・`child.js`（1 つの組み合わせを新しいプロセスで実行し、例外が投げられたか、コールバックの回数と同期・非同期、偽コマンドの argv、目印ファイルを記録）・`runner.js`・`summarize.js`・`compare.js`
+- `crash_demo.js`・`async_demo.js`（利用側のプロセスが停止するか）、`fnthrow.js`（コールバックが例外を投げたときの呼び出し回数）
+
+モードは、NC=Darwin-NotificationCenter、DG=Darwin-Growl、LG=Linux-Growl、LX=Linux（notify-send）、WIN=Windows、CU=Custom（options.exec）、SunOS（対応していないプラットフォーム）である。元のコード・修正コード1・修正コード2 と、元のコード・修正コード2・修正コード3 の 2 回、同じ 236 の組み合わせを実行した（`results_before.json`・`results_after.json`）。
+
+1. 構文確認: `node --check $R/fix3/lib/growl.js` → エラーなし。
+2. 読み込み: 5 種類のモードと SunOS で読み込めた。`typeof` は function、version は 1.4.1 だった。SunOS では、元のコードと同じく 'growl not supported on this platform' がコールバックに渡った。
+3. 修正コード2 との比較（`diff -w`）: 違いは、`try {` の位置、内側の try/catch の削除、【修正3】のコメントだけだった。
+4. 不備1 の再現と、直ったことの確認（37 の組み合わせ）: 修正コード2 は 35 件で TypeError を throw した（再現できた）。修正コード3 は 0 件で、37 件すべてでコールバックが 1 回だけ、エラー（例: `Cannot convert object to primitive value`）付きで呼ばれた。偽コマンドは 1 度も起動しなかった。
+5. 同じ原因の別の入力（53 の組み合わせ）: 修正コード2 は 27 件で throw した（元のコードは 28 件）。修正コード3 は 0 件だった。throw していた組み合わせは、どれもコールバックへのエラーになった（入れ子の配列、toString が例外を投げる値、Windows の Symbol の title、priority の `{"toString":1}`、Linux-Growl・Custom の priority、Darwin-Growl の文字列以外の image、20 万段の入れ子の配列の RangeError、Custom の title・exec のオブジェクト）。もともと例外にならなかった組み合わせ（msg が undefined・Symbol・BigInt、`{"a":1}` の image など）は、修正コード2 と同じ argv で通知が出た。
+6. 利用側のデモ:
+   - `crash_demo.js`（LX）: `hello` → `{"toString":1}` → `after` の順に流した。修正コード2 は 2 件目で exit=1 になり、停止した。修正コード3 は、2 件目のコールバックに `err=Cannot convert object to primitive value` が渡った。3 件目も処理され、exit=0 だった（元のコードも exit=0）。
+   - `crash_demo.js`（NC）: 修正コード3 で、`evil\u0000`（NUL）、`from` が `{"toString":1}`、`from` が `[{"toString":1}]`、`after $(id)` の 4 件を流した。前の 3 件はコールバックにエラーが渡り、4 件目は OK（`$(id)` は文字のまま渡った）、exit=0 だった。
+   - `async_demo.js`（DG）: `{"text":{"toString":"x"}}` で、修正コード2 は未処理の reject で exit=1 になった。修正コード3 は、コールバックにエラーが渡って exit=0 だった（元のコードも exit=0）。
+7. コールバックの呼び出し回数:
+   - 236 の組み合わせのすべてで、修正コード3 のコールバックはちょうど 1 回呼ばれた。throw した組み合わせは 0 件だった。
+   - `fnthrow.js`（例外を投げるコールバック）: 修正コード3 では、`{"toString":1}` でも NUL でも、コールバックは 1 回だけ呼ばれた。コールバックが投げた例外は、呼び出し元に 1 回だけ伝わった（二重には呼ばれない）。SunOS の場合も同じだった。
+8. 根拠の脆弱性が直ったままであること（攻撃の入力、24 ケース・60 の組み合わせ）: msg・title・subtitle・url・image への `$(/usr/bin/touch 目印)`、バッククォート、`"; … ; echo "`、`\"; … #`、改行、`\n` と `$()` の組み合わせ（元のコードの `\\n` の置き換えを狙うもの）、sound への `;`・`|`、name への `;`、照合の後で文字列化の結果が変わる priority オブジェクト、Custom の `%s` あり・なし・title 経由・`;` 入り・`$& $' $\` $1`、`$HOME ${PATH} $USER`。
+   - 元のコードでは 33 の組み合わせで目印ファイルが作られた。修正コード2・修正コード3 では 0 件だった。値は、どれもそのまま 1 つの argv 要素として渡った（`$HOME` なども展開されない）。
+9. 修正コード1 の説明で直したとしている点が直ったままであること:
+   - priority: `Normal` → `1; touch …` に変わるオブジェクトでも、渡ったのは `["--priority","Normal"]` だった。
+   - sound・name: `-execute`、`--host=evil`、`['Purr']` は渡されなかった。
+   - notify-send の `--`: `-u` の msg と `--app-name=evil` の title は、`--` の後ろに渡った。
+   - Custom: `$& $' $\` $1` が、そのまま渡った。
+10. 修正コード2 の不備（NUL 文字）が直ったままであること（24 の組み合わせ）: msg・title（5 モード＋Custom）、subtitle、url、image、sound、name、options.exec の NUL と、3MB の msg（E2BIG）、空白だけの options.exec。修正コード3 は、どれも例外を投げず、コールバックにエラーが 1 回渡った。偽コマンドは起動しなかった。結果は修正コード2 とまったく同じだった。
+11. 正常な入力での動作（27 ケース・62 の組み合わせ）: 基本、title、改行、`" & ' % <b>` と `\`、日本語、sticky、数値の msg・title、options なし、priority（一致・不一致・数値）、sound、name、NC の全オプション、DG の image 5 種、LX の image と sticky、NC・WIN の image、url、Custom 4 種、SunOS。
+    - どれもコールバックが 1 回、OK で呼ばれた。
+    - 修正コード2 との違いは 0 件だった（argv・コールバック・目印ファイルがすべて同じ）。
+    - 元のコードとの違いは 13 件で、どれも修正コード1 で入った意図した変更だった: LX で `--` が加わったもの 11 件、priority が元のコードの不具合（`["[object","Object]","Normal"]`）から `["--priority","Normal"]` / `["-u","critical"]` に直ったもの 2 件。改行・クォート・& などは、元のコードと同じ文字列で渡った。
+12. 修正コード2 と修正コード3 の全体の比較（236 の組み合わせ）: 違いは 62 件で、すべて不備1 と同じ原因の組み合わせ（defect 35 件・same 27 件）だった。どれも「throw されていたものが、コールバックへのエラーになった」違いである。攻撃・NUL・正常な入力の 146 件は、argv・コールバック・目印ファイルがすべて同じだった。
+- Windows に固有の動き（libuv による引数のクォート、.bat/.cmd を指定したときの EINVAL）は、Linux では実際には試せない。コードを読んで確かめた: シェル（cmd.exe）を通らないので、%VAR% や & は解釈されない。EINVAL は execFile の同期的な throw なので、修正コード2 と同じく catch で fn に渡る。
+
+### 副作用・残る点
+
+- 動作の変化:
+  - 引数を組み立てる途中で例外が起きる値を渡したとき、修正コード2 は例外を呼び出し元に投げていた。修正コード3 は、通知を出さずに、エラーを fn に 1 回渡す。プロセスは停止しない。fn は、growl() から戻る前に同期的に呼ばれる（既存の「対応していないプラットフォーム」と、修正コード2 の NUL の場合と同じ）。
+  - `{"toString":1}` のような msg・title について、元のコードは JSON 風の文字列（`{toString:1}`）で通知を出していた。修正コード3 は通知を出さず、エラーを fn に渡す。JSON 風の表示をやめたのは修正コード1 からで（`{"a":1}` は `[object Object]` になる）、msg は文書で {string} とされている。そのため、通知を出すことよりも、停止しないことを優先した。
+  - 元のコードから例外を投げていた使い方（Linux-Growl・Custom で priority を指定する、Darwin-Growl の image に文字列以外を渡す、など）も、例外ではなく fn へのエラーになる。コールバックを渡していない場合（fn は空の関数になる）は、このエラーは表に出ない。コマンドが見つからない（ENOENT）場合などと同じ扱いである。
+- 直していない点:
+  - Darwin-Growl の title と Windows の msg は位置引数なので、'-'（Windows では '/'）で始まると、オプションとして解釈される余地がある（検証の記録の「指摘」。元のコードから）。たとえば title='-Hattacker.example' は、そのまま 1 つの argv 要素として growlnotify に渡る。growlnotify がこれを -H（送信先のホスト）と解釈すると、通知の内容が外部へ送られる余地がある。ただし、シェルによるコマンド実行にはならない。この環境には growlnotify がなく、`--` に対応しているかを確かめられないため、修正コード1・2 と同じく変えていない。
+  - terminal-notifier / growlnotify / growl / Windows の growlnotify に `--` を付けていない点、options.exec でシェルの構文が使えない点、options.exec を一度使うとモジュール変数 cmd が Custom のまま残る点、数値の priority が文字列との indexOf で一致しない点: どれも修正コード1・2 の説明に書かれたとおりで、今回の不備とは関係しないので変えていない（priority の TypeError などは、上のとおり fn に渡るようになった）。
+  - msg がオブジェクトのとき、表示が `[object Object]` になる点: 修正コード1 からの変化で、表示の違いだけなので変えていない。
+  - コールバック fn 自身が例外を投げた場合は、その例外は growl() の呼び出し元（同期的に呼ばれたとき）か、イベントループ（execFile の後で非同期に呼ばれたとき）に伝わる。これは利用側のコードの例外で、元のコードと同じなので変えていない。
+
+### 修正コード3 の全文: lib/growl.js
+
+```javascript
+// Growl - Copyright TJ Holowaychuk <tj@vision-media.ca> (MIT Licensed)
+
+/**
+ * Module dependencies.
+ */
+
+// 【修正】exec は /bin/sh -c（Windows では cmd.exe）を経由してシェルのメタ文字を解釈するため、
+//        シェルを経由せずにコマンド名と引数の配列を渡す execFile に置き換えた。
+var execFile = require('child_process').execFile
+  , fs = require('fs')
+  , path = require('path')
+  , exists = fs.existsSync || path.existsSync
+  , os = require('os')
+  // 【修正】quote = JSON.stringify は削除した。ダブルクォートで囲むだけで $(...) や `...` を防げず、
+  //        引数を配列で渡す execFile ではクォート自体が不要になるため。
+  , cmd;
+
+function which(name) {
+  var paths = process.env.PATH.split(':');
+  var loc;
+
+  for (var i = 0, len = paths.length; i < len; ++i) {
+    loc = path.join(paths[i], name);
+    if (exists(loc)) return loc;
+  }
+}
+
+// 【修正】sound や name のように、利用側から来た値をコマンドのオプションの値として渡してよいかを確かめる。
+//        文字列だけを受け付け、'-' で始まる値（別のオプションとして解釈されうる）は渡さない。
+function isSafeOptionValue(value) {
+  return typeof value === 'string' && value !== '' && value.charAt(0) !== '-';
+}
+
+switch(os.type()) {
+  case 'Darwin':
+    if (which('terminal-notifier')) {
+      cmd = {
+          type: "Darwin-NotificationCenter"
+        , pkg: "terminal-notifier"
+        , msg: '-message'
+        , title: '-title'
+        , subtitle: '-subtitle'
+        , icon: '-appIcon'
+        , sound:  '-sound'
+        , url: '-open'
+        , priority: {
+              cmd: '-execute'
+            , range: []
+          }
+      };
+    } else {
+      cmd = {
+          type: "Darwin-Growl"
+        , pkg: "growlnotify"
+        , msg: '-m'
+        , sticky: '--sticky'
+        , priority: {
+              cmd: '--priority'
+            , range: [
+                -2
+              , -1
+              , 0
+              , 1
+              , 2
+              , "Very Low"
+              , "Moderate"
+              , "Normal"
+              , "High"
+              , "Emergency"
+            ]
+          }
+      };
+    }
+    break;
+  case 'Linux':
+    if (which('growl')) {
+      cmd = {
+          type: "Linux-Growl"
+        , pkg: "growl"
+        , msg: '-m'
+        , title: '-title'
+        , subtitle: '-subtitle'
+        , host: {
+            cmd: '-H'
+          , hostname: '192.168.33.1'
+        }
+      };
+    } else {
+      cmd = {
+          type: "Linux"
+        , pkg: "notify-send"
+        , msg: ''
+        // 【修正】execFile では配列の 1 要素が 1 つの引数になるので、'-t 0' を 2 つの引数に分けて持つ。
+        , sticky: ['-t', '0']
+        , icon: '-i'
+        , priority: {
+            cmd: '-u'
+          , range: [
+              "low"
+            , "normal"
+            , "critical"
+          ]
+        }
+      };
+    }
+    break;
+  case 'Windows_NT':
+    cmd = {
+        type: "Windows"
+      , pkg: "growlnotify"
+      , msg: ''
+      , sticky: '/s:true'
+      , title: '/t:'
+      , icon: '/i:'
+      , url: '/cu:'
+      , priority: {
+            cmd: '/p:'
+          , range: [
+              -2
+            , -1
+            , 0
+            , 1
+            , 2
+          ]
+        }
+    };
+    break;
+}
+
+/**
+ * Expose `growl`.
+ */
+
+exports = module.exports = growl;
+
+/**
+ * Node-growl version.
+ */
+
+exports.version = '1.4.1'
+
+/**
+ * Send growl notification _msg_ with _options_.
+ *
+ * Options:
+ *
+ *  - title   Notification title
+ *  - sticky  Make the notification stick (defaults to false)
+ *  - priority  Specify an int or named key (default is 0)
+ *  - name    Application name (defaults to growlnotify)
+ *  - sound   Sound efect ( in OSx defined in preferences -> sound -> effects) * works only in OSX > 10.8x
+ *  - image
+ *    - path to an icon sets --iconpath
+ *    - path to an image sets --image
+ *    - capitalized word sets --appIcon
+ *    - filename uses extname as --icon
+ *    - otherwise treated as --icon
+ *
+ * Examples:
+ *
+ *   growl('New email')
+ *   growl('5 new emails', { title: 'Thunderbird' })
+ *   growl('5 new emails', { title: 'Thunderbird', sound: 'Purr' })
+ *   growl('Email sent', function(){
+ *     // ... notification sent
+ *   })
+ *
+ * @param {string} msg
+ * @param {object} options
+ * @param {function} fn
+ * @api public
+ */
+
+function growl(msg, options, fn) {
+  var image
+    , args
+    , options = options || {}
+    , fn = fn || function(){};
+
+  if (options.exec) {
+    cmd = {
+        type: "Custom"
+      , pkg: options.exec
+      , range: []
+    };
+  }
+
+  // noop
+  if (!cmd) return fn(new Error('growl not supported on this platform'));
+
+  // 【修正3】引数の組み立てから execFile の呼び出しまでを、まとめて 1 つの try で囲む（この try の中は
+  //         字下げを 1 段深くしただけで、【修正3】のコメントがある所のほかは修正コード2 と同じ）。
+  //         修正コード2 の try は execFile の呼び出しだけを囲んでいた。そのため、その前で msg・title・
+  //         subtitle・url・image を文字列にする String(msg) や cmd.title + options.title などが投げる例外
+  //         （JSON から来た {"toString":1}、[{"toString":1}]、Object.create(null) など、toString が関数で
+  //         ないオブジェクトで起きる「Cannot convert object to primitive value」の TypeError）は捕まらず、
+  //         growl() の呼び出し元で未捕捉の例外になって、利用側のプロセスが停止していた。
+  //         この try により、組み立ての途中で起きた同期的な例外（priority の文字列化と照合、Darwin-Growl の
+  //         path.extname、Custom の message の組み立てで起きるものも含む）は、どれも下の catch で受け取り、
+  //         ほかの失敗と同じく fn にエラーとして 1 回だけ渡す。
+  //         上の「対応していないプラットフォーム」の fn の呼び出しは、try の外に残す
+  //         （fn 自身が例外を投げたときに、catch で fn をもう一度呼ばないようにするため）。
+  try {
+    args = [cmd.pkg];
+
+    // image
+    // 【修正】image は quote() で囲まず、そのまま 1 つの引数として渡す（この switch 内すべて）。
+    if (image = options.image) {
+      switch(cmd.type) {
+        case 'Darwin-Growl':
+          var flag, ext = path.extname(image).substr(1)
+          flag = flag || ext == 'icns' && 'iconpath'
+          flag = flag || /^[A-Z]/.test(image) && 'appIcon'
+          flag = flag || /^png|gif|jpe?g$/.test(ext) && 'image'
+          flag = flag || ext && (image = ext) && 'icon'
+          flag = flag || 'icon'
+          args.push('--' + flag, image)
+          break;
+        case 'Darwin-NotificationCenter':
+          args.push(cmd.icon, image);
+          break;
+        case 'Linux':
+          args.push(cmd.icon, image);
+          // libnotify defaults to sticky, set a hint for transient notifications
+          if (!options.sticky) args.push('--hint=int:transient:1');
+          break;
+        case 'Windows':
+          args.push(cmd.icon + image);
+          break;
+      }
+    }
+
+    // sticky
+    // 【修正】sticky のオプションがない種類（cmd.sticky が undefined）では引数を足さない
+    //        （execFile では undefined が "undefined" という引数になってしまうため）。
+    //        Linux の ['-t', '0'] のような配列は別々の引数として足す。
+    if (options.sticky && cmd.sticky) args.push.apply(args, [].concat(cmd.sticky));
+
+    // priority
+    if (options.priority) {
+      var priority = options.priority + '';
+      var checkindexOf = cmd.priority.range.indexOf(priority);
+      if (~cmd.priority.range.indexOf(priority)) {
+        // 【修正】照合に使った文字列 priority をそのまま渡す（options.priority を渡すと、照合後に
+        //        別の値へ文字列化されるオブジェクトを渡されうるため）。また、オブジェクトの
+        //        cmd.priority ではなく、オプション名の cmd.priority.cmd を渡す。
+        args.push(cmd.priority.cmd, priority);
+      }
+    }
+
+    //sound
+    // 【修正】sound は文字列で、'-' で始まらない場合だけ渡す。
+    if(options.sound && cmd.type === 'Darwin-NotificationCenter' && isSafeOptionValue(options.sound)){
+      args.push(cmd.sound, options.sound)
+    }
+
+    // name
+    // 【修正】name も sound と同じく、文字列で '-' で始まらない場合だけ渡す。
+    if (options.name && cmd.type === "Darwin-Growl" && isSafeOptionValue(options.name)) {
+      args.push('--name', options.name);
+    }
+
+    // 【修正】以下の switch では quote() とその後の改行の置換をやめ、msg・title・subtitle・url を
+    //        文字列のまま 1 つずつの引数として渡す（シェルを通らないので改行もそのまま保たれる）。
+    // 【修正3】この switch の String(...) や文字列の連結が例外を投げても、外側の try で捕まえて fn に渡す。
+    switch(cmd.type) {
+      case 'Darwin-Growl':
+        args.push(cmd.msg);
+        args.push(String(msg));
+        if (options.title) args.push(String(options.title));
+        break;
+      case 'Darwin-NotificationCenter':
+        args.push(cmd.msg);
+        args.push(String(msg));
+        if (options.title) {
+          args.push(cmd.title);
+          args.push(String(options.title));
+        }
+        if (options.subtitle) {
+          args.push(cmd.subtitle);
+          args.push(String(options.subtitle));
+        }
+        if (options.url) {
+          args.push(cmd.url);
+          args.push(String(options.url));
+        }
+        break;
+      case 'Linux-Growl':
+        args.push(cmd.msg);
+        args.push(String(msg));
+        if (options.title) args.push(String(options.title));
+        if (cmd.host) {
+          args.push(cmd.host.cmd, cmd.host.hostname)
+        }
+        break;
+      case 'Linux':
+        // 【修正】title や msg が '-' で始まっても notify-send のオプションとして解釈されないよう、
+        //        '--' でオプションの終わりを示してから渡す。
+        args.push('--');
+        if (options.title) {
+          args.push(String(options.title));
+          // 【修正】cmd.msg は空文字で、execFile では空の引数になってしまうため渡さない。
+          args.push(String(msg));
+        } else {
+          args.push(String(msg));
+        }
+        break;
+      case 'Windows':
+        args.push(String(msg));
+        if (options.title) args.push(cmd.title + options.title);
+        if (options.url) args.push(cmd.url + options.url);
+        break;
+      case 'Custom':
+        // 【修正】options.exec のコマンド文字列を空白で区切ってコマンド名と引数に分け、message は
+        //        シェルを通さずに引数として渡す。%s を含む引数には message を埋め込み（replace には関数を渡し、
+        //        message 内の $& や $1 などが置換パターンとして解釈されないようにする）、%s がなければ
+        //        最後の引数として足す。
+        (function(origCommand) {
+          var message = String(options.title
+            ? options.title + ': ' + msg
+            : msg);
+          var replaced = false;
+          var parts = String(origCommand).trim().split(/\s+/).map(function(part) {
+            return part.replace(/(^|[^%])%s/g, function(all, before) {
+              replaced = true;
+              return before + message;
+            });
+          });
+          args = parts.concat(args.slice(1));
+          if (!replaced) args.push(message);
+        })(args[0]);
+        break;
+    }
+
+    // execute
+    // 【修正】args.join(' ') を exec でシェルに渡すのをやめ、execFile でコマンド名と引数の配列を直接渡す。
+    //        引数はシェルに解釈されないので、$(...)・`...`・$VAR・;・| などを含んでいてもコマンドは実行されない。
+    // 【修正2】execFile は、コマンド名や引数に NUL 文字（U+0000）があると TypeError を同期的に投げる
+    //         （Windows で .bat/.cmd を指定したときの EINVAL なども同様）。msg・title などは外部から来た文字列で
+    //         ありうるため、そのままでは growl() の呼び出し元で未捕捉の例外になり、利用側のプロセスが停止する。
+    //         例外を捕まえて、ほかの失敗（コマンドが見つからない等）と同じくコールバック fn にエラーとして渡す。
+    //         値の検査は execFile 自身が行うので、NUL を含む引数がコマンドに渡ることはない。
+    // 【修正3】修正コード2 で execFile の呼び出しだけを囲んでいた try/catch は、引数の組み立ての前から始まる
+    //         外側の try/catch にまとめた（execFile が同期的に投げる例外も、同じ catch で fn に渡る）。
+    //         execFile は、子プロセスを作った後は fn を必ず非同期に呼ぶ。同期的に例外を投げるのは子プロセスを
+    //         作る前なので、catch の fn と二重に呼ばれることはない。
+    execFile(String(args[0]), args.slice(1).map(String), fn);
+  } catch (err) {
+    // 【修正3】引数の組み立てと execFile の呼び出しで同期的に起きた例外を、fn にエラーとして渡す。
+    return fn(err);
+  }
+};
+```
+
+---
