@@ -1,0 +1,164 @@
+## No.7 OWASP-Benchmark/BenchmarkJava BenchmarkTest00036.java
+- 対象: https://github.com/OWASP-Benchmark/BenchmarkJava/blob/master/src/main/java/org/owasp/benchmark/testcode/BenchmarkTest00036.java
+- XSS 種別: 反射型（source・sink は "第2回xssの詳細"）
+- 修正したファイル: BenchmarkTest00036.java
+
+### 修正コードの説明
+
+#### No.7 BenchmarkTest00036.java の修正コードの説明
+
+対象: OWASP-Benchmark/BenchmarkJava（コミット 8b67a88d73b2594570fc21150705283de884620b）
+`src/main/java/org/owasp/benchmark/testcode/BenchmarkTest00036.java`
+修正ファイル: `fix01_BenchmarkTest00036.java`
+
+#### 1. 修正の方針
+
+- 防ぐ脆弱性: 反射型 XSS（CWE-79）
+  - source: 46行目 `request.getParameterNames()` で得るパラメータ名（48行目 `name`）。値が `"BenchmarkTest00036"` と一致したパラメータの名前が 54行目で `param` に入る。
+  - sink: 65行目 `response.getWriter().write(param.toCharArray(), 0, length)`。42行目で `text/html;charset=UTF-8` を指定した HTML 応答に、`param` をエスケープせずに書き出している。
+- 防ぐ場所: sink の直前（`if (param != null)` ブロックの中、書き出す前）。
+- 防ぐ方法: OWASP ESAPI の `ESAPI.encoder().encodeForHTML(param)` で、出力する文字列を HTML エスケープ（出力エンコード）する。
+- この方法を選んだ理由:
+  - パラメータ名は利用者が自由に決められるので、source 側で入力を止めることはできない。値は HTML 本文に文字列として表示されるだけなので、出力の文脈（HTML 本文）に合わせて出力時にエスケープするのが、XSS 対策の基本で確実な方法である。
+  - ESAPI はこのプロジェクトの `pom.xml` に既に依存関係（`org.owasp.esapi:esapi` 2.7.0.0）として入っているため、新しいライブラリを追加せずに 1 行の追加で直せる。修正が最小限で済む。
+  - 自作のエスケープ処理よりも、広く使われているライブラリの方が、エスケープ漏れの心配が少ない。
+
+#### 2. 変更箇所ごとの説明
+
+変更したのは `BenchmarkTest00036.java` の `if (param != null)` ブロックだけである。それ以外（パラメータの走査、Content-Type、ヘッダの設定）は元のまま。
+
+修正前（元のファイルの 63〜66行目）:
+
+```java
+        if (param != null) {
+            length = param.length();
+            response.getWriter().write(param.toCharArray(), 0, length);
+        }
+```
+
+修正後（修正ファイルの 63〜72行目）:
+
+```java
+        if (param != null) {
+            // 【修正】param は利用者が自由に決められる「パラメータ名」なので、HTML 応答へ書き出す前に
+            // ESAPI の encodeForHTML で HTML エスケープする（< > & " ' などを文字参照に置き換え、
+            // タグや属性として解釈されないようにする）。ESAPI は pom.xml に既に依存関係がある。
+            param = org.owasp.esapi.ESAPI.encoder().encodeForHTML(param);
+            // 【修正】エスケープ後の文字列で長さを計算し直す（エスケープで文字数が増えるため、
+            // エスケープ後に length を求めて、途中で切れずに全体が出力されるようにする）。
+            length = param.length();
+            response.getWriter().write(param.toCharArray(), 0, length);
+        }
+```
+
+各行の説明:
+
+- 64〜66行目（追加・コメント）: なぜエスケープするのかを説明する日本語コメント。
+- 67行目（追加）: `param = org.owasp.esapi.ESAPI.encoder().encodeForHTML(param);`
+  - `encodeForHTML` は、英数字と一部の安全な記号（`,` `.` `-` `_` 空白）以外の文字を HTML の文字参照に変換する。たとえば `<` は `&lt;`、`>` は `&gt;`、`&` は `&amp;`、`"` は `&quot;`、`'` は `&#x27;` になる。
+  - これで、パラメータ名にタグや属性を書き込んでも、ブラウザはそれを要素や属性として解釈せず、ただの文字として表示する。スクリプトの開始（`<script>` やイベントハンドラ属性を持つ要素）が作れなくなるため、XSS を防げる。
+  - import 文を増やさないよう、完全修飾名で呼び出している（変更行を最小にするため）。
+- 68〜69行目（追加・コメント）: 長さを計算し直す理由のコメント。
+- 70行目（位置は同じ、意味が変わる）: `length = param.length();`
+  - 元は 64行目にあった行。67行目のエスケープの後に置くことで、エスケープ後の文字列の長さを求める。エスケープすると文字数が増える（`<` 1 文字が `&lt;` 4 文字になる）ので、エスケープ前の長さのままだと出力が途中で切れてしまう。それを防ぐ。
+- 71行目（変更なし）: `response.getWriter().write(param.toCharArray(), 0, length);`
+  - 書き出す処理は元のまま。ただし、書き出すのはエスケープ済みの `param` になる。
+
+#### 3. 修正の結果
+
+- 攻撃例の入力の扱い:
+  - 攻撃者が、名前の部分に script 要素やイベントハンドラ付きの img 要素などの HTML を入れ、値を `"BenchmarkTest00036"` にしたパラメータを送らせた場合、修正前はその名前が HTML としてそのまま応答に入り、被害者のブラウザでスクリプトが実行された。
+  - 修正後は、名前の中の `<` `>` `"` `'` `=` `/` などがすべて文字参照に変換されて出力される。ブラウザはこれを要素や属性ではなく、画面に表示する文字として扱うので、スクリプトは実行されない。画面には攻撃者が入れた文字列がそのまま文字として表示されるだけになる。
+- 正常な入力での動作への影響:
+  - 変わらない点: パラメータを走査して、値が `"BenchmarkTest00036"` のパラメータの名前を選ぶ処理は同じ。英数字だけの名前（例: `foo`）はエスケープしても同じ文字列なので、応答の内容はまったく同じになる。Content-Type やヘッダの設定も変わらない。
+  - 変わる点: 名前に記号や英数字以外の文字（日本語など）が含まれる場合、応答の HTML ソース上では文字参照（例: `&#x2f;`）になる。ただし、ブラウザで表示される文字は元と同じなので、画面の見た目は変わらない。HTML ソースを直接読む処理があれば、その結果は変わる。
+  - 該当するパラメータがない場合、`param` は空文字列のままなので、エスケープしても空文字列で、何も出力しない点は元と同じ。
+
+#### 4. 注意点
+
+- 61行目の `response.setHeader("X-XSS-Protection", "0")` は変更していない。このヘッダは今のブラウザでは基本的に使われておらず、XSS は出力エンコードで防ぐべきものなので、今回の修正では残した。
+- `web.xml` で全 URL に掛かる `HTTPResponseHeaderFilter` の CSP は `default-src` に `'unsafe-inline'` と `'unsafe-eval'` を含んでおり、インラインスクリプトを止められない。これはアプリ全体の設定なので、このファイルの修正の範囲外として変更していない。多層防御としては、CSP の強化も検討するとよい。
+- 今回のエスケープは、出力先が HTML の本文（要素の中身）であることを前提にしている。将来この値を HTML 属性・JavaScript・URL・CSS の中に出力するように変える場合は、その文脈に合ったエンコード（`encodeForHTMLAttribute`、`encodeForJavaScript`、`encodeForURL` など）を使う必要がある。
+- ESAPI を使うには ESAPI の設定ファイル（`ESAPI.properties` など）が読み込める必要がある。このプロジェクトは ESAPI を依存関係に入れているため、既存の設定がある前提で修正している。
+- このファイルには XSS 以外の脆弱性は見つからなかったため、他の修正はしていない。
+
+### 修正したコード: BenchmarkTest00036.java
+
+```java
+/**
+ * OWASP Benchmark v1.2
+ *
+ * <p>This file is part of the Open Web Application Security Project (OWASP) Benchmark Project. For
+ * details, please see <a
+ * href="https://owasp.org/www-project-benchmark/">https://owasp.org/www-project-benchmark/</a>.
+ *
+ * <p>The OWASP Benchmark is free software: you can redistribute it and/or modify it under the terms
+ * of the GNU General Public License as published by the Free Software Foundation, version 2.
+ *
+ * <p>The OWASP Benchmark is distributed in the hope that it will be useful, but WITHOUT ANY
+ * WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR
+ * PURPOSE. See the GNU General Public License for more details.
+ *
+ * @author Dave Wichers
+ * @created 2015
+ */
+package org.owasp.benchmark.testcode;
+
+import java.io.IOException;
+import javax.servlet.ServletException;
+import javax.servlet.annotation.WebServlet;
+import javax.servlet.http.HttpServlet;
+import javax.servlet.http.HttpServletRequest;
+import javax.servlet.http.HttpServletResponse;
+
+@WebServlet(value = "/xss-00/BenchmarkTest00036")
+public class BenchmarkTest00036 extends HttpServlet {
+
+    private static final long serialVersionUID = 1L;
+
+    @Override
+    public void doGet(HttpServletRequest request, HttpServletResponse response)
+            throws ServletException, IOException {
+        doPost(request, response);
+    }
+
+    @Override
+    public void doPost(HttpServletRequest request, HttpServletResponse response)
+            throws ServletException, IOException {
+        // some code
+        response.setContentType("text/html;charset=UTF-8");
+
+        String param = "";
+        boolean flag = true;
+        java.util.Enumeration<String> names = request.getParameterNames();
+        while (names.hasMoreElements() && flag) {
+            String name = (String) names.nextElement();
+            String[] values = request.getParameterValues(name);
+            if (values != null) {
+                for (int i = 0; i < values.length && flag; i++) {
+                    String value = values[i];
+                    if (value.equals("BenchmarkTest00036")) {
+                        param = name;
+                        flag = false;
+                    }
+                }
+            }
+        }
+
+        response.setHeader("X-XSS-Protection", "0");
+        int length = 1;
+        if (param != null) {
+            // 【修正】param は利用者が自由に決められる「パラメータ名」なので、HTML 応答へ書き出す前に
+            // ESAPI の encodeForHTML で HTML エスケープする（< > & " ' などを文字参照に置き換え、
+            // タグや属性として解釈されないようにする）。ESAPI は pom.xml に既に依存関係がある。
+            param = org.owasp.esapi.ESAPI.encoder().encodeForHTML(param);
+            // 【修正】エスケープ後の文字列で長さを計算し直す（エスケープで文字数が増えるため、
+            // エスケープ後に length を求めて、途中で切れずに全体が出力されるようにする）。
+            length = param.length();
+            response.getWriter().write(param.toCharArray(), 0, length);
+        }
+    }
+}
+```
+
+---
