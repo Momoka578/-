@@ -1,0 +1,149 @@
+## No.5 OWASP-Benchmark/BenchmarkJava BenchmarkTest00014.java
+- 対象: https://github.com/OWASP-Benchmark/BenchmarkJava/blob/master/src/main/java/org/owasp/benchmark/testcode/BenchmarkTest00014.java
+- XSS 種別: 反射型（source・sink は "第2回xssの詳細"）
+- 修正したファイル: BenchmarkTest00014.java
+
+### 修正コードの説明
+
+#### No.5 BenchmarkTest00014.java の修正コードの説明
+
+対象: OWASP-Benchmark/BenchmarkJava（コミット 8b67a88d73b2594570fc21150705283de884620b）
+`src/main/java/org/owasp/benchmark/testcode/BenchmarkTest00014.java`
+
+修正ファイル: `fix01_BenchmarkTest00014.java`（ライセンスヘッダ 17 行を省略しているため、元のファイルとは行番号がずれる）
+
+#### 1. 修正の方針
+
+- 防ぐ脆弱性: 反射型 XSS（CWE-79）
+  - source: 元のファイル 45 行目 `request.getHeaders("Referer")`（48 行目で最初の値を `param` に代入）
+  - 伝播: 52 行目 `java.net.URLDecoder.decode(param, "UTF-8")` で URL デコードされる（無害化はされない）
+  - sink: 56 行目 `response.getWriter().format(param, obj)`。42 行目で `text/html` を指定した応答本文に、`param` がそのまま出力される
+- 防ぐ場所: sink の直前（URL デコードの後、出力の前）。
+- 防ぐ方法: OWASP ESAPI の `ESAPI.encoder().encodeForHTML()` で HTML エスケープした値を出力する。
+- この方法を選んだ理由:
+  - 出力先は HTML の本文（要素の内容）なので、その文脈に合った HTML エスケープが正しい対策になる。
+  - エスケープは URL デコードの**後**に行う必要がある。デコードの前にエスケープしても、`%3Cscript%3E` のような符号化された文字がデコードで `<script>` に戻ってしまうため。
+  - ESAPI は同じリポジトリの `pom.xml` に依存関係（`org.owasp.esapi:esapi` 2.7.0.0）として入っており、新しいライブラリを追加せずに使える。
+  - 入力値を拒否したり文字を削除したりする方法と違い、正常な Referer の文字列は見た目を変えずに表示できる。
+  - 変更は「エスケープした変数を作る 1 行」と「出力する変数を差し替える 1 行」だけで、元の処理の流れ（ヘッダ取得 → URL デコード → `format` で出力）はそのまま残る。
+
+#### 2. 変更箇所ごとの説明
+
+##### 変更 1: エスケープ済みの値を作る行を追加
+
+- ファイル: `fix01_BenchmarkTest00014.java` 39〜42 行目（元のファイルでは 55 行目と 56 行目の間に追加）
+- 修正前: なし（`param` をそのまま次の行で出力していた）
+- 修正後:
+
+```java
+        // 【修正】Referer ヘッダ（外部入力）を、URL デコードした後に HTML 出力用にエスケープする。
+        // < > " ' & などを文字参照（&lt; など）に変換し、タグやスクリプトとして解釈されないようにする。
+        // （ESAPI は % も &#x25; に変換するため、書式指定子として働く文字も残らない）
+        String safeParam = org.owasp.esapi.ESAPI.encoder().encodeForHTML(param);
+```
+
+- 各行の役割:
+  - 39〜41 行目: 修正の意図を説明する日本語コメント。
+  - 42 行目: `ESAPI.encoder()` で ESAPI の標準エンコーダを取得し、`encodeForHTML(param)` で HTML の本文用にエスケープした文字列を `safeParam` に入れる。英数字と `, . - _ 空白` 以外の文字は、`&lt;` `&gt;` `&quot;` `&amp;` のような名前付き文字参照、または `&#x27;` のような数値文字参照に変換される。
+  - クラス名は完全修飾名（`org.owasp.esapi.ESAPI`）で書いたので、import 文の追加は不要。
+- XSS が防げる理由: HTML のタグや属性を作るのに必要な `<` `>` `"` `'` `&` がすべて文字参照になるため、ブラウザはそれらを「文字」として表示するだけで、タグやスクリプトとして解釈しない。エスケープは URL デコードの後に行っているので、符号化して送られた `<` なども確実に無害化される。
+
+##### 変更 2: 出力する変数をエスケープ済みのものに差し替え
+
+- ファイル: `fix01_BenchmarkTest00014.java` 43〜44 行目（元のファイルの 56 行目）
+- 修正前:
+
+```java
+        response.getWriter().format(param, obj);
+```
+
+- 修正後:
+
+```java
+        // 【修正】エスケープ前の param ではなく、エスケープ済みの safeParam を出力する。
+        response.getWriter().format(safeParam, obj);
+```
+
+- 各行の役割:
+  - 43 行目: 修正の意図を説明する日本語コメント。
+  - 44 行目: 応答本文（`text/html`）に書き出す文字列を、外部入力そのままの `param` から、HTML エスケープ済みの `safeParam` に変える。
+- XSS が防げる理由: sink に届く文字列が必ずエスケープ済みになるため、Referer に何が入っていても HTML の構造を変えられない。また、`%` も `&#x25;` に変換されるので、`format` の書式指定子（`%s` など）によってエスケープ後の文字列が書き換えられることもない（`obj` の中身は固定の `"a"` `"b"` で、仮に展開されても HTML を作れる値ではない）。
+
+##### 変更していない箇所
+
+- 42 行目（元）の `setContentType`、45〜49 行目の Referer の取得、52 行目の URL デコード、54 行目の `X-XSS-Protection: 0`、55 行目の `obj` は変えていない（修正は最小限にするため）。
+
+#### 3. 修正の結果
+
+- 攻撃例の入力の扱い:
+  - 攻撃者が Referer にスクリプトを含む文字列（URL 符号化したものを含む）を入れた場合、52 行目でデコードされて `<script>` のような文字列になるが、42 行目（修正後）で `&lt;script&gt;` のように変換される。
+  - ブラウザには `<script>` という**文字**が画面に表示されるだけで、スクリプトは実行されない。イベントハンドラ属性（`onerror=` など）を使う攻撃も、`<` や `"` が文字参照になるためタグや属性を作れず、成立しない。
+- 正常な入力への影響:
+  - 変わらない点: 通常の Referer（例: `http://localhost:8443/benchmark/xss-00/...`）は、`:` `/` `?` `=` などが文字参照に変換されるが、ブラウザで表示したときの見た目は修正前と同じ。Referer がない場合は空文字が出力される点も同じ。
+  - 変わる点:
+    - 応答の HTML ソース上の文字列は文字参照を含む形になる（表示は同じ）。
+    - 修正前は Referer に `%s` などが含まれると書式指定子として解釈され（`%s` が `a` に置き換わる、不正な指定子では例外になる）ていたが、修正後は `%` がエスケープされるため、入力した文字がそのまま表示される。
+    - 日本語などの非 ASCII 文字も数値文字参照（`&#x3042;` など）として出力されるが、表示は同じ。
+
+#### 4. 注意点
+
+- XSS 以外の問題（修正対象外）:
+  - 書式文字列の外部制御（CWE-134）: 元のコードは外部入力を `format` の書式文字列として使っている。今回の修正では、エスケープで `%` が `&#x25;` になる副作用により実質的に書式指定子は働かなくなるが、これは XSS 対策の結果であって、書式文字列の問題を直接直したものではない。根本的には、外部入力を書式文字列として使わないこと（`format("%s", safeParam)` や `print(safeParam)` にする）が望ましい。
+  - `X-XSS-Protection: 0` は残している。現在の主要ブラウザではこのヘッダの XSS フィルタ機能は廃止されているため、今回のエスケープによる対策の効果には影響しない。
+- 残る制約:
+  - `encodeForHTML` は HTML の本文（要素の内容）や引用符で囲んだ属性値に出力する場合の対策である。将来この値を `<script>` の中や URL、CSS の中に出力するように変更する場合は、その文脈に合ったエスケープ（`encodeForJavaScript`、`encodeForURL` など）が別に必要になる。
+  - ESAPI の実行には `ESAPI.properties` などの設定が必要である（Benchmark プロジェクトでは他のテストケースでも ESAPI を使っており、設定は用意されている前提）。
+  - サイト全体の CSP（`HTTPResponseHeaderFilter`）は `'unsafe-inline'` と `'unsafe-eval'` を許可しており、多層防御としては弱い。今回の修正はこのサーブレットの出力のエスケープだけで XSS を防ぐもので、CSP は変更していない。
+
+### 修正したコード: BenchmarkTest00014.java
+
+```java
+package org.owasp.benchmark.testcode;
+
+import java.io.IOException;
+import javax.servlet.ServletException;
+import javax.servlet.annotation.WebServlet;
+import javax.servlet.http.HttpServlet;
+import javax.servlet.http.HttpServletRequest;
+import javax.servlet.http.HttpServletResponse;
+
+@WebServlet(value = "/xss-00/BenchmarkTest00014")
+public class BenchmarkTest00014 extends HttpServlet {
+
+    private static final long serialVersionUID = 1L;
+
+    @Override
+    public void doGet(HttpServletRequest request, HttpServletResponse response)
+            throws ServletException, IOException {
+        doPost(request, response);
+    }
+
+    @Override
+    public void doPost(HttpServletRequest request, HttpServletResponse response)
+            throws ServletException, IOException {
+        // some code
+        response.setContentType("text/html;charset=UTF-8");
+
+        String param = "";
+        java.util.Enumeration<String> headers = request.getHeaders("Referer");
+
+        if (headers != null && headers.hasMoreElements()) {
+            param = headers.nextElement(); // just grab first element
+        }
+
+        // URL Decode the header value since req.getHeaders() doesn't. Unlike req.getParameters().
+        param = java.net.URLDecoder.decode(param, "UTF-8");
+
+        response.setHeader("X-XSS-Protection", "0");
+        Object[] obj = {"a", "b"};
+        // 【修正】Referer ヘッダ（外部入力）を、URL デコードした後に HTML 出力用にエスケープする。
+        // < > " ' & などを文字参照（&lt; など）に変換し、タグやスクリプトとして解釈されないようにする。
+        // （ESAPI は % も &#x25; に変換するため、書式指定子として働く文字も残らない）
+        String safeParam = org.owasp.esapi.ESAPI.encoder().encodeForHTML(param);
+        // 【修正】エスケープ前の param ではなく、エスケープ済みの safeParam を出力する。
+        response.getWriter().format(safeParam, obj);
+    }
+}
+```
+
+---
