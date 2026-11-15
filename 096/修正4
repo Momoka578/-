@@ -1,0 +1,366 @@
+## No.96 CVE-2020-15095 npm (npm/cli 6.14.5) lib/fetch-package-metadata.js
+
+- 修正コード3の検証で見つかった不備: pacote の「Non-registry package missing package.json: 名前@URL」のように名前@ が前に付く // なしの URL が、er.message 側で伏せられずログに平文で残る（CWE-312 / CWE-532（修正コード2の検証の記録と同じ））
+- 修正コード4 のファイル: lib/fetch-package-metadata.js
+- 組み合わせ: 修正コード4 のファイル（lib/fetch-package-metadata.js）。修正前の最終版: lib/fetch-package-metadata.js（修正コード3）
+- 親の確認: lib/fetch-package-metadata.js: node --check で構文エラーなし。エージェントが読み取り専用の材料（orig・given）を変えていないこと、読まない範囲のファイルを読んでいないことを、記録で確認した。
+- 使用トークン量（作成）: 新規 313,616（入力 110 ／ キャッシュ作成 207,647 ／ 出力〔推定〕 105,859）、キャッシュ読込 7,732,889、総処理 8,046,505、リクエスト 54 回
+
+対象: No.96 CVE-2020-15095 npm/cli `lib/fetch-package-metadata.js`（元のコードは npm/cli 479e45c、npm 6.14.5）
+修正コード4: `$R/fix4/lib/fetch-package-metadata.js`（修正コード3 `$R/given/fix3/lib/fetch-package-metadata.js` をコピーし、不備の箇所だけを直した。今回直した箇所には `【修正4】` のコメントを付けた。修正コード1 の `【修正】`、修正コード2 の `【修正2】`、修正コード3 の `【修正3】` のコメントは、内容が変わらないのでそのまま残した）
+
+### 修正コード3の不備
+
+#### 不備: er.message に「パッケージ名@ + // のない URL」の形で埋め込まれた spec が伏せられない
+
+- 場所: `$R/given/fix3/lib/fetch-package-metadata.js`
+  - 58 行目 `const URL_CREDENTIALS_NO_SLASH = /(^|\s)((?!(?:[a-z]|npm|file):)[a-z0-9.+-]+:[/\\]*)[^\s/\\?#]*@/gi`
+  - 63 行目 `return str.replace(URL_CREDENTIALS, ':$1***@').replace(URL_CREDENTIALS_NO_SLASH, '$1$2***@')`
+  - 84 行目 `log.silly('fetchPackageMetaData', 'error for ' + redactUrlCredentials(String(spec), true), redactUrlCredentials(er.message))` の er.message 側
+  - （37 行目の `URL_CREDENTIALS = /:([/\\]+)[^\s/\\?#]*@/g` は、「:」の後に `/` か `\` が 1 個以上ないと一致しない）
+- 問題: er.message 用の置き換えで `//` のない「スキーム:」を伏せるのは、`URL_CREDENTIALS_NO_SLASH` の `(^|\s)` のとおり、スキームが文字列の先頭か空白の直後から始まる場合だけだった。ところが pacote 9.5.12 の `lib/finalize-manifest.js` 157 行目は
+  ```js
+  const err = new Error(`Non-registry package missing package.json: ${spec}.`)
+  ```
+  で、npa の Result の toString（`name@saveSpec`。remote・git 型の saveSpec は利用者が書いた rawSpec そのもの）をそのままメッセージに入れる。名前の付いた spec では `… package.json: mypkg@HTTP:alice:S3cretPass@host/x.tgz.` のように、スキームの前に `mypkg@` が付くので、`URL_CREDENTIALS_NO_SLASH` にも `URL_CREDENTIALS` にも一致しない。このエラー（code `ENOPACKAGEJSON`）は、fetchPackageMetadata の 130 行目 `if (dep.type !== 'directory') return logAndFinish(err)` を通って 84 行目のログに出る。spec 側（`error for …`）は伏せられているのに、同じ行の er.message 側に、サーバに受け付けられた本物のパスワード・トークンが平文で残り、`log.record` を通して npm-debug.log に書き出される。判定の脆弱性（CWE-312・CWE-532）が、この経路と入力で残っていた。
+- 自分で再現した（e2e。`$R/bench/e2e.js`・`child.js`・`cases_nopkg.json`、出力は `$R/bench/e2e_nopkg_out.txt`）: 127.0.0.1 だけで待ち受ける HTTP サーバを立て（終わったら閉じた）、本物の pacote 9.5.12 と git 2.53.0 で、元のコード・修正コード1〜3 を実際に require して、call-limit で包まれた fetchPackageMetadata を呼んだ。サーバは、Authorization が付いていれば 200 で package.json のない tgz（README だけ）か HTML を返し、git の dumb HTTP では Authorization が付いていれば package.json のないリポジトリを返す（付いていなければ 401）。
+  - 検証の記録の入力 N1 `mypkg@HTTP:alice:S3cretPass@127.0.0.1:PORT/…/nopkg.tgz`（文字列・Result）: サーバに `Basic alice:S3cretPass` が届いて 200 を返し、修正コード3 のログは
+    ```
+    error for mypkg@HTTP:***@127.0.0.1:PORT/fix3-N1-s/nopkg.tgz Non-registry package missing package.json: mypkg@HTTP:alice:S3cretPass@127.0.0.1:PORT/fix3-N1-s/nopkg.tgz.
+    ```
+    になった。N2 `@scope/pkg@Http:…`、N5（HTML を返す場合）、N6 `npa.resolve('mypkg', 'HTTP:alice:S3cretPass@…')`、NG1 `mypkg@git+http:bob:Tok3nXYZ@…/nopkg.git`（git が `bob:Tok3nXYZ` で取得に成功）、NG3 `npa.resolve('mypkg', 'GIT+HTTP:bob:Tok3nXYZ@…')` も同じく er.message 側に平文で残った。検証の記録のとおり再現できた。
+  - 同じ原因の別の入力（どれもサーバに認証情報が届き、修正コード3 で er.message 側に平文）: N7・NG7（npa の Result を `Object.assign({}, …)` でただのオブジェクトにしたもの。spec 側は `[object Object]` だが、pacote が `npa.resolve(name, rawSpec)` で作り直した Result の toString がメッセージに入る）、N8 `mypkg@HTTP:al@ice:p@ss99@…`（`@` を複数含む）、N9 `mypkg@hTtP:alice:S3cret%40Pass@…`（パーセント符号化）、N10（`?a=b` 付き）、N12 `mypkg@HTTP:alice:pa ss99@…`（生の空白）、NG5 `@scope/pkg@gIt+HtTp:Tok3nXYZ@…`（トークンだけ・大文字小文字の混在）、NG6（`#master` 付き）。
+  - 秘密が残った件数（33 件中）: 元のコード 33、修正コード1 29、修正コード2 29、修正コード3 24。名前のない N3・NG2 と `//` のある N4・NG4 は、修正コード3 でも伏せられた。
+  - pacote を差し替えた確認（`$R/bench/unit.js`・`cases_attack.js`）でも、pacote が spec を埋め込む別のメッセージ `Verification failed while extracting ${spec}:`（with-tarball-stream.js 127 行目・extract.js 94 行目）・`No git url for ${spec}`（fetchers/git.js 89 行目）や、引用符・括弧の中に spec が入る形で、同じように残ることを確かめた（修正コード3 は 1395 通り中 953 通りで秘密が残った）。
+- いつ入ったか: 修正コード1 から。修正コード1 の er.message 用 `/:\/\/[^\s/?#]*@/g` も、修正コード2 の `/:([/\\]+)[^\s/\\?#]*@/g` も `//` のない形を扱わない（e2e で修正コード1・2 も同じ入力で平文が残り、名前のない N3・NG2 も残った）。修正コード3 は語の先頭（先頭か空白の直後）の形だけを足したので、名前の付いた形が残った。元のコードには伏せる処理がない（全件が平文）。
+
+#### 参考: 検証の記録で「指摘」とした点
+- M07（ssh の相手が返すメッセージの引用符の中の `'bob:Tok3nXYZ@h:org/…'`）: 今回の正規表現の拡張（下の 2）で、結果として伏せられるようになった（`$R/bench/quoted.js`、出力は `quoted_out.txt`）。
+- X01・X02（hosted-git-info がパスに読み替えた `…gitlab.com/bob%3ATok3nX%40git.example.com/…`）: 直していない（「副作用・残る点」）。
+
+### 再修正の内容
+
+変更したのは `lib/fetch-package-metadata.js` の 3 か所だけ。ほかの行（修正コード3 の `SPEC_STARTS_WITH_SCHEME`・`SPEC_URL_CREDENTIALS`・`URL_CREDENTIALS`・`URL_CREDENTIALS_IN_SPEC`・`redactUrlCredentials`・`redactSpecCredentials`、fetchPackageMetadata、addBundled）は修正コード3 と同じ。
+
+#### 1. er.message に埋め込まれた spec そのものを、spec 側と同じ方法で伏せる（新しい関数 `redactSpecInMessage`、修正コード4 の 85〜117 行目。不備への主な対応）
+
+```js
+function redactSpecInMessage (message, spec, specString) {
+  if (typeof message !== 'string') return message
+  const forms = [specString]
+  if (spec && typeof spec === 'object') {
+    const name = typeof spec.name === 'string' ? spec.name : ''
+    for (const key of ['raw', 'rawSpec', 'saveSpec', 'fetchSpec']) {
+      const value = spec[key]
+      if (typeof value !== 'string') continue
+      forms.push(value)
+      if (name) forms.push(name + '@' + value)
+    }
+  }
+  forms.sort((a, b) => b.length - a.length)
+  const seen = new Set()
+  for (const form of forms) {
+    if (!form || seen.has(form)) continue
+    seen.add(form)
+    if (message.indexOf(form) === -1) continue
+    const redacted = redactUrlCredentials(form, true)
+    if (redacted !== form) message = message.split(form).join(redacted)
+  }
+  return message
+}
+```
+
+- **何をするか**: ログに出す spec の文字列（`String(spec)`）と、spec がオブジェクト（npa の Result など）のときの `raw`・`rawSpec`・`saveSpec`・`fetchSpec`、それぞれに `name@` を付けたものを「spec の形」の候補にする。er.message の中にその文字列がそのまま出てきたら、spec 側と同じ `redactUrlCredentials(…, true)`（修正コード3 の spec 用の伏せ方）で伏せた形に置き換える。例: `Non-registry package missing package.json: mypkg@HTTP:alice:S3cretPass@host/x.tgz.` → `… package.json: mypkg@HTTP:***@host/x.tgz.`。
+- **なぜこの方法にしたか**: pacote は spec の toString をそのまま文章に入れる（`${spec}`）。埋め込まれた文字列は spec 側でログに出す文字列と同じなので、spec 側で正しく伏せられる範囲（npa・url.parse と同じ規則で決めた範囲）を、そのまま er.message 側にも当てられる。正規表現で er.message の中から URL を探す方法と違い、前後の文字（`.` `:` 引用符・括弧・改行など）にも、パスワードに使われた文字（生の空白・タブ・`'` `(`・`@`・`%` 符号化など）にもよらない。候補に `name@rawSpec` などを加えたのは、pacote が `npa(spec, opts.where)` で Result を作り直す（`where` が違うと `npa.resolve(name, rawSpec, where)` になる）場合や、ただのオブジェクトが渡された場合（spec 側は `[object Object]`）でも、メッセージに入る形を拾うため。
+- **どう動くか**: 長い候補から順に（`mypkg@HTTP:…` を `HTTP:…` より先に）置き換える。同じ文字列の候補は 1 回だけ扱い、メッセージに出てこない候補は伏せる処理をしない。伏せても変わらない候補（認証情報を含まない spec）は置き換えないので、通常のメッセージは変わらない。置き換えは正規表現ではなく `split`/`join` で行うので、後戻りがなく、`$&` `$1` などの置換パターンも展開されない（spec に `$` を含めて確かめた）。文字列でない er.message（undefined など）はそのまま返す。
+- **ログを出す行（126〜130 行目）**:
+  ```js
+  const specString = String(spec)
+  log.silly('fetchPackageMetaData', 'error for ' + redactUrlCredentials(specString, true), redactUrlCredentials(redactSpecInMessage(er.message, spec, specString)))
+  ```
+  er.message は、先に `redactSpecInMessage` で spec の形を伏せてから、これまでの er.message 用の置き換え（`URL_CREDENTIALS`・`URL_CREDENTIALS_NO_SLASH`）を行う。順番を逆にすると、先に一部が `***` になって、埋め込まれた spec の文字列と一致しなくなるため。`String(spec)` は元のコードと同じく 1 回だけ求め、spec 側と `redactSpecInMessage` の両方で使う。er と pkg は書き換えずに `done(er, pkg)` に渡し、tracker の扱いも変えていない。
+
+#### 2. er.message 用の正規表現で、語の先頭の後に「引用符・括弧」と「パッケージ名@」を許す（`URL_CREDENTIALS_NO_SLASH`、修正コード4 の 58〜67 行目。同じ原因の別の形への対応）
+
+```js
+const URL_CREDENTIALS_NO_SLASH = /(^|\s)(['"`(<[{]*(?:(?:@[\w.!~*'()-]+\/)?[\w.!~*)-][\w.!~*'()-]*@)?(?!(?:[a-z]|npm|file):)[a-z0-9.+-]+:[/\\]*)[^\s/\\?#]*@/gi
+```
+
+- **何を変えたか**: 修正コード3 の `(^|\s)` と「スキーム:」の間に、次の 2 つを任意で（0 回でも）許した。置換文字列は修正コード3 と同じ `'$1$2***@'` で、空白・引用符・パッケージ名・スキーム・区切りは元のまま残し、userinfo だけを `***` にする。
+  - 開き側の引用符・括弧（`'` `"` `` ` `` `(` `<` `[` `{`）の並び。
+  - パッケージ名と「@」。`@scope/name@` も含む。名前の文字は validate-npm-package-name が古いパッケージにも認める文字（`encodeURIComponent` で変わらない英数字と `. _ ~ ! * ' ( ) -`）にした。
+- **なぜ足したか**: 1 の照合は、メッセージに入る文字列が spec の形と完全に一致するときに効く。この正規表現は、一致しない形（別の依存の spec がメッセージに入る場合や、作り直しで形が変わった場合など）で、`mypkg@HTTP:user:pass@…`・`'HTTP:user:pass@…'`・`(other@git+https:bob:token@…)` のような形も伏せるための、2 段目の守り。例: `could not fetch (other@git+https:bob:Tok3nXYZ@git.example/r.git)` → `(other@git+https:***@git.example/r.git)`、`fatal: 'bob:Tok3nXYZ@h.example:org/repo.git' …` → `'bob:***@h.example:org/repo.git' …`（検証の記録の M07）。
+- **処理時間（線形のまま）**: 開始位置は修正コード3 と同じく先頭か空白の直後だけ。足した部分（引用符・括弧、パッケージ名、「@」）も、スキーム・区切り・authority も空白を含まないので、1 つの開始位置からの走査は次の空白までで終わり、開始位置どうしの走査区間は重ならない。さらに、名前の 1 文字目から `'` と `(` を除いて、引用符・括弧の並びと文字が重ならないようにしたので、文字の分け方が一通りに決まる（`'` や `(` で始まる名前は、その文字を引用符・括弧の並びが受け持つ）。名前の文字には `@` `/` `:` が入らないので、名前の部分の後戻りは 1 回の走査分だけ。開始位置を空白以外（引用符の直後など）にも広げる方法は、authority の区間が後の開始位置と重なって 2 乗の時間になるので採らなかった。
+- **除くスキーム**: 否定先読み `(?!(?:[a-z]|npm|file):)` は名前の後に置いたので、`foo@npm:bar@1.0.0`・`(foo@npm:bar@1.0.0)`・`C:@scope\pkg` などは、修正コード3 と同じく変わらない。
+
+#### 2 つの仕組みの分担（確認用に片方だけにした版で確かめた）
+- 1 の照合だけ（正規表現は修正コード3 のまま）: 1395 通りすべてで秘密が残らなかった。
+- 2 の正規表現だけ（照合を無効にした版）: 1395 通り中 145 通りで残った。パスワードに生の空白・タブがある形（er.message 用の正規表現は文章を伏せすぎないよう空白で止まる）と、`fetch failed:${spec}` のように空白なしで続く形。
+- そのため、修正コード4 では 1 を主な対応とし、2 を spec と一致しない形への補助として両方を入れた。
+
+### 確認した内容と結果
+
+確認の環境: Node v22.22.1、git 2.53.0。npm/cli 479e45c の `node_modules/*/package.json` を curl で `$R/dl/nm/` に取得して版を確かめ、npm-package-arg 6.1.1・hosted-git-info 2.8.8・pacote 9.5.12・npm-registry-fetch 4.0.4・make-fetch-happen 5.0.2・node-fetch-npm 2.0.2・npmlog 4.1.2・call-limit 1.1.1・lru-cache 5.1.1・aproba 2.0.0・figgy-pudding 3.5.1・rimraf 2.7.1・validate-npm-package-name 3.0.0・semver 5.7.1 を `npm install --ignore-scripts` で `$R/bench/` に入れた（npm 本体が入っていないことを確認した）。`./utils/depr-check.js` は同じコミットのものを取得して使い、`./npm`・`./config/figgy-config.js`・`./utils/temp-filename`・`./utils/is-windows.js`・read-package-tree はスタブにした（`$R/bench/stub/`）。元のコード・修正コード1〜4 を `$R/bench/run/{orig,fix1,fix2,fix3,fix4}/lib/` にコピーして、実際に require して呼んだ（`$R/bench/setup_variants.sh`）。HOME・TMPDIR は `$R/bench` の下に向け、git の利用者設定や資格情報ヘルパーが効かないようにした。サーバは 127.0.0.1 だけで待ち受け、終わったら閉じた。
+
+1. **構文確認・読み込み**: `node --check` で修正コード4 に構文エラーがないことを確認した。本物の依存モジュールとスタブで require でき、fetchPackageMetadata を呼べた。
+2. **不備の再現と修正の確認（e2e。`$R/bench/e2e.js`・`cases_nopkg.json`、出力は `e2e_nopkg_out.txt`）**: 上の「修正コード3の不備」の 33 通り（N1〜N13・NG1〜NG7 を文字列・Result・npa.resolve・ただのオブジェクトで）。
+   - 秘密が残った件数: 元のコード 33、修正コード1 29、修正コード2 29、修正コード3 24、**修正コード4 0**。
+   - 修正コード4 のログの例: `error for mypkg@HTTP:***@127.0.0.1:PORT/fix4-N1-s/nopkg.tgz Non-registry package missing package.json: mypkg@HTTP:***@127.0.0.1:PORT/fix4-N1-s/nopkg.tgz.`、`error for mypkg@git+http:***@… Non-registry package missing package.json: mypkg@git+http:***@127.0.0.1:PORT/fix4-NG1-s/nopkg.git.`、`error for [object Object] Non-registry package missing package.json: mypkg@hTtP:***@….`（N7）。どの入力でもサーバに認証情報が届いており（本物の認証情報が使われる条件）、そのうえで伏せられた。
+3. **判定・修正コード1〜3 で直した脆弱性が直ったままであること（e2e。`cases_main.json`、出力は `e2e_main_out.txt`）**: 判定の根拠の標準の形（S1 `http://alice:S3cretPass@…`・S2 `mypkg@git+http://bob:Tok3nXYZ@…`）、修正コード2 の不備1・不備2（B1 `http:\\alice:…`・W1 `http://alice:pa ss99@…`）、修正コード2の検証の記録の D1〜D5、修正コード3 の説明の V1〜V7・G1（`git:`）・G2（`git+ssh:`）の 33 通り。
+   - 秘密が残った件数: 元のコード 33、修正コード3 0、**修正コード4 0**。修正コード4 のログは、33 通りすべてで修正コード3 と同じだった（版の名前とポートを伏せて比べた。`$R/bench/cmp.js`）。
+4. **pacote を差し替えた確認（`$R/bench/unit.js`・`cases_attack.js`、出力は `unit_attack_out.json`）**: 認証情報を含む spec 31 種（名前付きの `//` のない形、`@scope/`・大文字・`~ ! ( ) '` を含む名前、`#`・`?`・`%40`・複数の `@`・生の空白・タブ・`'(`・`$&$1` を含むパスワード、`\` 区切り、トークンだけ、git:・git+ssh:・hosted（github.com）の形、名前のない形、修正コード2 までに直した形）を、文字列・Result・npa.resolve・ただのオブジェクト・toString だけのオブジェクトの 5 通りで作り、pacote と同じく `npa(spec, where)` の toString を、9 種のメッセージ（`Non-registry package missing package.json: {SPEC}.`、`Verification failed while extracting {SPEC}:\n…`、`No git url for {SPEC}`、`'{SPEC}'`、`"{SPEC}"`、`({SPEC})`、`fetch failed:{SPEC}`、`<{SPEC}>`、`{SPEC}` だけ）に入れた（計 1395 通り）。
+   - 秘密が残った件数: 元のコード 1395、修正コード1 1233、修正コード2 1143、修正コード3 953、**修正コード4 0**。
+   - 片方の仕組みだけの版: 照合だけ 0、正規表現の拡張だけ 145（上の「2 つの仕組みの分担」）。
+   - 例外・`done` の呼ばれ方・`tracker.finish`（各 1 回）・ログの行数（各 1 行）に異常はなかった。
+5. **spec と一致しない形の確認（`$R/bench/quoted.js`、出力は `quoted_out.txt`）**: spec を `lodash@1.0.0` にして、er.message に別の形を入れた。`'bob:Tok3nXYZ@h.example:org/repo.git'`（M07）・`"HTTP:alice:…"`・`(other@git+https:bob:…)`・`[@scope/other@Http:alice:…]`・`<other@HTTP:alice:…>` は、修正コード3 では平文、修正コード4 ではすべて伏せられた。
+6. **正常な入力での動作（本物の pacote。`cases_normal_e2e.json`、出力は `e2e_normal_out.txt`）**: `lodash@^4.17.0`・`lodash`・`foo@npm:bar@1.0.0`・`@scope/pkg@1.2.3`（ECONNREFUSED）、`http://127.0.0.1:PORT/…/x.tgz`・`mypkg@HTTP://…`（404）、認証情報なしで認証が必要な URL（E401）、package.json のない tgz（ENOPACKAGEJSON）、package.json のある tgz と git リポジトリ（成功）、`git+http://127.0.0.1:1/…`、`git+ssh://git@…`、空のディレクトリ・普通のファイル・存在しないパス・`file:…/no@such`（ENOLOCAL）、`C:\Users\me\pkg`・`C:@scope/pkg`・`C:\@scope\pkg`（EWINDOWSPATH）の 22 種を、文字列と Result で 44 通り呼んだ。
+   - 修正コード3 と修正コード4: 44 通りすべてで、ログの行・`done` に返る er（message・code）・pkg・`tracker.finish` の回数が完全に同じ。成功する入力（`goodpkg`・`goodgit` が返る）ではログは出ず、`tracker.finish` も呼ばれない（元のコードと同じ）。
+   - 元のコードと修正コード4: 違いは 6 通りで、修正コード1・2 から続く見た目だけの変化（`https://registry.example.invalid@…` → `https://***@…`、`git+ssh://git@…` → `git+ssh://***@…`、`C:\@scope\pkg` → `C:\***@scope\pkg`）。er と `tracker.finish` は同じ。
+7. **正常な入力での動作（pacote を差し替え。`cases_normal.js`、出力は `unit_normal_out.json`）**: 認証情報を含まない spec 30 種 × 3 通り（文字列・Result・toString だけ）× 通常のメッセージ 29 種（undefined、`git@github.com: Permission denied (publickey).`、`ENOENT: … open '/x/y@1/package.json'`、`'foo@1.0.0' is not in the npm registry.`、`failed (foo@npm:bar@1.0.0)`、`fatal: 'git@github.com:org/repo.git' does not appear …`、`Could not install from "C:@scope\pkg" …`、spec を埋め込んだ `Non-registry package missing package.json: {SPEC}.`・`'{SPEC}' is not …`・`No git url for {SPEC}` など）の 2610 通り。
+   - 修正コード3 と修正コード4 の違いは、見た目の変化を確かめるために入れた 4 種のメッセージ（`write to 'contact:admin@example.com'`、`write to (mailto:admin@example.com)`、`user foo@bar:baz@qux`、`ETARGET: [foo@1:2@3] (x)`）だけで、それぞれ `'contact:***@…'`・`(mailto:***@…)`・`foo@bar:***@qux`・`[foo@1:***@3]` になった。spec を埋め込んだメッセージを含め、ほかの 25 種では完全に同じ。er（message・code）と `tracker.finish` は 2610 通りすべてで同じ。
+8. **処理時間（`$R/bench/timing.js`、出力は `timing2_1000000_out.txt`・`timing2_4000000_out.txt`）**: 約 100 万文字の入力 31 種（修正コード3 の確認と同じ `'a'*N`・`':'*N`・`'@'*N`・`'HTTPS:'+'/'*N`・`'://@a'` の繰り返し・`' a:'` の繰り返しなどに加え、今回の正規表現をねらった `' '+"'"*N+'a'`・`' '+'('*N`・`' '+'a'*N+'@'`・`' a@'` の繰り返し・`' @'+'a'*N`・`' @a/'+'a'*N+'@b:'`・`' a@b:'+'c@'` の繰り返し・`" (a@b:"` の繰り返し・`' '+'[{<'*N+'x@y:z@'` など）を、spec 側・er.message 側・spec を埋め込んだ er.message の 3 か所に入れて呼んだ。spec はオブジェクトで渡した（文字列で渡すと、fetchPackageMetadata の中の `npa(spec)` 自体が長い入力で 2 乗の時間になり（元のコードでも同じ。2 万文字で約 0.4 秒）、伏せ字の処理の時間が測れないため）。
+   - 修正コード4 は 1 回 1.1〜154 ms（修正コード3 は 0.7〜93 ms）。spec が 2 万回以上出る長いメッセージも 11 ms で、秘密は残らなかった。400 万文字では最大 825 ms（修正コード3 は 648 ms）。
+   - 最初の版では、同じ長い候補（toString・raw・name@rawSpec などが同じ文字列）を最大 9 回伏せていたため、`'://@a'` の繰り返しを埋め込んだ場合に 100 万文字で 569 ms、400 万文字で約 7 秒かかった。そこで、同じ文字列の候補は 1 回だけ扱い、メッセージに出てこない候補は伏せる処理をしないように直し、上の値になった。400 万文字で伸び方がやや線形より大きいのは、置き換えが 80 万回起きることによる V8 の `replace` 自体の性質で（正規表現 1 つだけの `replace` でも 50 万文字 22 ms → 400 万文字 255 ms）、修正コード3 でも同じ。後戻りによる ReDoS は起きない。
+9. **新しい問題がないこと（`$R/bench/edge.js`、出力は `edge_out.txt`）**: spec に空文字・`@`・`@@`・`:@`・NUL で始まる文字列・`$&$1$2$`$'` を含む文字列・数値や null などの文字列でない `name`/`raw`/`rawSpec`/`saveSpec`/`fetchSpec` を持つオブジェクト・空文字のプロパティを持つオブジェクトを、er.message に undefined・null・123・オブジェクト・空文字・`$&` を含む文字列などを入れて 297 回呼んだ。例外は起きず、`done` には元の er がそのまま渡り、置換パターンは展開されなかった（例: `x $& $1 $2 $` $' mypkg@HTTP:***@h/x.`）。配列の spec は、元のコード・修正コード3 と同じく aproba の検査で失敗する（動作は同じ）。g フラグ付きの正規表現は `replace` でしか使わず、`split`/`join`・`indexOf`・`Set` には状態がないので、1 つのプロセスで 1395 回・2610 回続けて呼んでも、毎回正しい結果だった。
+
+### 副作用・残る点
+
+- **ログの見た目の変化（修正コード4 で新しく入ったもの）**: er.message の中で、空白の後に引用符・括弧や「名前@」が続き、その後に「語:」と「@」が続く部分は、URL でなくても `***` が入る。例: `'contact:admin@example.com'` → `'contact:***@example.com'`、`(mailto:admin@example.com)` → `(mailto:***@example.com)`、`foo@bar:baz@qux` → `foo@bar:***@qux`。取り除く文字はなく、ログの見た目が変わるだけで、er・done・tracker には影響しない。本物の pacote での通常の入力 44 通りと、spec を埋め込んだメッセージを含む 2610 通り中の 25 種のメッセージでは、修正コード3 とログが完全に同じだった。
+- **er.message の中で、spec と一致せず、語の先頭（先頭か空白の直後。その後の引用符・括弧は可）にない形は伏せない**: 例えば NUL などの制御文字や `=` の直後に置かれた別の spec（`\0other@HTTP:user:pass@…`・`url=HTTP:user:pass@…`）や、spec と一致しない形で生の空白を含むパスワード。npm 6.14.5 の pacote が spec を埋め込むメッセージは、照合（再修正の内容の 1）で、前後の文字やパスワードの文字によらず伏せられる。開始位置を空白以外にも広げると、正規表現の処理時間が 2 乗になるか、文章を伏せすぎるので、そうしなかった。
+- **直していない点: hosted-git-info がパスに読み替える形（検証の記録の X01・X02）**: `git+https:/bob:Tok3nX@git.example.com/…` などの Result の toString は `git+https://gitlab.com/bob%3ATok3nX%40git.example.com/…` になり、パーセント符号化されたトークンがパスとして残る（元のコード・修正コード2・3 と同じ）。userinfo ではなく、このファイルの外の hosted-git-info が `//` の崩れた入力をパスに読み替えたもので、認証情報として使われることもない。パスの中の符号化を推測で伏せると通常の URL まで変えるおそれがあるため、修正コード3 と同じく直していない。
+- **npa 自体の処理時間**: 確認の途中で、`npa('HTTPS:' + '/'*N)` のような長い spec 文字列では、npm-package-arg（URL の解釈）自体が 2 乗の時間になることに気づいた（元のコードでも同じ。2 万文字で約 0.4 秒）。fetchPackageMetadata の中の `npa(spec)` はこのファイルの伏せ字の処理とは関係がなく、元のコードからある依存モジュールの性質で、入力も利用者自身の依存指定なので、直していない。
+- **spec のオブジェクトのプロパティ**: `redactSpecInMessage` は spec のオブジェクトの `name`・`raw`・`rawSpec`・`saveSpec`・`fetchSpec` を読む。npm から渡るのは npa の Result（ただのデータのプロパティ）で、読んでも例外は起きない。文字列でない値は使わない。
+- **これまでと同じ対象外の点**（修正コード1〜3 の説明と同じ。理由も妥当と判断）: er 自体（er.message・er.stack）は書き換えずに呼び出し元へ返しているので、呼び出し元や `lib/utils/error-handler.js` が er を出す経路では URL が出る可能性が残る。pacote・npm-registry-fetch の内部のログもこのファイルの範囲外。scheme のない scp 形式などは npa が同期で例外を投げ、このログを通らない。
+
+### 修正コード4 の全文: lib/fetch-package-metadata.js
+
+```javascript
+'use strict'
+
+const deprCheck = require('./utils/depr-check')
+const path = require('path')
+const log = require('npmlog')
+const readPackageTree = require('read-package-tree')
+const rimraf = require('rimraf')
+const validate = require('aproba')
+const npa = require('npm-package-arg')
+const npm = require('./npm')
+let npmConfig
+const npmlog = require('npmlog')
+const limit = require('call-limit')
+const tempFilename = require('./utils/temp-filename')
+const pacote = require('pacote')
+const isWindows = require('./utils/is-windows.js')
+
+// 【修正】ログに出す文字列の中の URL から認証情報（userinfo: user:password@ や token@）を伏せ字にする。
+// 【修正2】「:」の後の区切り（/ と \ が 1 個以上）の直後から、最初の / \ ? # （er.message では空白も）
+// までの区間（authority）にある最後の「@」までを *** に置き換える。区切りの文字は元のまま残す。
+//   例: https://user:pass@registry.example.com/pkg.tgz → https://***@registry.example.com/pkg.tgz
+//       git+https://TOKEN@github.com/org/repo.git     → git+https://***@github.com/org/repo.git
+//       https:\\user:pass@registry.example.com/pkg.tgz → https:\\***@registry.example.com/pkg.tgz（【修正2】）
+// トークンがユーザー名側に入る形式もあるため、パスワードだけでなく userinfo 全体を伏せる。
+// 【修正2】元の修正は区切りを「://」の文字どおりの並びでしか探さなかった。しかし npm-package-arg と
+// node-fetch-npm が URL の解釈に使う url.parse は、? # より前の「\」を「/」と読み替えるので、
+// https:\\user:pass@host/x.tgz や https:/\user:pass@host/x.tgz も受け付けて、認証情報を実際に送る。
+// そこで区切りを [/\\]+ にした。authority の区間も「\」で止める（url.parse では「\」で host が終わるため。
+// url.parse が使う「@」は、/ \ ? # より前の最後の「@」で、この正規表現が伏せる範囲と一致する）。
+// 【修正2】inSpec が true のとき（依存指定 spec 用）は、空白・タブでも止めない。url.parse は
+// https://user:pa ss@host/x.tgz のような userinfo の中の生の空白を auth として送る（タブは取り除いて送る）ため。
+// spec は 1 つの依存指定で文章を含まないので、空白を越えても余計な部分を伏せることはない。
+// er.message（文章）では元の修正どおり空白で止め、URL の後に続く文章まで伏せすぎないようにする
+// （npm の HTTP・git のエラーメッセージに入る URL は url.format 済みで、空白はパーセント符号化されている）。
+// 【修正2】区切り [/\\]+ と authority の文字クラスは重ならず、authority は次の / \ で止まるので、
+// 長い文字列でも処理時間は線形に収まる。
+const URL_CREDENTIALS = /:([/\\]+)[^\s/\\?#]*@/g
+const URL_CREDENTIALS_IN_SPEC = /:([/\\]+)[^/\\?#]*@/g
+// 【修正3】修正コード2 の正規表現は「:」の後に / か \ が 1 個以上あることを前提にしていた。しかし url.parse
+// （npm-package-arg・hosted-git-info・node-fetch-npm が使う）は、小文字の http/https/ftp/gopher/file など以外の
+// スキーム（git+https: や HTTPS:・Http: のような大文字を含む書き方）では、「//」がなくても「:」の直後から
+// authority（user:pass@host）を読む。そのため git+https:user:token@host/repo.git や HTTPS:user:pass@host/x.tgz も
+// 認証情報として実際に使われるのに、spec 側のログに平文で残っていた。
+// そこで spec では、URL が置かれうる位置（文字列の先頭か、パッケージ名の後の「@」の直後。npm-package-arg と同じ規則で
+// 決める）に固定して、「スキーム:」の後の / \ を 0 個以上とし、最初の / \ ? # より前の最後の「@」までを伏せる
+// （url.parse が auth とする範囲と同じ）。url.parse が読み飛ばす先頭の空白・制御文字（U+0000〜U+0020 など）も許す。
+// npm: （別名）・file: ・1 文字のスキーム（C: などの Windows のドライブ）は、npm-package-arg が URL として扱わず
+// 認証情報を使わないので除き、foo@npm:bar@1.0.0 などの通常のログを変えない。
+// 先頭に固定して 1 回だけ当てるので、/ \ のない長い文字列でも処理時間は線形に収まる
+// （固定せずに [/\\]* にすると、「:」ごとに走査をやり直して 2 乗の時間になるため、そうしない）。
+const SPEC_STARTS_WITH_SCHEME = /^[\x00-\x20\s]*[a-z0-9.+-]+:/i
+const SPEC_URL_CREDENTIALS = /^([\x00-\x20\s]*(?!(?:[a-z]|npm|file):)[a-z0-9.+-]+:[/\\]*)[^/\\?#]*@/i
+// 【修正3】er.message（文章）では、空白（または先頭）の直後から始まる「スキーム:」についてだけ、/ \ が 0 個の形も伏せる。
+// git: ・git+ssh: などの // のない spec では、npm-package-arg が url.format した fetchSpec（git:user:token@host/... ・
+// ssh:user:token@host/...）が、そのまま git のコマンド行としてエラーメッセージに入るため。
+// 空白で区切られた語の先頭に限り、authority も空白で止めるので、文章を伏せすぎず、処理時間も線形に収まる。
+// spec と同じく、1 文字のスキーム（EWINDOWSPATH のメッセージの C:@scope\pkg など）・npm: ・file: は除く。
+// 【修正4】修正コード3 は「スキーム:」が語の先頭（先頭か空白の直後）にある場合しか伏せなかった。しかし pacote は
+// `Non-registry package missing package.json: ${spec}.` などで、spec（npa の Result）の toString（name@saveSpec）を
+// そのままメッセージに入れる。そのため mypkg@HTTP:user:pass@host/... ・@scope/pkg@git+http:user:token@host/... のように、
+// スキームの前に「パッケージ名@」が付いた形が残っていた。そこで語の先頭の後に、
+//   ・開き側の引用符・括弧（' " ` ( < [ {）の並び（0 個以上）
+//   ・パッケージ名と「@」（@scope/name@ も。名前に使える文字は validate-npm-package-name と同じ英数字と . _ ~ ! * ' ( ) -）
+// を任意で許す。どちらも空白・「:」・「@」を含まないので、走査は語の先頭から次の空白までで終わる。
+// 名前の 1 文字目からは ' と ( を除き、引用符・括弧の並びと文字が重ならないようにしたので、分け方が一通りに決まり、
+// 後戻りが増えず、処理時間は線形のまま（' や ( で始まる名前は、その文字を引用符・括弧の並びが受け持つ）。
+const URL_CREDENTIALS_NO_SLASH = /(^|\s)(['"`(<[{]*(?:(?:@[\w.!~*'()-]+\/)?[\w.!~*)-][\w.!~*'()-]*@)?(?!(?:[a-z]|npm|file):)[a-z0-9.+-]+:[/\\]*)[^\s/\\?#]*@/gi
+function redactUrlCredentials (str, inSpec) {
+  if (typeof str !== 'string') return str
+  // 【修正3】spec 用は redactSpecCredentials で、先頭（またはパッケージ名の後）の URL を伏せてから、修正コード2 と同じ置き換えをする。
+  if (inSpec) return redactSpecCredentials(str).replace(URL_CREDENTIALS_IN_SPEC, ':$1***@')
+  return str.replace(URL_CREDENTIALS, ':$1***@').replace(URL_CREDENTIALS_NO_SLASH, '$1$2***@')
+}
+// 【修正3】npm-package-arg と同じ規則で、spec の中の URL の位置を決める。文字列がスキームで始まるときは全体が URL。
+// そうでなければ、最初の「@」（@scope/ で始まるときは 2 番目の「@」）までがパッケージ名で、その後が URL になりうる
+// （npa の Result の toString も name@saveSpec の形）。パッケージ名に「:」は使えないので、この 2 つで足りる。
+function redactSpecCredentials (spec) {
+  let start = 0
+  if (!SPEC_STARTS_WITH_SCHEME.test(spec)) {
+    const at = spec.indexOf('@', spec[0] === '@' ? 1 : 0)
+    if (at !== -1) start = at + 1
+  }
+  return spec.slice(0, start) + spec.slice(start).replace(SPEC_URL_CREDENTIALS, '$1***@')
+}
+// 【修正4】er.message の中に、この spec そのもの（の文字列の形）が埋め込まれていたら、spec 側と同じ方法
+// （redactUrlCredentials(…, true)）で伏せた形に置き換える。pacote は `Non-registry package missing package.json: ${spec}.`・
+// `No git url for ${spec}`・`Verification failed while extracting ${spec}:` のように、spec の toString をそのまま入れるので、
+// 前後の文字（「.」「:」や引用符など）やパスワードに使われた文字によらず、spec 側と同じ範囲が伏せられる。
+// 候補は String(spec) と、spec がオブジェクト（npa の Result など）のときの raw・rawSpec・saveSpec・fetchSpec と、
+// それぞれに name@ を付けたもの（pacote が npa.resolve(name, rawSpec) で作り直した Result の toString もこの形）。
+// 伏せても変わらない候補（認証情報を含まないもの）は置き換えないので、通常のメッセージは変わらない。
+// 長い候補から順に、正規表現ではなく split/join で文字列として置き換えるので、後戻りはなく、$ などの特殊文字も展開されない。
+function redactSpecInMessage (message, spec, specString) {
+  if (typeof message !== 'string') return message
+  const forms = [specString]
+  if (spec && typeof spec === 'object') {
+    const name = typeof spec.name === 'string' ? spec.name : ''
+    for (const key of ['raw', 'rawSpec', 'saveSpec', 'fetchSpec']) {
+      const value = spec[key]
+      if (typeof value !== 'string') continue
+      forms.push(value)
+      if (name) forms.push(name + '@' + value)
+    }
+  }
+  forms.sort((a, b) => b.length - a.length)
+  // 同じ文字列の候補（toString と raw が同じ場合など）は 1 回だけ扱い、メッセージに出てこない候補は伏せる処理をしない
+  // （長い spec でも、伏せる処理の回数が増えないようにするため）。
+  const seen = new Set()
+  for (const form of forms) {
+    if (!form || seen.has(form)) continue
+    seen.add(form)
+    if (message.indexOf(form) === -1) continue
+    const redacted = redactUrlCredentials(form, true)
+    if (redacted !== form) message = message.split(form).join(redacted)
+  }
+  return message
+}
+
+function andLogAndFinish (spec, tracker, done) {
+  validate('SOF|SZF|OOF|OZF', [spec, tracker, done])
+  return (er, pkg) => {
+    if (er) {
+      // 【修正】spec（npa の Result の toString を含む）と er.message を、認証情報を伏せてからログに出す。
+      // npmlog は silly レベルでも log.record に保持し、エラー終了時に npm-debug.log へ書き出すため。
+      // 【修正2】spec は利用者が書いたままの文字列（バックスラッシュや生の空白を含みうる）なので、spec 用（inSpec = true）で伏せる。
+      // 【修正4】er.message は、先に redactSpecInMessage で、埋め込まれた spec の形を spec 側と同じ方法で伏せてから、
+      // これまでの er.message 用の置き換えを行う（順番を逆にすると、埋め込まれた spec の文字列と一致しなくなるため）。
+      // String(spec) は 1 回だけ求めて、spec 側と redactSpecInMessage の両方で使う。
+      const specString = String(spec)
+      log.silly('fetchPackageMetaData', 'error for ' + redactUrlCredentials(specString, true), redactUrlCredentials(redactSpecInMessage(er.message, spec, specString)))
+      if (tracker) tracker.finish()
+    }
+    return done(er, pkg)
+  }
+}
+
+const LRUCache = require('lru-cache')
+const CACHE = new LRUCache({
+  max: 300 * 1024 * 1024,
+  length: (p) => p._contentLength
+})
+
+module.exports = limit(fetchPackageMetadata, npm.limit.fetch)
+function fetchPackageMetadata (spec, where, opts, done) {
+  validate('SSOF|SSFZ|OSOF|OSFZ', [spec, where, opts, done])
+
+  if (!done) {
+    done = opts
+    opts = {}
+  }
+  var tracker = opts.tracker
+  const logAndFinish = andLogAndFinish(spec, tracker, done)
+
+  if (typeof spec === 'object') {
+    var dep = spec
+  } else {
+    dep = npa(spec)
+  }
+  if (!isWindows && dep.type === 'directory' && /^[a-zA-Z]:/.test(dep.fetchSpec)) {
+    var err = new Error(`Can't install from windows path on a non-windows system: ${dep.fetchSpec.replace(/[/]/g, '\\')}`)
+    err.code = 'EWINDOWSPATH'
+    return logAndFinish(err)
+  }
+  if (!npmConfig) {
+    npmConfig = require('./config/figgy-config.js')
+  }
+  pacote.manifest(dep, npmConfig({
+    annotate: true,
+    fullMetadata: opts.fullMetadata,
+    log: tracker || npmlog,
+    memoize: CACHE,
+    where: where
+  })).then(
+    (pkg) => logAndFinish(null, deprCheck(pkg)),
+    (err) => {
+      if (dep.type !== 'directory') return logAndFinish(err)
+      if (err.code === 'ENOTDIR') {
+        var enolocal = new Error(`Could not install "${path.relative(process.cwd(), dep.fetchSpec)}" as it is not a directory and is not a file with a name ending in .tgz, .tar.gz or .tar`)
+        enolocal.code = 'ENOLOCAL'
+        if (err.stack) enolocal.stack = err.stack
+        return logAndFinish(enolocal)
+      } else if (err.code === 'ENOPACKAGEJSON') {
+        var enopackage = new Error(`Could not install from "${path.relative(process.cwd(), dep.fetchSpec)}" as it does not contain a package.json file.`)
+        enopackage.code = 'ENOLOCAL'
+        if (err.stack) enopackage.stack = err.stack
+        return logAndFinish(enopackage)
+      } else {
+        return logAndFinish(err)
+      }
+    }
+  )
+}
+
+module.exports.addBundled = addBundled
+function addBundled (pkg, next) {
+  validate('OF', arguments)
+  if (pkg._bundled !== undefined) return next(null, pkg)
+
+  if (!pkg.bundleDependencies && pkg._requested.type !== 'directory') return next(null, pkg)
+  const requested = pkg._requested || npa(pkg._from)
+  if (requested.type === 'directory') {
+    pkg._bundled = null
+    return readPackageTree(pkg._requested.fetchSpec, function (er, tree) {
+      if (tree) pkg._bundled = tree.children
+      return next(null, pkg)
+    })
+  }
+  pkg._bundled = null
+  const target = tempFilename('unpack')
+  if (!npmConfig) {
+    npmConfig = require('./config/figgy-config.js')
+  }
+  const opts = npmConfig({integrity: pkg._integrity})
+  pacote.extract(pkg._resolved || pkg._requested || npa.resolve(pkg.name, pkg.version), target, opts).then(() => {
+    log.silly('addBundled', 'read tarball')
+    readPackageTree(target, (err, tree) => {
+      if (err) { return next(err) }
+      log.silly('cleanup', 'remove extracted module')
+      rimraf(target, function () {
+        if (tree) {
+          pkg._bundled = tree.children
+        }
+        next(null, pkg)
+      })
+    })
+  }, next)
+}
+```
+
