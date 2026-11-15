@@ -1,0 +1,26 @@
+### No.22 CVE-2016-10735 bootstrap（twbs/bootstrap v4.0.0-beta、js/src/util.js の Util.getSelectorFromElement）
+- 対象: https://github.com/ossf-cve-benchmark/ossf-cve-benchmark/blob/main/CVEs/CVE-2016-10735.json（ossf-cve-benchmark のテストケース（prePatch のコミットのコード））
+- 判定: **脆弱性あり**（クロスサイトスクリプティング XSS・CWE-79 / CWE-116）
+- XSS に該当: 種別・source・sink は "第2回xssの詳細"、修正コードは "第2回修正版コード" を参照
+- 根拠（エージェントの判定記録から）:
+  - 根拠:
+  - js/src/util.js 113-125行の Util.getSelectorFromElement(element) は、要素の data-target 属性（114行）を取り出し、それが無いか "#" のときは href 属性（116行）を取り出す。そして 120行で `const $selector = $(selector)` として jQuery の $() に渡し、要素があるかを確かめている。
+  - 対象の jQuery は 3.x（package.json の "jquery": "3.0.0 - 4.0.0"）。jQuery の $() は、文字列が "<" で始まり ">" で終わるとき、または空白の後に "<...>" が来る形のとき、CSS セレクタではなく HTML として解析し、DOM 要素を作る（parseHTML、keepScripts=true）。
+  - そのため data-target / href に「onerror 属性付きの img タグ」のような文字列があると、120行で img 要素が作られる。画像の読み込みに失敗すると onerror のスクリプトが実行される（要素が文書に挿入されなくても実行される）。さらに $selector.length > 0 になるので、121行でその文字列がそのまま返される。呼び出し側（collapse.js 84/230/322/371行、modal.js 542行、carousel.js 464行、alert.js 93行、dropdown.js 353行、scrollspy.js 131行、tab.js 116行）でも再び $(selector) に渡され、もう一度実行される。
+  - 属性値は getAttribute() で取り出す時点で HTML 実体参照（&lt; など）が元の文字に戻る。サーバー側が属性値を正しく HTML エスケープして出力していても、ブラウザ側で "<" に戻るので、サーバー側のエスケープでは防げない。Bootstrap のクライアント側の JS が、DOM 上のテキストを HTML として解釈し直している（CWE-116 不適切なエンコード／エスケープ、CWE-79）。
+  - 発火する条件: data-toggle="collapse" / "modal" などのトリガー要素をクリックしたとき。collapse は Collapse の生成時（collapse.js 80-86行）に、ページ内のすべての [data-toggle="collapse"] 要素の属性を調べる。scrollspy は window の load 時（scrollspy.js 309行 → refresh の 123-131行）にナビのリンクの href を調べる。そのため、クリックがなくても実行されることがある。
+  - 修正案: 120行の存在確認を、文字列を CSS セレクタとしてだけ解釈する document.querySelector() に置き換える。HTML の形の文字列は SyntaxError になり、catch で null を返す。
+  - 同じ種類の問題（data 属性の値を $() に渡す）は collapse.js 291行（data-parent → this._config.parent）、scrollspy.js 80-82行（data-target → this._selector）、tooltip.js 285行（data-container）にもある。今回の判定の主な箇所は util.js 120行とする。
+- 使用トークン量（判定）: 新規 30,260（入力 18 ／ キャッシュ作成 17,297 ／ 出力〔推定〕 12,945）、キャッシュ読込 223,243、総処理 253,503、リクエスト 9 回（出力の記録値 11,906）
+
+# No.22 CVE-2016-10735 bootstrap（twbs/bootstrap v4.0.0-beta、js/src/util.js の Util.getSelectorFromElement）
+- 対象: https://github.com/ossf-cve-benchmark/ossf-cve-benchmark/blob/main/CVEs/CVE-2016-10735.json
+
+- **XSS 種別**: DOM-base。攻撃文字列はサーバーが出力する HTML の属性値として届くが、サーバー側の出力（エスケープ済み）には問題がない。ブラウザ上の Bootstrap の JS が DOM の属性のテキストを読み取り、jQuery の $() で HTML として解釈して実行するため、脆弱性はクライアント側の DOM 処理にある。
+- **source**: js/src/util.js 114行 element.getAttribute('data-target')、116行 element.getAttribute('href')（ページの作成者以外が値を決められる属性。例: 利用者の投稿内容から作られたボタンやリンクの data-target / href）
+- **伝播経路**: data-target / href 属性 → getAttribute()（実体参照が元に戻り "<" になる）→ 変数 selector（114/116行）→ 120行 $(selector)。さらに 121行で同じ文字列が戻り値になり → 呼び出し側の $(selector)（collapse.js 371行、modal.js 542行、carousel.js 464行 など）
+- **sink**: js/src/util.js 120行 `const $selector = $(selector)`（jQuery の $() による HTML の解析と要素の生成）。二次的な sink として、呼び出し側の $(selector)。
+- **脆弱性の位置**: sink 側（util.js 120行）。source の属性値は本来 CSS セレクタとして扱うべきデータなのに、それを検証せずに、HTML としても解釈する $() に渡している点が問題。
+- **攻撃例**: 利用者が内容を決められるページ（例: 掲示板の投稿に data-toggle="collapse" 付きのボタンを書ける、またはアプリが利用者の入力を data-target に入れる）で、攻撃者が data-target の値として onerror 属性付きの img タグの文字列を入れる。サーバーは属性値をエスケープして出力するが、閲覧者がボタンをクリックしたとき（collapse の場合はページの初期化時）に Bootstrap がその値を $() に渡す。img 要素が作られ、onerror のスクリプトが閲覧者のブラウザで実行され、Cookie の窃取などが行われる。
+
+---
