@@ -1,0 +1,27 @@
+### No.21 CVE-2017-0931 html-janitor (guardian/html-janitor, src/html-janitor.js)
+- 対象: https://github.com/ossf-cve-benchmark/ossf-cve-benchmark/blob/main/CVEs/CVE-2017-0931.json（ossf-cve-benchmark のテストケース（prePatch のコミットのコード））
+- 判定: **脆弱性あり**（クロスサイトスクリプティング／DOM-based XSS・サニタイザの回避、CWE-79 / CWE-116）
+- XSS に該当: 種別・source・sink は "第2回xssの詳細"、修正コードは "第2回修正版コード" を参照
+- 根拠（エージェントの判定記録から）:
+  - 根拠:
+  - 対象は prePatch 8c99e653 の src/html-janitor.js（version 2.0.4）。ブラウザ上でホワイトリストにより HTML を無害化するライブラリで、利用者は janitor.clean(html) に信頼できない HTML（貼り付け内容、利用者の投稿など）を渡し、戻り値を画面に挿入する前提で使う。
+  - 43 行目 `var sandbox = document.createElement('div');` で、作業用の要素を「表示中の生きた document」の要素として作っている。44 行目 `sandbox.innerHTML = html;` で未検査の HTML をそのまま解析させている。
+  - 生きた document が持ち主の要素は、ツリーに挿入されていなくても、innerHTML で作られた時点で <img src> などのリソース取得が始まる。取得の失敗・成功で発生する error/load イベントは非同期に届き、その時点で要素に残っているイベントハンドラ属性（onerror など）が実行される。
+  - 46 行目以降の _sanitize は同期処理で、ホワイトリストにないタグは 103〜115 行目で親から外す（parentNode.removeChild(node)）だけで、その要素の属性（onerror 等）は消さない。外された要素の画像取得はそのまま続くため、後で error イベントが発生した時に onerror が実行される。つまり、サニタイズの結果（戻り値）は安全でも、clean() を呼んだだけで攻撃者のスクリプトが利用者のページのオリジンで実行される。
+  - 例: config に img がない（または false）設定で、clean('<img src=存在しないURL onerror=任意のJS>') を呼ぶと、戻り値は空文字列だが、直後に onerror の JS がページの権限で実行される。<video>/<audio> の <source onerror>、<object>/<embed> などの読み込みを伴う要素でも同様。
+  - 副次的な注意（修正対象外、設定に依存）: (1) a: {href: true} のように属性を true で許可すると href="javascript:..." も通る（URL スキームの検査がない）。(2) small: true のようにタグを true にすると on* 属性を含むすべての属性が残る。(3) <template> を許可すると、TreeWalker は template.content を辿らないため中身が無検査で残る。これらは設定次第の問題で、本 CVE の中心は 43〜44 行目。
+- 使用トークン量（判定）: 新規 17,201（入力 10 ／ キャッシュ作成 11,214 ／ 出力〔推定〕 5,977）、キャッシュ読込 102,259、総処理 119,460、リクエスト 5 回（出力の記録値 6,035）
+
+---
+## No.21 CVE-2017-0931 html-janitor (guardian/html-janitor, src/html-janitor.js)
+- 対象: https://github.com/ossf-cve-benchmark/ossf-cve-benchmark/blob/main/CVEs/CVE-2017-0931.json
+
+- **XSS 種別**: DOM-base（サーバを経由せず、ブラウザ上の JavaScript が受け取った文字列を innerHTML という DOM の sink に渡し、クライアント側だけでスクリプトが実行されるため）
+- **source**: src/html-janitor.js 42 行目 `HTMLJanitor.prototype.clean = function (html)` の引数 html（呼び出し側が渡す、利用者・第三者由来の未信頼 HTML。貼り付けデータ、投稿本文、URL 由来の値など）
+- **伝播経路**: clean(html) の引数 html（42 行目）→ 生きた document で作った sandbox（43 行目）の innerHTML に代入（44 行目）→ ブラウザが HTML を解析し、<img> 等の要素を生成してリソース取得を開始 → _sanitize（46 行目、51〜132 行目）はホワイトリスト外の要素を removeChild で外すだけ（111 行目）で、onerror などの属性は残る → 非同期に error イベントが発生し、onerror の JS が実行される
+- **sink**: src/html-janitor.js 44 行目 `sandbox.innerHTML = html;`（43 行目 `document.createElement('div')` で、スクリプトが有効な生きた document の要素として作られた sandbox への innerHTML 代入）
+- **脆弱性の位置**: sink 側。source（html）は「信頼できない HTML」を受け取るのが本ライブラリの役目なので問題ではない。問題は、無害化する前の HTML を、スクリプトやリソース読み込みが有効な文書の要素の innerHTML に入れている 43〜44 行目にある（加えて、外した要素の属性を消さない 103〜111 行目が実行を許している）。
+- **攻撃例**: 攻撃者が、html-janitor でサニタイズしてから表示する Web アプリ（コメント欄やリッチテキストエディタへの貼り付けなど）に、存在しない画像を読み込む img タグと、その onerror 属性に Cookie 送信などの JS を書いた HTML を投稿・貼り付けさせる。被害者のブラウザで clean() が実行されると、img はホワイトリスト外として結果から消えるが、作業用 div に作られた img の画像取得が失敗した時点で onerror が実行され、被害者のセッションで任意の JS が動く。
+  - 修正案: 作業用の要素を document.implementation.createHTMLDocument('') で作った「閲覧コンテキストを持たない不活性な文書」の中に作る（スクリプト・イベントハンドラ・画像取得が動かない）。
+
+---
