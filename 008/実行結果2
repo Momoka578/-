@@ -1,0 +1,14 @@
+### No.8 OWASP-Benchmark/BenchmarkPython testcode/BenchmarkTest00794.py
+- 対象: https://github.com/OWASP-Benchmark/BenchmarkPython/blob/main/testcode/BenchmarkTest00794.py（GitHub のコード（第1回で取得したときのコミットに固定））
+- 判定: **脆弱性なし**（弱い乱数 CWE-330 の疑いを検討したが該当せず。XSS CWE-79 も該当せず）
+- なしと判断した理由（エージェントの判定記録から）:
+  - 根拠（なしと判断した理由）:
+  - 用途: ルート /benchmark/weakrand-02/BenchmarkTest00794（GET/POST, 23〜28行）。「remember me」用のクッキー値を乱数で作り、サーバ側の mysession に保存して応答に表示する処理。
+  - 乱数（CWE-330 の観点）: 51行 value = str(random.SystemRandom().random())[2:]。random.SystemRandom は OS の暗号論的乱数源（os.urandom）を使うため予測できない。メルセンヌツイスタの random.random() のような弱い乱数ではない。値は random() の小数部の数字列で、約 53 ビットのエントロピーがあり、推測は現実的でない。→ 弱い乱数の脆弱性はない。
+  - ユーザー入力の扱い（XSS・インジェクションの観点）: source は 31行 request.args.getlist("BenchmarkTest00794")。34行で param に入り、38〜43行でリスト ['safe', param, 'moresafe'] を作り pop(0) で先頭を除くため [param, 'moresafe'] となり、bar = lst[1] は常に定数 'moresafe'。さらに bar も param も以降で一度も使われない。→ ユーザー入力が応答・SQL・コマンド・ファイルパスなどに到達しない。
+  - 応答の中身: 55行・60〜61行で出力する user（'SafeRandall00794'）、cookie（'rememberMe00794'）は 48〜50行の定数から作られる。mysession[cookie] は 58行で直前に SystemRandom 由来の数字列（value）を代入した直後に出力するので、出力される値は常にサーバが作った数字列（まれに 'e-05' のような指数表記が混じる程度）である。helpers/utils.py の mysession はモジュール全体で共有されるグローバル dict（6行）で、仮に他のテストケースが 'rememberMe00794' キーに任意の値を書き込めたとしても、53行の条件が真なら 55行の定数のみ出力、偽なら 58行で上書きしてから出力するため、外部の値が応答に出ることはない。→ XSS（CWE-79）は成立しない。
+  - その他: 53行の比較は == による通常の文字列比較（タイミング差の理論的な問題はあるが、実害のある脆弱性とはいえない）。mysession が全利用者で共有される点や、応答で Set-Cookie を発行しない点はベンチマーク用の簡易実装上の設計であり、このテストケース固有の脆弱性ではない。
+  - 結論: 安全な乱数（SystemRandom）を使い、ユーザー入力はどこにも流れないため、脆弱性なしと判定する。
+- 使用トークン量（判定）: 新規 6,912（入力 6 ／ キャッシュ作成 4,299 ／ 出力〔推定〕 2,607）、キャッシュ読込 58,956、総処理 65,868、リクエスト 3 回（出力の記録値 2,893）
+
+---
