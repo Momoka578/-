@@ -1,0 +1,101 @@
+## No.15 google/firing-range DOMPropagation.java（+ data/dompropagation.tmpl, data/toxicdom.tmpl）
+- 対象: https://github.com/google/firing-range/blob/master/src/tests/dom/DOMPropagation.java
+- XSS 種別: DOM-base（source・sink は "第2回xssの詳細"）
+- 修正したファイル: dompropagation.tmpl
+
+### 修正コードの説明
+
+#### No.15 google/firing-range DOMPropagation（dompropagation.tmpl）の修正の説明
+
+#### 1. 修正の方針
+
+- 対象の脆弱性（DOM-based XSS）
+  - source: `dompropagation.tmpl` 4 行目 `location.hash.substr(1)`（URL の `#` 以降）
+  - 伝播経路: 4 行目 `payload` → 5 行目 `window.status = payload` → 6 行目 `retrieved_payload = window.status`
+  - sink: `dompropagation.tmpl` 7 行目 `eval(retrieved_payload)`
+  - この JavaScript は `DOMPropagation.java` 33〜37 行目で `toxicdom.tmpl` の `<script>` 内（5 行目の `%%PAYLOAD%%`）に埋め込まれ、そのままブラウザに配信される。
+- どこで防ぐか: sink 側（`dompropagation.tmpl` 7 行目）で防ぐ。
+- どのように防ぐか: `eval` を削除し、読み戻した値は「文字列データ」として `textContent` で表示するだけにする。
+- この方法を選んだ理由:
+  - フラグメントはサーバーへ送られないので、サーバー側（Java）でエスケープや入力検証をしても効かない。防御はクライアント側の JavaScript で行う必要がある。
+  - 問題の本質は「信頼できない文字列をコードとして実行していること」にある。`eval` に渡す文字列をエスケープしたりフィルタしたりしても、JavaScript の文法は表現の幅が広く、抜け道が残りやすい。そこで、コードとして実行する経路そのものをなくすのが最も確実である。
+  - `window.status` に書き込んで読み戻す処理（DOM 属性を経由した値の伝播）は残した。このページが示そうとしている「DOM 属性を経由しても値は無害化されない」という流れは保ったまま、終点だけを安全な処理に変えるという最小限の修正にするためである。
+  - `DOMPropagation.java` と `toxicdom.tmpl` は変更していない。Java 側はリクエストの値を使っておらず、固定のテンプレートを返しているだけなので、テンプレートを直せば配信内容も安全になる。
+
+#### 2. 変更箇所ごとの説明
+
+##### 変更箇所: `dompropagation.tmpl` 7 行目（修正後は 7〜13 行目）
+
+修正前のコード:
+
+```javascript
+var payload = location.hash.substr(1);
+window.status = payload;
+var retrieved_payload = window.status;
+eval(retrieved_payload);
+```
+
+修正後のコード:
+
+```javascript
+var payload = location.hash.substr(1);
+window.status = payload;
+var retrieved_payload = window.status;
+// 【修正】eval(retrieved_payload) を削除した。（コメント）
+// 【修正】読み戻した値は「データ（文字列）」としてだけ扱い、textContent で画面に表示する。（コメント）
+var output = document.createElement('div');
+output.textContent = retrieved_payload;
+document.body.appendChild(output);
+```
+
+各行の説明:
+
+- 4〜6 行目（変更なし）: URL のフラグメントを読み、`window.status` に書いてから読み戻す。値の伝播の部分は元のまま。
+- 7〜10 行目（追加）: 修正の内容と理由を説明する日本語コメント。
+- 削除した行 `eval(retrieved_payload);`: フラグメントの文字列を JavaScript のコードとして実行していた。これが XSS の sink だったので削除した。
+- 11 行目 `var output = document.createElement('div');`: 値を表示するための `div` 要素を作る。HTML の文字列を組み立てずに、DOM API で要素を作る。
+- 12 行目 `output.textContent = retrieved_payload;`: 値を `textContent` で設定する。`textContent` はテキストノードとして扱われ、HTML としても JavaScript としても解釈されない。そのため、値に `<script>` やイベントハンドラ属性、JavaScript の文が含まれていても、ただの文字として表示されるだけになる。
+- 13 行目 `document.body.appendChild(output);`: 作った要素をページに追加する。このスクリプトは `toxicdom.tmpl` の `<body>` 内にあるので、実行時点で `document.body` は存在する。
+
+XSS が防げる理由:
+
+- 攻撃者が制御できる値（フラグメント）が、コードとして実行される場所（`eval`）にも、HTML として解釈される場所（`innerHTML` や `document.write` など）にも届かなくなる。
+- 値の行き先は `textContent` だけで、ここではブラウザが値を解析しないので、どのような文字列でもスクリプトは実行されない。
+
+#### 3. 修正の結果
+
+- 攻撃例の入力: `#` の後ろに、Cookie を外部へ送る JavaScript 文を付けた URL を被害者が開いた場合
+  - 修正前: 文字列が `window.status` を経由して `eval` に渡り、ページのオリジンで実行される。Cookie などが攻撃者に送られる。
+  - 修正後: 同じ文字列が、画面上に文字としてそのまま表示されるだけになる。スクリプトは実行されず、外部への送信も起きない。
+- 正常な入力での動作への影響:
+  - 変わらない点: ページの HTML 構造、サーバーの応答の内容（ヘッダを含む）、`window.status` への書き込みと読み戻しの処理。フラグメントがない場合は空の `div` が追加されるだけで、見た目はほぼ変わらない。
+  - 変わる点: フラグメントの内容が JavaScript として実行されなくなる。代わりにその文字列がページに表示される。このページは「DOM 属性を経由した値の伝播で XSS が起きること」を示すテスト用ページなので、修正後はスキャナのテストケースとしては「XSS が起きない」ページになる。
+
+#### 4. 注意点
+
+- 修正していないもの:
+  - `DOMPropagation.java` 37 行目の `Responses.sendXssed` は、`X-XSS-Protection: 0` を付けてブラウザの XSS フィルタを無効にしている。テンプレートの修正で XSS は起きなくなるので変更していない。多層防御を強めたい場合は、`Responses.sendNormalPage` に替えることや、`eval` を禁止する Content-Security-Policy（`script-src` に `'unsafe-eval'` を含めない）を付けることも考えられる。ただし、`toxicdom.tmpl` はインラインスクリプトを使っているので、CSP を付けるときは nonce やハッシュの設定も必要になる。
+  - 同じ `toxicdom.tmpl` を使う他のテスト（`ToxicDom.java` など）は、今回の対象外として確認・修正していない。
+- 残る制約:
+  - フラグメントの文字列は画面に表示される。そのため、攻撃者がリンクを使って、ページ上に任意の「文字列」を表示させることはできる（コンテンツの偽装）。ただし、スクリプトの実行や HTML の挿入はできない。
+  - `window.status` の値は同じウィンドウの他のスクリプトからも読める。今後このページに別のスクリプトを追加して、その値を `eval` や `innerHTML` などに渡すと、同じ脆弱性が再び生じる。読み戻した値は常に信頼できないデータとして扱う必要がある。
+
+### 修正したコード: dompropagation.tmpl
+
+```html
+// Writing to DOM attribute document.title and
+// reading back propagates the XSS payload.
+
+var payload = location.hash.substr(1);
+window.status = payload;
+var retrieved_payload = window.status;
+// 【修正】eval(retrieved_payload) を削除した。URL のフラグメント（攻撃者が自由に指定できる値）を
+// JavaScript のコードとして実行しないようにするため。
+// 【修正】読み戻した値は「データ（文字列）」としてだけ扱い、textContent で画面に表示する。
+// textContent は HTML や JavaScript として解釈されないので、値に < や " や JS の文が含まれても実行されない。
+var output = document.createElement('div');
+output.textContent = retrieved_payload;
+document.body.appendChild(output);
+```
+
+---
