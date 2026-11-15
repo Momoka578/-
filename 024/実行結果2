@@ -1,0 +1,39 @@
+### No.24 CVE-2017-1000427 marked 0.3.6（markedjs/marked, lib/marked.js の Renderer.prototype.link）
+- 対象: https://github.com/ossf-cve-benchmark/ossf-cve-benchmark/blob/main/CVEs/CVE-2017-1000427.json（ossf-cve-benchmark のテストケース（prePatch のコミットのコード））
+- 判定: **脆弱性あり**（XSS: CWE-79。原因は URL スキームのブラックリスト検査の不備 CWE-20 / CWE-184）
+- XSS に該当: 種別・source・sink は "第2回xssの詳細"、修正コードは "第2回修正版コード" を参照
+- 根拠（エージェントの判定記録から）:
+  - 根拠:
+  - 対象: markedjs/marked prePatch 38f1727f の lib/marked.js（package.json の version 0.3.6）。Markdown を HTML に変換するライブラリ。
+  - sanitize: true は「信頼できない Markdown を安全に HTML 化する」ためのオプション。HTML タグはエスケープされ（610-615 行、356-366 行）、リンクの href は Renderer.prototype.link（869-888 行）でスキームを検査する。
+  - しかし 872-880 行の検査は、href を unescape → decodeURIComponent → 英数字と「:」以外を削除 → 小文字化 したうえで、先頭が 'javascript:' か 'vbscript:' のときだけ空文字を返す（878 行）。危険なスキームを列挙するブラックリスト方式で、'data:' スキームが含まれていない。
+  - そのため [a](data:text/html;base64,...) のような Markdown は、sanitize: true でも 882 行で <a href="data:text/html;base64,..."> としてそのまま出力される。大文字の DATA: や、文字参照 da&#116;a: でも通る（node で prePatch のコードを実行して確認済み。javascript: は空になり、data: は a 要素として出力された）。
+  - 参照形式のリンク（[a]: data:... の定義、371-374 行）も同じ link() を通るので同様に通る。
+  - 被害者がそのリンクをクリックすると、data: URL の HTML 文書が開き、中の script が実行される（当時のブラウザでは data: URL への遷移を許可。特に Firefox 57 より前は data: 文書が遷移元のオリジンを引き継いだため、表示しているサイトのオリジンでスクリプトが動く）。sanitize: true を信用して利用者の Markdown を表示するアプリ（コメント欄・README 表示など）で XSS になる。
+  - 補足: 画像 Renderer.prototype.image（890-897 行）は sanitize 時もスキームを全く検査しない（img の src では現在のブラウザでスクリプトは動かないため、主な問題はリンク側）。
+- 使用トークン量（判定）: 新規 25,318（入力 18 ／ キャッシュ作成 17,221 ／ 出力〔推定〕 8,079）、キャッシュ読込 234,221、総処理 259,539、リクエスト 9 回（出力の記録値 7,131）
+
+---
+
+### No.25 CVE-2017-1001004 typed-function（typed-function.js）
+- 対象: https://github.com/ossf-cve-benchmark/ossf-cve-benchmark/blob/main/CVEs/CVE-2017-1001004.json（ossf-cve-benchmark のテストケース（prePatch のコミットのコード））
+- 判定: **脆弱性あり**（JavaScript コードインジェクション CWE-94。ブラウザで使うと XSS CWE-79 に相当。原因は生成コードへ埋め込む文字列のエスケープ・検証の欠如 CWE-116）
+- XSS に該当: 種別・source・sink は "第2回xssの詳細"、修正コードは "第2回修正版コード" を参照
+- 根拠（エージェントの判定記録から）:
+  - 根拠（prePatch 9a8cac3 の typed-function.js を静的に読んで判定。PoC の実行は権限で拒否されたため未実行）:
+  - _typed(name, signatures)（1079行）は、型付き関数の本体を JavaScript のソース文字列として組み立て、1115行 `new Function(refs.name, 'createError', body)` で評価し、1116行 `factory(refs, createError)` で即座に実行する。
+  - 関数名 name はエスケープも検証もせずにソースへ連結される。
+    - 1100行 `var _name = name || '';`
+    - 1102行 `code.push('function ' + _name + '(' + _args.join(', ') + ') {');` … 関数名の位置にそのまま入る
+    - 1104行 `code.push('  var name = \'' + _name + '\';');` … シングルクォート文字列の中にそのまま入る
+    - 1111行 `'return ' + code.join('\n')` で body になり、1115行で評価される。
+  - name の入口: 公開 API `typed(name: string, signatures: Object)`（1242行 'string, Object': _typed）で、呼び出し側が渡した任意の文字列がそのまま _typed に届く。typed(signatures) / typed(...fns) の経路でも getName()（64〜87行）が既存の型付き関数の fn.name を引き継いで 1240・1277行で _typed に渡す。
+  - 入力例: name を「f(){}, <任意の式>, function g」の形にすると、1102行は `return function f(){}, <任意の式>, function g(arg0) {` となり、return のカンマ式として <任意の式> が 1116行の factory 実行時（＝typed() を呼んだ時点）に実行される。1104行の側はクォートの中なので、ペイロードに ' を含めなければ構文は壊れない。name に ' を入れるだけでも構文エラーになる。
+  - シグネチャ文字列も同じ問題がある: シグネチャのキー（836〜839行）→ Signature（399〜402行、',' で分割）→ Param（199〜216行、'|' で分割して trim）を経て、625行 `'... // signature: ' + this.params.join(', ')` で行コメントに入る。型名の途中に改行を入れればコメントから抜けて任意のコードを書ける。'...any|<改行を含む文字列>' のような可変長 any 型の引数では getTypeTest()（33行、未知の型なら例外）を通らない（674〜682行）ので、登録外の型名でも生成コードまで届く。
+  - そのほか、668〜670行（conversion.from を // type: コメントへ）、719・820行（型名を '...' 文字列へ）もエスケープなしで連結している。ただしこれらは addType / addConversion で登録した型名・変換に限られる（開発者が決める値）。
+  - 影響: アプリが利用者に関数名やシグネチャを決めさせて typed() に渡す場合（例: 数式言語のライブラリが利用者定義の関数を typed で作る場合）、攻撃者は任意の JavaScript を実行できる。Node.js ではサーバ上の任意コード実行、ブラウザではページのオリジンでのスクリプト実行（XSS）になる。
+  - XSS 以外の修正案（参考）: Node.js 側の RCE も同じ修正（name とシグネチャ文字列の検証・エスケープ）で防げる。
+- 使用トークン量（判定）: 新規 38,919（入力 12 ／ キャッシュ作成 27,384 ／ 出力〔推定〕 11,523）、キャッシュ読込 163,161、総処理 202,080、リクエスト 6 回（出力の記録値 11,110）
+- 注記（親）: エージェントは無害な実験コードでの動作確認を試みたが、ダウンロードしたコードの実行は Claude Code の権限の判定で拒否されたため、判定と修正はコードを読んだだけで行った（エージェントの報告）。
+
+---
