@@ -1,0 +1,415 @@
+## No.21 CVE-2017-0931 guardian/html-janitor src/html-janitor.js（prePatch 8c99e65）
+
+- 修正コード2の検証で見つかった不備: template を許可する設定で template の中身（template.content）が検査されず、noscript を使う mutation XSS が残る（CWE-79（判定の記録））
+- 修正コード3 のファイル: src/html-janitor.js
+- 組み合わせ: 修正コード3 のファイル（src/html-janitor.js）。修正前の最終版: src/html-janitor.js（修正コード2）
+- 親の確認: src/html-janitor.js: node --check で構文エラーなし。エージェントが読み取り専用の材料（orig・given）を変えていないこと、読まない範囲のファイルを読んでいないことを、記録で確認した。
+- 使用トークン量（作成）: 新規 178,692（入力 66 ／ キャッシュ作成 104,527 ／ 出力〔推定〕 74,099）、キャッシュ読込 2,605,945、総処理 2,784,637、リクエスト 33 回
+
+- 対象: ossf-cve-benchmark CVE-2017-0931、guardian/html-janitor `src/html-janitor.js`（prePatch 8c99e65）
+- 修正コード3: `fix3/src/html-janitor.js`。修正コード2（`given/fix2/src/html-janitor.js`）をコピーし、`_sanitize` に 1 か所だけ追加した（L135-153）。
+- clean() の変更（inert な文書で解析する。修正コード1 の【修正】）、createTreeWalker の変更（同じく【修正】）、noscript の検査（修正コード2 の【修正2】）は、内容を変えずにそのまま残した。
+
+### 修正コード2の不備
+
+#### 不備1: template の中身を検査しないため、中身の noscript による mutation XSS が残り、許可していないタグや on* 属性もそのまま出力される
+
+- 場所: `given/fix2/src/html-janitor.js`
+  - L46-48（clean）: スクリプト無効の inert な文書で解析する。この文書では `<noscript>` の中身が要素として解析される。
+    ```js
+    var sandboxDocument = document.implementation.createHTMLDocument('');
+    var sandbox = sandboxDocument.createElement('div');
+    sandbox.innerHTML = html;
+    ```
+  - L132-133: `// Sanitize children` / `this._sanitize(node);`（DOM の子だけをサニタイズする）
+  - L154-158: `node.ownerDocument.createTreeWalker(node, NodeFilter.SHOW_TEXT | NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_COMMENT, null, false)`。TreeWalker は DOM の子だけをたどる。HTML の `<template>` の中身は子ノードではなく、別の DocumentFragment（`node.content`）に入る。そのため、template の中身は一度も訪れない。
+  - L144: `if (nodeName === 'noscript' && /<\/noscript/i.test(node.innerHTML)) {`（【修正2】）。TreeWalker が訪れた noscript にしか効かない。
+  - L52: `return sandbox.innerHTML;`。HTML のシリアライズでは template の中身も出力される。検査していない中身が、そのまま返り値に入る。
+- 問題:
+  - template を許可した設定では、template の中身は、タグの許可リスト・属性の検査・コメントの削除・【修正2】の noscript の検査を、どれも受けない。
+  - (a) 中身の noscript による mutation XSS（修正コード2 で直したとしている問題の、別の経路）: inert な文書では、`<template><noscript><style>…</style></noscript></template>` の style の生テキストに `</noscript></template><img src=x onerror=…>` を入れられる。返り値はほぼ入力のまま出る。ところが、返り値を入れる表示中のページはスクリプト有効なので、noscript の中身は `</noscript` までの生テキストになる。そこで noscript が閉じ、続く `</template>` で template も閉じる。後ろの `<img src=x onerror=…>` は、div の直下の本物の要素になり、onerror が実行される。
+  - (b) 同じ原因の別の経路（宣言的 shadow DOM）: template の中身に許可していない `<img onerror>` などが残る。通常の innerHTML で入れた場合、template の中身は描画されないので実行されない。しかし、`template` と属性 `shadowrootmode` を許可した設定の出力を、アプリが `setHTMLUnsafe` などで入れる場合は違う。このときは `<template shadowrootmode=open>` の中身が shadow root として描画され、onerror が実行される。
+- 問題になる入力・条件（自分で再現した。headless Chrome 157 の標準モードと互換モードの両方で、同じ結果だった）:
+  - (a) の基本形（t01）: 設定 `{tags: {template: {}}}`（template を許可するだけでよい。noscript・style の許可は不要）、入力 `<template><noscript><style></noscript></template><img src=x onerror=…></style></noscript></template>`
+    - 修正コード2 の返り値は入力と同じ文字列になった。これを接続済みの div に innerHTML で入れると、onerror が実行された（setHTMLUnsafe で入れた場合も実行された）。
+  - (a) の変形で、修正コード2 で描画時に実行されたもの（17 件）:
+    - noscript・style も許可（t02）、template を true で許可（t03）、template を関数で許可し `</noscript >`・`</template\n>` で閉じる（t24）
+    - p の中で xmp を使う（t04）、iframe（t05）、template の入れ子（t06）、大文字と空白（t07）、先頭に NUL（t23）
+    - table の中（t14）、select の中（t15）、math の mtext の中（t22）、svg の foreignObject の中（t28）、div と template を交互に入れ子（t21）
+    - noscript を許可した設定で、style を使わずにコメント `<!--</noscript></template><img …>-->` を使う（t17）。修正コード2 は template の中のコメントも消さないので、この形も通る。
+    - noscript を許可し、style は許可しない（t19）、style だけ許可（t29）
+    - svg onload を使う形（t08）は、Chrome では実行されなかった。ただし、再解析した木に許可していない svg 要素と onload 属性ができた（許可リスト違反）。
+  - (b)（修正コード2 で、setHTMLUnsafe で入れたときに実行された。3 件）:
+    - 設定 `{tags: {div: {}, template: {shadowrootmode: true}}}`、入力 `<div><template shadowrootmode=open><img src=x onerror=…></template></div>`（t11）。返り値に img と onerror が残り、shadow root の中で実行された。
+    - template を true で許可（t12）。a の href を `^https?:` の関数で検査する設定で、`<span><template shadowrootmode=open><a href="javascript:…">x</a><img …></template></span>`（t26）。template の中なので、href の検査も img の削除も効かなかった。
+  - 許可リスト違反（実行はされないが、出力に許可していないものが残る）: `<template><img src=x onerror=…></template>`（t10、a21）、入れ子の template（a22）、`<template><b onclick=…>x</b><i>y</i><!--c--></template>` で onclick・i・コメントが残る（t13）。
+  - 発火しなかったもの（参考）:
+    - 属性値を使う形（t18）は、Chrome が属性値の `<` `>` をエスケープするため発火しない。
+    - textarea を使う形（t27）は、テキストがエスケープされるため発火しない。
+    - svg の中の template（t16）は、svg 名前空間の要素で中身が普通の子になり、解析も変わらないため発火しない。
+    - template を許可しない設定（t20）では、template が中身ごと消えるため発火しない。
+    - noscript の中の template（t09）は、【修正2】の検査（noscript の innerHTML は template の中身も含む）で消えるため発火しない。
+- いつ入ったか:
+  - template の中身を検査しないこと自体は、元のコードからある。元のコードも同じ TreeWalker を使う。元のコードも t10 の `<template><img onerror></template>` をそのまま通し、(b) の t11・t12・t26 も、元のコードで setHTMLUnsafe で入れると実行された。
+  - (a) の、template から抜け出して描画時に実行される mutation XSS は、修正コード1 で入った。解析に使う文書を、スクリプト無効の inert な文書に変えたためである（scripting フラグの違い）。元のコードは、同じ入力でも描画時には発火しなかった（元のコードで起きるのは、判定の脆弱性である解析時の発火だけ）。
+  - 修正コード2 は noscript の検査を足したが、TreeWalker がたどる範囲にしか効かないので、template の中身では直っていない。つまり (a) は、修正コード1 で入り、修正コード2 でも残った不備である。修正コード2 の説明の「noscript を許可しない設定では…発火しない（確認済み）」は、template を許可する設定（t01）では成り立たない。
+
+### 再修正の内容
+
+変更は `fix3/src/html-janitor.js` の `_sanitize` の 1 か所だけである（L135-153。そのうち L135-150 はコメント）。
+
+```js
+      // Sanitize children
+      this._sanitize(node);
+
+      // 【修正3】template 要素の中身もサニタイズする。
+      // …（説明のコメント）…
+      if (node.content && node.content.nodeType === Node.DOCUMENT_FRAGMENT_NODE) {
+        this._sanitize(node.content);
+      }
+
+      // 【修正2】noscript の解析の違いによる mutation XSS を防ぐ。
+      …（修正コード2 のまま）…
+```
+
+- 何をしているか
+  - 許可された要素について、属性を削り（L121-130）、子をサニタイズした（L133）直後に、その要素が中身の DocumentFragment（`node.content`）を持つかどうかを見る。持つのは HTML の template 要素だけである。
+  - 持っていれば、その DocumentFragment にも同じ `_sanitize` を当てる。これで template の中身にも、通常の子と同じ処理がすべて適用される。
+    - タグの許可リスト（許可しない要素は外す。script・style は中身ごと消す）
+    - 属性の検査（許可していない属性、関数で不可とされた値を削る）
+    - コメントの削除
+    - インライン要素の中のブロック要素、ブロック要素の入れ子の処理
+    - 【修正2】の noscript の検査
+  - 中身の中にさらに template があれば、その中身も同じ処理の中で再帰的に検査される。
+- なぜこの方法にしたか
+  - 不備の原因は「TreeWalker が template の中身に入らない」ことである。そのため、中身にもサニタイザを当てるのが、原因に対するいちばん直接の直し方である。noscript の経路 (a) だけでなく、宣言的 shadow DOM の経路 (b) や、許可リスト違反のような同じ原因の問題も、まとめて直る。
+  - 検証の記録の修正案 (案2)「設定にかかわらず template を中身ごと削除する」も検討した。しかし、template を許可している利用者の出力が大きく変わる（正常な中身まで消える）ので、採らなかった。案1（この方法）なら、template を許可しない設定の動作も、template を含まない入力の動作も、まったく変わらない。
+  - 条件は `nodeName === 'template'` ではなく、`node.content` が DocumentFragment であること（nodeType 11）にした。HTML のシリアライズで中身が出力されるのは、まさに「中身の DocumentFragment を持つ HTML の template 要素」なので、出力に出るものと検査するものが一致する。
+    - svg 名前空間の `<template>` は content を持たず、中身は普通の子として既に検査されるので、対象にしなくてよい。
+    - 誤って別のものを対象にしないことも確かめた。meta 要素の `content` は文字列（nodeType がない）で、対象にならない。form 要素の `content` は `<input name=content>` で名前付きプロパティに上書きされうるが、その値は要素（nodeType 1）なので対象にならない。この 2 つは n35・n36 で、返り値が修正コード2 と同じことを確かめた。
+    - `Node.DOCUMENT_FRAGMENT_NODE` は、既存のコードの `Node.TEXT_NODE`・`Node.COMMENT_NODE` と同じ書き方である。template に対応していない古いブラウザでは `node.content` が undefined なので、何もしない（例外は出ない）。
+  - 位置は、子のサニタイズの直後で、【修正2】の noscript の検査の前にした。noscript の中に template がある場合、外側の noscript を検査する時点（その noscript の `_sanitize(node)` が終わった後）では、中の template の中身はもうサニタイズ済みである。そのため、`node.innerHTML` による `</noscript` の判定は、最終的に出力される文字列で行われる。
+- 既存の処理が DocumentFragment でも正しく動くこと
+  - `_sanitize(node.content)` では、`parentNode` が DocumentFragment になる。
+  - `createTreeWalker` は `node.ownerDocument`（template の中身の持ち主の文書。閲覧コンテキストを持たない inert な文書）で TreeWalker を作る。そのため、中身を検査しても、読み込みやスクリプトは起きない。
+  - `parentNode.removeChild`・`insertBefore`・`this._sanitize(parentNode)`（外した後のたどり直し）は、DocumentFragment でもそのまま動く。
+  - ブロック要素の入れ子の判定（L93-97）について。`isBlockElement(DocumentFragment)` は false なので、template の中身の直下の要素は「入れ子」とみなされない。これは、clean() のいちばん外側の div（`isNotTopContainer` が false）の直下の要素と同じ扱いである。中身の中の要素どうしは、通常の木と同じ規則で判定される。
+- どう動くか（例。Chrome 157 で確かめた返り値）
+  - t01（`{template: {}}`）: noscript と style は許可されていないので外される。style は中身ごと消える。返り値は `<template></template>`。
+  - t02（`{template: {}, noscript: {}, style: {}}`）: 中身の noscript の innerHTML が `<style></noscript></template><img …></style>` となり、`</noscript` を含むので、【修正2】の検査で noscript ごと消える。返り値は `<template></template>`。
+  - t17（noscript だけ許可、コメントを使う形）: コメントが消え、返り値は `<template><noscript></noscript></template>`。
+  - t11（shadowrootmode を許可）: img は許可されていないので消え、返り値は `<div><template shadowrootmode="open"></template></div>`。t26 は、href の関数の検査が効いて `<span><template shadowrootmode="open"><a>x</a></template></span>`。
+  - t13: `<template><b>x</b>y</template>`（onclick・i・コメントが消える）。
+  - 正常な `<template><p>tpl <b>b</b></p></template>`（n26）、`<template><ul><li>a</li></ul><noscript><p>n</p></noscript></template>`（n27）、入れ子の template（n28）などは、修正コード2 と同じ返り値のまま残る。
+
+### 確認した内容と結果
+
+確認用のファイルは `bench/` に置いた。対象の js は引数で渡した。
+- `bench/run.sh` と `harness_std.html`・`harness_quirks.html`・`harness.js`・`cases.js`: 個別のケースでの確認
+- `bench/fuzz.sh`・`fuzz.js`: ランダムな入力での比較
+- `bench/robust.js`: 大きな入力での確認
+- `bench/node_load.js`: Node での読み込みの確認
+- 結果は `bench/res/` に置いた。
+
+- 構文・読み込み
+  - `node --check`: 元のコード・修正コード2・修正コード3 とも OK。
+  - Node で require できた（module.exports が関数、`prototype.clean`・`_sanitize` が関数）。不正な設定 `{p: 'x'}` では、"The configuration was invalid" の例外を投げた。Node で clean() を呼ぶと、document がないため ReferenceError になる。これは元のコードと同じである（ブラウザ専用のライブラリ）。
+  - headless Chrome 157 で、UMD のグローバル（HTMLJanitor）として読み込めた。
+- ブラウザでの確認（headless Chrome 157、`--headless=new --dump-dom --virtual-time-budget`）
+  - 標準モード（doctype あり）と互換モード（doctype なし）の 2 つのページで、元のコード・修正コード1・修正コード2・修正コード3 を同じ 111 件のケースで動かした。
+    - ケースの内訳: a=解析時の実行 23、m=noscript の mXSS 18、t=template の中身 29、g=対象外の mXSS など 5、n=正常な入力 36
+  - 各ケースで、次の 3 段階で onerror などが実行されるか（発火）を記録した。
+    1. clean() を呼ぶだけ（clean 段階）
+    2. 返り値を接続済みの div に innerHTML で入れる（描画段階）
+    3. 返り値を接続済みの div に setHTMLUnsafe で入れる（描画段階 2。宣言的 shadow DOM が有効）
+  - あわせて、再解析した木（template の中身と shadow root を含む）に、許可していないタグや on* 属性があるか（許可リスト違反）を調べた。
+  - 結果（標準モードと互換モードで、件数も ID も同じだった）:
+
+    | | 元のコード | 修正コード1 | 修正コード2 | 修正コード3 |
+    |---|---|---|---|---|
+    | a 群 clean 段階の発火（判定の脆弱性） | 17 | 0 | 0 | 0 |
+    | m 群 clean 段階 / 描画段階の発火 | 18 / 0 | 0 / 14 | 0 / 0 | 0 / 0 |
+    | t 群 clean 段階の発火 | 22 | 0 | 0 | 0 |
+    | t 群 描画段階（innerHTML）の発火 | 0 | 18 | 17 | 0 |
+    | t 群 描画段階 2（setHTMLUnsafe）の発火 | 3 | 21 | 20 | 0 |
+    | t 群 許可リスト違反 | 22 | 26 | 25 | 1 |
+    | a 群 許可リスト違反（template の中身の img） | 2 | 2 | 2 | 0 |
+    | n 群 発火 | 0 | 0 | 0 | 0 |
+
+    - 修正コード3 の t 群の違反 1 件は t25（`{a: {href: true}}` で `<template><a href="javascript:…">`）である。href を true で許可する設定の仕様で、template の外でも同じく通る（判定の付随の指摘で、対象外としている点）。
+    - g 群では、g01（form/math/mglyph/style の名前空間の混乱）と g03（`{img: true}` で全属性を許可）が、どの版でも描画段階で発火した。修正コード3 で変わっていない（対象外の点。「副作用・残る点」を参照）。
+  - 判定の脆弱性（解析時の発火）は、回り込みの入力でも直ったままだった。
+    - 回り込みの入力: 大文字、文字参照の属性値、srcset、svg image、details ontoggle、input type=image、audio、table・math の中、keepNestedBlockElements、設定の関数が例外を投げる場合（a16）、ページで定義したカスタム要素（a15）、template の中の img（a20-a22）
+    - 修正コード3 では、どれも clean 段階で発火しなかった。
+  - 修正コード2 で直した noscript の mXSS（m 群）も、直ったままだった。修正コード3 の返り値は、修正コード2 と全件同じだった。
+- 返り値の比較
+  - 修正コード2 と修正コード3 の返り値が違ったのは 111 件中 28 件で、すべて入力に template を含むケースだった。template を含まない 83 件は全件同じだった（標準・互換とも）。
+  - 修正コード3 の返り値は、標準モードと互換モードで全件同じだった。
+  - 正常な入力 36 件で、元のコードと同じだったのは、標準 32 件、互換 31 件だった。違うのは次のケースだけで、危険な変化はない。
+    - n27・n29（template の中の noscript の中身の扱い）、n15 の互換モード（`<p>a<table>…</table>c</p>` で p が閉じる）: 修正コード1 からの変化で、修正コード2 と同じ返り値。
+    - n33・n34: 今回の変化（「副作用・残る点」を参照）。
+- ランダムな入力での比較（`bench/fuzz.sh`）
+  - 修正コード2 と修正コード3 を同じページに読み込み、ランダムに組み立てた入力とランダムな設定で比べた。種 3 つ × 5000 件。
+    - 入力の材料: template・noscript・style・xmp・iframe・svg・math・コメント・onerror など
+    - 返り値を、innerHTML と setHTMLUnsafe で入れて調べた。
+  - template を含まない入力（1928・1933・835 件）は、返り値が全件同じだった。
+  - 例外は、どちらも 0 件だった。描画時の発火も、どちらも 0 件だった。
+  - 再解析した木の on* 属性の違反は、修正コード2 で 267・263・832 件、修正コード3 で 0 件だった。許可していないタグの違反は、修正コード2 で 687・682・1109 件、修正コード3 で 0 件だった。
+  - 修正コード3 だけに違反や発火が出たケース（新しく入った問題）は 0 件だった。
+  - 検出の仕組みが働くことも確かめた。元のコードと比べた試行（500 件）では、元のコードの clean 段階の発火が 62 件、検出された。
+- 大きな入力・深い入れ子（`bench/robust.js`。元のコード・修正コード2・修正コード3 を比べた）
+  - template を 5000 段入れ子にし、中に img を置いた入力:
+    - 修正コード3 は例外を出さず、112ms で、img のない返り値を返した。修正コード2 は img を含んだまま返した。
+    - Chrome の HTML パーサは、入れ子の深さを 512 段程度で打ち切る。そのため、再帰の深さも、通常の要素の入れ子と同じ範囲に収まる。
+    - 参考: div を 5000 段入れ子にした入力は、元のコードを含むすべての版で RangeError になる（元からの性質）。
+  - template を 5000 個並べた入力は 26ms、正常な大きな入力（p を 3000 個）は 24ms で、修正コード2（13ms・23ms）と大きく変わらなかった。
+  - template の中にコメントを 2 万個並べた入力では、修正コード3 は RangeError を投げた（修正コード2 は中身を見ないので通した）。これは、template の外に同じコメントを 2 万個並べた入力で、元のコード・修正コード1・修正コード2 が同じ RangeError を投げるのと同じ原因である（「副作用・残る点」を参照）。2000 個では、どの版も例外は出なかった。
+
+### 副作用・残る点
+
+- 動作の変化（今回加えたもの）: template を許可した設定では、template の中身にも、通常の子と同じサニタイズがかかるようになった。
+  - 中身の中の、許可していないタグは外れ、許可していない属性とコメントは消える。`</noscript` を含む noscript も消える。
+  - 空白だけのテキストのうち、隣にブロック要素があるものは消える。例: n33 `<template><p>a</p> <p>b</p></template>` が `<template><p>a</p><p>b</p></template>` になる。
+  - ブロック要素の入れ子は外れる。例: n34 `<template><li><p>…</p></li></template>` が `<template><li>…</li></template>` になる。
+  - これらは、template の外で前から行っている処理と同じで、サニタイザとして本来そうあるべき動作である。
+  - template を許可しない設定（これまでどおり、template は中身ごと消える）と、template を含まない入力では、動作は変わらない（ケース 83 件と、ランダムな入力 4696 件で確かめた）。
+- 例外について: template の中のコメントなどが非常に多い入力（2 万個程度）では、clean() が RangeError を投げることがある。
+  - 原因は、元のコードからある「1 つ外すたびに `this._sanitize(parentNode)` で親を再帰的にたどり直す」作りである。template の外に同じものを並べれば、元のコードでも修正コード2 でも同じ例外になる。
+  - したがって、攻撃者にできることは増えていない。例外になった場合、返り値は返らない（安全側に止まる）。
+  - この作りを直すにはループの構造を大きく変える必要があるので、変更を必要な範囲にとどめるため、直していない。
+  - 修正コード2の検証の「指摘」にあった次の点も、同じ理由でそのままである。いずれも、template の中身にも同じく当てはまるようになった。
+    - noscript 2 万個での RangeError
+    - 二乗の処理時間
+    - 正常な noscript の入れ子も消える、広めの判定
+- 直していない点（対象外）:
+  - 判定の付随の指摘（allowedAttrs === true で全属性を許可する点と、属性値（javascript: など）を検査しない点）。t25・g03 のとおり、template の中でも外でも同じ動作である。ライブラリの設定の仕様なので、対象外のままとした。
+  - svg・math の名前空間の混乱を使う一般的な mXSS（g01）。元のコードと同じ「解析→シリアライズ→再解析」の構造の問題で、修正で増えたものではない。
+  - form の DOM clobbering（参考として確認した）。設定で form と input の name 属性を許可すると、`<form onmouseover=…><input name=attributes></form>` の onmouseover が消えずに残る。`node.attributes` が input 要素に置き換わるためである。元のコード・修正コード2・修正コード3 で同じ動作で、template の中でも外でも同じだった（g04・g05）。原因が判定の脆弱性とも今回の不備とも別で、元のコードからあるので、直していない。
+  - 宣言的 shadow DOM について: `shadowrootmode` 属性を許可した設定では、出力に `<template shadowrootmode>` が残る。ただし、修正コード3 では中身が許可リストどおりにサニタイズされるので、setHTMLUnsafe などで入れても、許可した要素・属性しか描画されない（t11・t12・t26 で確認）。
+- 未確認の点: 確認は Chrome 157 だけで行った。属性値の `<` `>` をエスケープしない古いブラウザでの動作は、環境にないため実行していない。【修正2】の検査は template の中身にも実際のシリアライズ結果で効くので、そのようなブラウザで `</noscript` が出れば、修正コード2 の説明と同じく削除される（コードを読んでの確認）。
+
+### 修正コード3 の全文: src/html-janitor.js
+
+```javascript
+(function (root, factory) {
+  if (typeof define === 'function' && define.amd) {
+    define('html-janitor', factory);
+  } else if (typeof exports === 'object') {
+    module.exports = factory();
+  } else {
+    root.HTMLJanitor = factory();
+  }
+}(this, function () {
+
+  /**
+   * @param {Object} config.tags Dictionary of allowed tags.
+   * @param {boolean} config.keepNestedBlockElements Default false.
+   */
+  function HTMLJanitor(config) {
+
+    var tagDefinitions = config['tags'];
+    var tags = Object.keys(tagDefinitions);
+
+    var validConfigValues = tags
+      .map(function(k) { return typeof tagDefinitions[k]; })
+      .every(function(type) { return type === 'object' || type === 'boolean' || type === 'function'; });
+
+    if(!validConfigValues) {
+      throw new Error("The configuration was invalid");
+    }
+
+    this.config = config;
+  }
+
+  // TODO: not exhaustive?
+  var blockElementNames = ['P', 'LI', 'TD', 'TH', 'DIV', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'PRE'];
+  function isBlockElement(node) {
+    return blockElementNames.indexOf(node.nodeName) !== -1;
+  }
+
+  var inlineElementNames = ['A', 'B', 'STRONG', 'I', 'EM', 'SUB', 'SUP', 'U', 'STRIKE'];
+  function isInlineElement(node) {
+    return inlineElementNames.indexOf(node.nodeName) !== -1;
+  }
+
+  HTMLJanitor.prototype.clean = function (html) {
+    // 修正: 現在表示中の document ではなく、閲覧コンテキストを持たない別文書（inert な文書）で解析する。
+    // この文書内では画像などの読み込みもイベントハンドラ（onerror 等）の実行も起きないため、
+    // サニタイズ前の HTML を innerHTML に入れてもスクリプトは動かない。
+    var sandboxDocument = document.implementation.createHTMLDocument('');
+    var sandbox = sandboxDocument.createElement('div');
+    sandbox.innerHTML = html;
+
+    this._sanitize(sandbox);
+
+    return sandbox.innerHTML;
+  };
+
+  HTMLJanitor.prototype._sanitize = function (parentNode) {
+    var treeWalker = createTreeWalker(parentNode);
+    var node = treeWalker.firstChild();
+    if (!node) { return; }
+
+    do {
+      if (node.nodeType === Node.TEXT_NODE) {
+        // If this text node is just whitespace and the previous or next element
+        // sibling is a block element, remove it
+        // N.B.: This heuristic could change. Very specific to a bug with
+        // `contenteditable` in Firefox: http://jsbin.com/EyuKase/1/edit?js,output
+        // FIXME: make this an option?
+        if (node.data.trim() === ''
+            && ((node.previousElementSibling && isBlockElement(node.previousElementSibling))
+                 || (node.nextElementSibling && isBlockElement(node.nextElementSibling)))) {
+          parentNode.removeChild(node);
+          this._sanitize(parentNode);
+          break;
+        } else {
+          continue;
+        }
+      }
+
+      // Remove all comments
+      if (node.nodeType === Node.COMMENT_NODE) {
+        parentNode.removeChild(node);
+        this._sanitize(parentNode);
+        break;
+      }
+
+      var isInline = isInlineElement(node);
+      var containsBlockElement;
+      if (isInline) {
+        containsBlockElement = Array.prototype.some.call(node.childNodes, isBlockElement);
+      }
+
+      // Block elements should not be nested (e.g. <li><p>...); if
+      // they are, we want to unwrap the inner block element.
+      var isNotTopContainer = !! parentNode.parentNode;
+      var isNestedBlockElement =
+            isBlockElement(parentNode) &&
+            isBlockElement(node) &&
+            isNotTopContainer;
+
+      var nodeName = node.nodeName.toLowerCase();
+
+      var allowedAttrs = getAllowedAttrs(this.config, nodeName, node);
+
+      var isInvalid = isInline && containsBlockElement;
+
+      // Drop tag entirely according to the whitelist *and* if the markup
+      // is invalid.
+      if (isInvalid || shouldRejectNode(node, allowedAttrs)
+          || (!this.config.keepNestedBlockElements && isNestedBlockElement)) {
+        // Do not keep the inner text of SCRIPT/STYLE elements.
+        if (! (node.nodeName === 'SCRIPT' || node.nodeName === 'STYLE')) {
+          while (node.childNodes.length > 0) {
+            parentNode.insertBefore(node.childNodes[0], node);
+          }
+        }
+        parentNode.removeChild(node);
+
+        this._sanitize(parentNode);
+        break;
+      }
+
+      // Sanitize attributes
+      for (var a = 0; a < node.attributes.length; a += 1) {
+        var attr = node.attributes[a];
+
+        if (shouldRejectAttr(attr, allowedAttrs, node)) {
+          node.removeAttribute(attr.name);
+          // Shift the array to continue looping.
+          a = a - 1;
+        }
+      }
+
+      // Sanitize children
+      this._sanitize(node);
+
+      // 【修正3】template 要素の中身もサニタイズする。
+      // HTML の <template> の中身は子ノードではなく、別の DocumentFragment（node.content）に入る。
+      // TreeWalker は DOM の子だけをたどるので、これまでは template の中身を一切検査せず、
+      // そのまま clean() の返り値にシリアライズしていた。そのため template を許可した設定では、
+      //  - 中身の <noscript> に【修正2】の検査が効かず、使用時（スクリプト有効のページ）に
+      //    noscript が </noscript> で閉じ、続く </template> で template も閉じて、後ろの
+      //    <img src=x onerror=...> などが本物の要素になる（mutation XSS）。
+      //  - 許可していないタグや on* 属性が中身にそのまま残り、宣言的 shadow DOM
+      //    （<template shadowrootmode>。setHTMLUnsafe などで入れた場合）では実際に描画・実行される。
+      // そこで、template の中身（DocumentFragment）にも同じ _sanitize を当てて、タグの許可リスト・
+      // 属性の検査・コメントの削除・【修正2】の noscript の検査を、通常の子と同じように適用する。
+      // 中身の中の template も、この処理の中で同じように再帰的に検査される。
+      // node.content が DocumentFragment のとき（HTML の template 要素）だけ行う。meta の content
+      // （文字列）や、form の名前付きプロパティ（<input name=content> は要素）は対象にならない。
+      // 子のサニタイズの直後に行うので、外側の noscript の【修正2】の検査（node.innerHTML）は、
+      // サニタイズ済みの template の中身を含めた文字列で判定される。
+      if (node.content && node.content.nodeType === Node.DOCUMENT_FRAGMENT_NODE) {
+        this._sanitize(node.content);
+      }
+
+      // 【修正2】noscript の解析の違いによる mutation XSS を防ぐ。
+      // clean() は閲覧コンテキストのない文書（スクリプト無効）で解析するため、<noscript> の中身は
+      // 要素として解析・サニタイズされる。しかし返り値を入れる表示中のページはスクリプト有効で、
+      // そこでは <noscript> の中身は「</noscript までの生テキスト」として解析し直される。
+      // そのため中身のシリアライズ結果に </noscript があると（例: 許可した <style> のテキスト
+      // `</noscript><img src=x onerror=...>`）、使用時にそこで noscript が閉じ、残りが本物の要素になる。
+      // 中身を子のサニタイズ後に実際にシリアライズして調べ、</noscript（大文字小文字を問わない）が
+      // 含まれていれば noscript を中身ごと削除する。noscript の中身はスクリプト有効のページでは
+      // 表示されないので、削除しても見た目は変わらない。名前空間を問わず（svg 内なども）対象にする。
+      if (nodeName === 'noscript' && /<\/noscript/i.test(node.innerHTML)) {
+        parentNode.removeChild(node);
+
+        this._sanitize(parentNode);
+        break;
+      }
+
+    } while ((node = treeWalker.nextSibling()));
+  };
+
+  function createTreeWalker(node) {
+    // 修正: 解析対象のノードが属する文書（inert な文書）で TreeWalker を作る
+    return node.ownerDocument.createTreeWalker(node,
+                                     NodeFilter.SHOW_TEXT | NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_COMMENT,
+                                     null, false);
+  }
+
+  function getAllowedAttrs(config, nodeName, node){
+    if (typeof config.tags[nodeName] === 'function') {
+      return config.tags[nodeName](node);
+    } else {
+      return config.tags[nodeName];
+    }
+  }
+
+  function shouldRejectNode(node, allowedAttrs){
+    if (typeof allowedAttrs === 'undefined') {
+      return true;
+    } else if (typeof allowedAttrs === 'boolean') {
+      return !allowedAttrs;
+    }
+
+    return false;
+  }
+
+  function shouldRejectAttr(attr, allowedAttrs, node){
+    var attrName = attr.name.toLowerCase();
+
+    if (allowedAttrs === true){
+      return false;
+    } else if (typeof allowedAttrs[attrName] === 'function'){
+      return !allowedAttrs[attrName](attr.value, node);
+    } else if (typeof allowedAttrs[attrName] === 'undefined'){
+      return true;
+    } else if (allowedAttrs[attrName] === false) {
+      return true;
+    } else if (typeof allowedAttrs[attrName] === 'string') {
+      return (allowedAttrs[attrName] !== attr.value);
+    }
+
+    return false;
+  }
+
+  return HTMLJanitor;
+
+}));
+```
+
+---
