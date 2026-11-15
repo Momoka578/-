@@ -1,0 +1,14 @@
+## No.15 google/firing-range DOMPropagation.java（+ data/dompropagation.tmpl, data/toxicdom.tmpl）
+- 対象: https://github.com/google/firing-range/blob/master/src/tests/dom/DOMPropagation.java（GitHub のコード（第1回で取得したときのコミットに固定））
+- 判定: **脆弱性あり**（DOM-based XSS／eval による任意 JavaScript 実行・CWE-79、CWE-95）
+- XSS に該当: 種別・source・sink は "第2回xssの詳細"、修正コードは "第2回修正版コード" を参照
+- 根拠（エージェントの判定記録から）:
+  - 根拠:
+  - DOMPropagation.java 33〜37 行目: toxicdom.tmpl（<script> の中に %%PAYLOAD%% を持つ HTML）の %%PAYLOAD%% を dompropagation.tmpl の JavaScript で置き換え（35 行目 Templates.replacePayload）、Responses.sendXssed（37 行目。X-XSS-Protection: 0、Content-Type: text/html）でそのままブラウザへ返す。サーバー側の出力は固定文字列で、リクエスト値は使っていない。
+  - 返された JavaScript（dompropagation.tmpl）は、4 行目で URL のフラグメント location.hash.substr(1) を読み、5 行目で window.status に代入し、6 行目で window.status から読み戻し、7 行目で eval(retrieved_payload) に渡す。検証・エスケープ・許可リストは一切ない。
+  - window.status は HTML 仕様上「最後に設定した値をそのまま返す」属性なので、フラグメントの文字列がそのまま eval に届く。
+  - 結果: 攻撃者が URL の # 以降に JavaScript の文を入れたリンク（/dom/dompropagation#<JS>）を被害者に開かせると、その文がページのオリジンで実行され、Cookie の窃取・画面の改ざん・利用者になりすました操作などができる。
+  - フラグメントはサーバーへ送られないので、サーバー側の WAF やログでは検知できない。
+- 使用トークン量（判定）: 新規 10,469（入力 6 ／ キャッシュ作成 7,700 ／ 出力〔推定〕 2,763）、キャッシュ読込 60,330、総処理 70,799、リクエスト 3 回（出力の記録値 3,030）
+
+---
