@@ -1,0 +1,25 @@
+### No.9 OWASP-Benchmark/BenchmarkPython testcode/BenchmarkTest00096.py
+- 対象: https://github.com/OWASP-Benchmark/BenchmarkPython/blob/main/testcode/BenchmarkTest00096.py（GitHub のコード（第1回で取得したときのコミットに固定））
+- 判定: **脆弱性あり**（クロスサイトスクリプティング（反射型 XSS）・CWE-79）
+- XSS に該当: 種別・source・sink は "第2回xssの詳細"、修正コードは "第2回修正版コード" を参照
+- 根拠（エージェントの判定記録から）:
+  - 根拠:
+  - testcode/BenchmarkTest00096.py 31 行目で、POST のフォーム引数 BenchmarkTest00096 を request.form.get() でそのまま param に取得している（空なら "" にするだけで検証・エスケープなし）。
+  - 35〜36 行目で possible = "ABC"、guess = possible[0] = 'A' と固定されるため、38〜40 行目の match 文は常に case 'A' に入り、bar = param（ユーザー入力そのもの）になる。'bob' 等の固定値になる分岐（case 'B'／case _）は実行されない。
+  - 50〜52 行目で f 文字列 f'bar is \'{bar}\' and otherarg is \'{otherarg}\'' に bar を無加工で埋め込み、54 行目で RESPONSE（str）をそのまま return している。Flask は str の戻り値を Content-Type: text/html; charset=utf-8 で返すため、ブラウザは応答を HTML として解釈する。
+  - 19 行目で helpers.utils.escape_for_html を import しているが一度も使われておらず、render_template（自動エスケープ）も使っていない。app.py にも Content-Type 変更や CSP 付与などの after_request 処理はない。
+  - よって、BenchmarkTest00096 に HTML タグやスクリプトを含む文字列を POST すると、その文字列がエスケープされずに応答 HTML に出力され、被害者のブラウザ上で攻撃者のスクリプトが実行される。
+- 使用トークン量（判定）: 新規 8,045（入力 8 ／ キャッシュ作成 5,685 ／ 出力〔推定〕 2,352）、キャッシュ読込 82,082、総処理 90,127、リクエスト 4 回（出力の記録値 2,743）
+
+---
+## No.9 OWASP-Benchmark/BenchmarkPython testcode/BenchmarkTest00096.py
+- 対象: https://github.com/OWASP-Benchmark/BenchmarkPython/blob/main/testcode/BenchmarkTest00096.py
+
+- **XSS 種別**: 反射型（リクエストのフォーム引数が保存されずに、同じリクエストの応答にそのまま反映されるため。サーバ側で HTML を組み立てて出力しており、DOM-base ではない）
+- **source**: 31 行目 param = request.form.get("BenchmarkTest00096")（POST フォーム引数。GET ルート 23〜25 行目も同じ処理を呼ぶ）
+- **伝播経路**: 31 行目 param → 32〜33 行目（None／空のとき "" にするだけ） → 36 行目 guess は常に 'A' → 40 行目 bar = param → 51 行目 f 文字列に {bar} として埋め込み RESPONSE に連結 → 54 行目 return RESPONSE
+- **sink**: 54 行目 return RESPONSE（51 行目で bar を埋め込んだ文字列を text/html の応答本文として出力）
+- **脆弱性の位置**: sink 側（51〜54 行目）。source で入力を受け取ること自体は通常の処理であり、問題は HTML 応答に出力する直前で escape_for_html 等の HTML エスケープをしていないこと（import 済みの escape_for_html が未使用）。
+- **攻撃例**: 攻撃者は、BenchmarkTest00096 にスクリプトを含む HTML 断片を入れて対象 URL へ自動 POST するフォームを罠ページに用意し、被害者に開かせる。被害者のブラウザは応答の「bar is '…'」の部分に埋め込まれたスクリプトを対象サイトのオリジンで実行し、Cookie の窃取や画面の改ざん、被害者になりすました操作が行われる。
+
+---
