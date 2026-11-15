@@ -1,0 +1,590 @@
+## No.14 ossf-cve-benchmark CVE-2016-1000229.json → swagger-ui（prePatch commit 14fad2b4, src/main/javascript/helpers/handlebars.js）
+
+- 修正コード3の検証で見つかった不備: サニタイザが開始タグと閉じタグの対応を取らないため、description の閉じない <div> などで後に続くテンプレートの要素が説明文の中に入り、古い直列化では renderGFM の再解析で mutation XSS になる（CWE-79（判定の記録））
+- 修正コード4 のファイル: src/main/javascript/helpers/handlebars.js
+- 組み合わせ: 修正コード4 のファイル（src/main/javascript/helpers/handlebars.js）。修正前の最終版: src/main/javascript/helpers/handlebars.js（修正コード3）
+- 親の確認: src/main/javascript/helpers/handlebars.js: node --check で構文エラーなし。エージェントが読み取り専用の材料（orig・given）を変えていないこと、読まない範囲のファイルを読んでいないことを、記録で確認した。
+- 使用トークン量（作成）: 新規 402,952（入力 124 ／ キャッシュ作成 244,370 ／ 出力〔推定〕 158,458）、キャッシュ読込 10,924,360、総処理 11,327,312、リクエスト 62 回
+
+対象: No.14 swagger-ui（prePatch 14fad2b4）`src/main/javascript/helpers/handlebars.js`
+もとにしたコード（最終版）: 修正コード3 `given/fix3/src/main/javascript/helpers/handlebars.js`
+修正コード4: `fix4/src/main/javascript/helpers/handlebars.js`（修正コード3 をコピーして、不備の箇所だけを変更した。直したところには `【修正4】` のコメントを付けた。修正コード1 の `【修正】`、修正コード2 の `【修正2】`、修正コード3 の `【修正3】` のコメントは、内容が変わらないのでそのまま残した）
+
+### 修正コード3の不備
+
+#### 不備1: description の閉じない（対応の取れていない）許可タグで、後に続くテンプレートの要素を `.markdown` の中に取り込み、renderGFM で mutation XSS になる
+
+- 場所: 修正コード3 handlebars.js L144-156 の `_sanitize` と、L91-119 の `_sanitizeTag`。
+  ```js
+  return html.replace(/<(\/?)([a-zA-Z][a-zA-Z0-9]*)((?:[\s\/][^<>]*)?)>|[^<]+|</g, function(m, slash, name, attrs) {
+      if (name) {
+          return _sanitizeTag(m, slash, name, attrs);
+      }
+      return _escapeText(m);
+  });
+  ```
+  ```js
+  if (slash) {
+      return _has(_voidTags, tag) ? '' : '</' + tag + '>';   // L97-99
+  }
+  ```
+  `_sanitizeTag` は許可したタグを 1 つずつ組み立て直すだけで、開始タグと終了タグの対応を取っていない。開始タグ（`<div>`、`<table><tr><td>` など）は閉じなくてもそのまま出し、終了タグ（`</div>`、`</td>` など）は対応する開始タグが無くても出す。`sanitize('<div>')` は `"<div>"`、`sanitize('<table><tr><td>')` は `"<table><tr><td>"`、`sanitize('</div>')` は `"</div>"` を返していた。
+- 問題: ヘルパーの出力は、テンプレートの中で `<div class="markdown">{{{sanitize description}}}</div>`（operation.handlebars L24・L32、main.handlebars L4）、`<td class="markdown">{{{sanitize description}}}</td>`（param.handlebars L32 など）のように、外側の要素の中に入る。出力に閉じない `<div>` があると、テンプレートの `</div>` がその div を閉じ、`.markdown` の div は開いたままになる。`<table><tr><td>` なら、セルの中では外側の `</div>` がスコープの外として無視される。どちらも、テンプレートでその後に続く要素が `.markdown` の中に入る。
+  - operation.handlebars では、後ろにパラメータの表（`tbody.operation-params`）があり、ParameterView が後からその表に行を追加する。行の中の renderTextParam の `<input … value='…'>` の属性値には、API 仕様の default が `escapeExpression` でエスケープされて入る。main.handlebars では、後ろに externalDocs・license・contact・termsOfServiceUrl の `<a href="{{{escape …}}}">` がある。
+  - エスケープした `&lt;` `&gt;` は、ブラウザが属性値を解析すると `<` `>` に戻る。描画の後、SwaggerUi.js L236-239 の renderGFM が `$(this).html(marked($(this).html()))` を実行すると、2025 年の HTML 仕様の変更より前の innerHTML の直列化（このコミットの時期のブラウザ）は属性値の `<` `>` を生のまま出すので、marked が空行やコードスパン（`` ` ``）で属性値の途中から区切り、残りの `<img src=x onerror=…>` を生の HTML として出力し、`.html()` で DOM に入る。クリックなしでスクリプトが動く。
+  - 修正コード3 の L105-113（文字参照を戻した値に `<` `>` を含む属性を捨てる）は、サニタイザが出す属性だけを見るので、テンプレートが出す属性には効かない。修正コード3 の説明の前提「属性値に `<` `>` が無ければ、直列化した HTML の中の生の `<` は許可したタグの先頭だけ」は、`.markdown` の中身がサニタイザの出力だけのときにしか成り立たず、取り込みがあると崩れる。
+- 問題になる入力の例（どれも API 仕様の値。描画直後は危険なものが無く、renderGFM の後に `img@onerror` ができる）:
+  - (a) operation の description: `<div>`、同じ operation の query パラメータ（type string）の default: `x\n\n<img src=x onerror=alert(document.domain)>`（判定の根拠と同じ parameters[].default が source）
+  - (b) info.description: `<div>`、externalDocs: `{"description": "d", "url": "x\n\n<img src=x onerror=alert(document.domain)>"}`
+  - (c) info.description: `<table><tr><td>`、externalDocs: `{"description": "`", "url": "x` <img src=x onerror=alert(document.domain)> `"}`（改行なし。コードスパン）
+  - (d) operation の description: `` <table><tr><td>` ``、パラメータの default: `` x` <img src=x onerror=alert(document.domain)> ` ``
+  - (e) info.description: `<span><div>`、info.license.url: `x\n\n<img src=x onerror=alert(document.domain)>`
+  - 同じ原因の別の形: `<p><div>`、`<b><div>`、`<dl><dt><div>`、`<div><div><div>`、`<table>`、`<table><tbody><tr><th>`、`</li></ul><div>` なども取り込みを起こす。取り込む先も、x-data-* の値、operation の successDescription の後ろのパラメータ、readOnly の operation の body パラメータの name（textarea の `name='…'`）、termsOfServiceUrl などがある。
+- 自分で再現した: 同じコミットの jQuery 1.8.0・Handlebars 4.0.5・lodash・marked と、各版の handlebars.js を jsdom 16.7.0（古い直列化）に読み込み、MainView・ResourceView・OperationView・ParameterView・StatusCodeView と同じ順・同じ jQuery の `.html()`/`.append()` で描画し、renderGFM と同じ処理をした（`$R/bench/env.js`、`t1.js`）。
+  - 上の (a)〜(e): 修正コード3 は 5 件とも、描画直後は危険なし → renderGFM の後に `img@onerror`（元のコード・修正コード1・修正コード2 も同じ）。(a) では、renderGFM の前の `.markdown` の中に `form.sandbox`・`table.fullwidth` などのテンプレートの要素が入り、innerHTML に `value="x\n\n<img src=x onerror=alert(document.domain)>"` が生の `<` `>` のまま出ていた。
+  - 閉じないタグ・対応の取れていないタグ 28 種 × 取り込む先 13 種 = 364 件（`t1.js`）: 修正コード3 は、描画直後に危険 0 件、renderGFM の後に危険 50 件、`.markdown` への取り込み 154 件（修正コード2 も同じ。元のコード・修正コード1 は renderGFM の後に 73 件）。閉じないタグが無い対照 13 件は危険なし。
+  - jsdom 31.0.1（新しい直列化。属性値の `<` `>` も `&lt;` `&gt;` にする）では、危険は 0 件だが、取り込みは同じく 154 件起きる（XSS になるのは古い直列化のブラウザだけ）。
+- いつからあるか: description → renderGFM の XSS は元のコードからある（元のコードは `<img src=x onerror=…>` を直接書いても通す。修正コード1 も同じ）。修正コード2 はこれをホワイトリスト型のサニタイザで直したとし、修正コード3 は renderGFM の mutation XSS を直したとしたが、修正コード2 で作ったサニタイザがタグの対応を取らない作りのままだったので、この入力では直っていなかった（修正コード3 で新しく入ったものではなく、修正コード2 から（さらに元のコードから）直し切れていなかったもの）。
+
+#### 同じ原因で起きる別の問題（検証の記録には無い。自分で見つけた）: 表のタグで、tr の中で描画するテンプレートの描画が例外で止まる
+
+- 場所: 上と同じ（L144-156 `_sanitize`、L97-99 の終了タグ）。
+- 問題: ParameterView・StatusCodeView は、tr 要素に `$(tr).html(テンプレートの出力)` で描画する。jQuery 1.8.0 の `.html()` は、出力が `<td` で始まるので wrapMap を使い、`<table><tbody><tr>` ＋出力＋`</tr></tbody></table>` を div に入れて解析し、`div.lastChild` を 3 回たどって中身を取り出す。description などに対応の無い `</table>`（ほかに `<tfoot>`・`<thead>` などの組み合わせ）があると、その外側の table が閉じられて構造が変わり、`div.lastChild` が null になって `TypeError: Cannot read properties of null (reading 'lastChild')` が出る。ParameterView.render から MainView.render まで例外が伝わるので、API 仕様の 1 か所の値で、ページ全体の描画が止まる（XSS ではないが、描画を落とす例外）。
+- 問題になる入力: param・param_required の description、readOnly の param の default・name（label の中）、レスポンスのヘッダの description のどれかに `</table>`。
+- 自分で再現した（`t6.js`）: 表のタグ 14 種 × tr の中の場所 5 種 = 70 件で、元のコード・修正コード1・修正コード2・修正コード3 は、どれも `</table>` の 5 件で例外。ランダムな description（`t2.js`）でも、修正コード3 は 1,000 件中 198 件で例外が出た（`<tfoot>`・`<thead>`・`</tbody>` などの組み合わせを含む）。
+- いつからあるか: 元のコードからある（元のコードはどのタグも通す）。不備1 と同じく、ヘルパーの出力のタグが外側の要素を閉じることが原因。
+
+### 再修正の内容
+
+修正コード4 の変更は、`_sanitize` で許可したタグの対応をスタックで取るようにしたこと（関数と表の追加）と、`_sanitizeTag` の最後の 1 行だけ。許可するタグ・属性、文字列のエスケープ、URL の検査、属性値の `<` `>` の検査（【修正3】）、コメントの除去（【修正3】）、sanitize のオブジェクトの経路、renderTextParam などは、修正コード3 のまま変えていない。
+
+#### 1. 許可したタグの開始タグと終了タグの対応をスタックで取る（L153-326）
+
+考え方: ヘルパーの出力が、テンプレートの外側の要素を閉じたり、後に続く要素を取り込んだりしないためには、「出力を HTML パーサが読んだとき、出力の中で開いた要素は出力の中ですべて閉じられ、出力の外の要素は 1 つも閉じられない」必要がある。そこで、出力の中で開いているタグをスタック（配列 `stack`）で管理し、HTML パーサ（ツリー構築）が許可したタグに対して行う処理を、出力の側で先に明示的に行う。パーサが暗黙に閉じる要素は先に終了タグを出し、パーサが無視したり表の外へ移したりするタグは捨てる。こうすると、パーサが出力を読むとき、出力の終了タグはいつも「その時点の一番内側の要素」を閉じるだけになり、パーサの開いた要素のスタックは `stack` と同じになる。入力の最後で `stack` に残ったタグをすべて閉じるので、出力の後ろではパーサの状態が出力の前と同じに戻る。
+
+追加した表（L153-170）:
+- `_specialTags`: HTML パーサの「special」に当たる許可タグ（li・dd・dt の閉じる相手を探すのを止める）
+- `_closePTags`: 開始タグで、開いている p をパーサが暗黙に閉じるタグ（blockquote・dd・div・dl・dt・h1〜h6・hr・li・ol・p・pre・table・ul）
+- `_headingTags`、`_scopeTags`（table・td・th。スコープの境界）、`_listScopeTags`（`</li>` のときは ol・ul も境界）
+- `_tableOnlyTags`（table・tbody・tfoot・thead・tr。直下に表の構造のタグしか置けない要素）、`_tableSectionTags`、`_tablePartTags`
+- `_maxDepth = 100`（入れ子の深さの上限）
+
+追加した関数:
+- `_findOpen(stack, names, stops)`（L172-186）: スタックの上から `names` のタグを探して位置を返す。`stops` のタグに先に当たったら -1（スコープの外）。スタックには `_allowedTags` で確かめた小文字のタグ名しか入らないので、`_has` ではなく `names[...] === true` で調べる（`constructor` などのプロトタイプの名前でも `true` にはならない。`_has` を使った最初の版は、深い入れ子＋対応しない終了タグの繰り返しで 20 万文字に約 600 ms かかったので、速い形にした）。
+- `_closeFrom(stack, index)`（L188-195）: スタックの `index` から上の要素を、内側から順に閉じる終了タグを返す。
+- `_findListItem(stack, names)`（L197-211）: li・dd・dt の開始タグのとき、パーサと同じく、スタックの上から同じ種類のタグを探す。見つかればその位置、div・p 以外の special のタグに先に当たれば -1、スタックの底まで当たらなければ -2。
+- `_openTag(stack, tag, html)`（L213-281）: 許可したタグの開始タグ。
+  - 深さが `_maxDepth` 以上のときは、空要素以外の開始タグを捨てる（ブラウザも 512 段ほどで入れ子を打ち切る。上限があるので、スタックを探す時間は 1 タグあたり一定以下になり、全体の処理時間は入力の長さに比例する）。
+  - tbody・thead・tfoot・tr・td・th: この出力の中で開いた table があるときだけ使う。無いときは捨てる（パーサは body の中ではこれらを無視し、テンプレートのセルの中（`<td class="markdown">` など）では、そのセルを閉じてしまうため）。table があるときは、パーサが暗黙に閉じる要素（前の td・tr・tbody など）を先に閉じる。tr は tbody などの区分の中に、td・th は tr の中に置き、tr が無いときはパーサと同じく `<tr>` を補う。
+  - table・tbody・tr などの直下に、表の構造以外のタグが来たときは捨てる（パーサは表の外へ移す（foster parenting）か、`<table>` なら今の表を閉じるため）。文字はそのまま出す（パーサが表の前に移すが、要素は開かないので対応はずれない）。
+  - li・dd・dt: `_findListItem` で見つけた前の li などを閉じる。-2（出力の中に ul・ol などが無い）のときは捨てる（パーサはテンプレート側の要素まで探しに行き、外側の li などを閉じることがあるため）。
+  - `_closePTags` のタグ: スコープの中に p が開いていれば、そこまで閉じる。
+  - h1〜h6: 一番内側の要素が見出しなら閉じる（パーサと同じ）。
+  - a: td・th より内側に a が開いていれば、そこまで閉じる（パーサは a の中の a で外側の a を閉じるため）。
+  - 空要素（br・hr・img）以外はスタックに積み、組み立て直したタグ（`_sanitizeTag` の結果）を出す。
+- `_closeTag(stack, tag)`（L283-300）: 許可したタグの終了タグ。対応する開始タグがスコープの中で開いているときだけ、その要素までを内側から順に閉じる（h1〜h6 の終了タグは、パーサと同じく開いている見出しをどれでも閉じる。table 関係は table の中だけ、`</li>` は ol・ul の中だけ、それ以外は table・td・th の中だけを探す）。対応する開始タグが無い終了タグは捨てる。
+- `_sanitize`（L302-326）: 許可したタグ（空要素の終了タグを除く）は `_openTag`・`_closeTag` に渡す。許可しないタグ（文字列にする）と空要素の終了タグ（捨てる）は、修正コード3 のとおり `_sanitizeTag` で処理する。最後に `_closeFrom(stack, 0)` で、開いたままのタグをすべて閉じる。
+
+どう動くか（例）:
+- `<div>` → `<div></div>`、`<table><tr><td>` → `<table><tr><td></td></tr></table>`、`<span><div>` → `<span><div></div></span>`
+- `</div>`・`</td></tr></table>`・`<td>`・`<tr>`・`<li>`（リストの外）→ 空文字列（捨てる）
+- `<ul><li>a<li>b</ul>` → `<ul><li>a</li><li>b</li></ul>`、`<p>a<div>b</div>c</p>` → `<p>a</p><div>b</div>c`、`<table><td>x` → `<table><tr><td>x</td></tr></table>`
+- 上の (a) では、operation の description の `.markdown` の中身は `<div></div>` だけになり、パラメータの表は `.markdown` の外（テンプレートどおりの位置）に描画される。
+
+なぜこの方法にしたか:
+- 検証の記録の修正案（スタックで管理し、対応しない終了タグを捨て、最後に閉じる）を基本にした。ただ、それだけでは、HTML パーサが暗黙に閉じたり表の外へ移したりするタグ（表の部品・li・dd・dt・p・a・h1〜h6）で、パーサの開いた要素とスタックがずれる場合がある（例: テンプレートの `<td class="markdown">` の中の `<td>` は、そのセルを閉じる）。記録でも「念のため親子関係を検査するか、許可リストから外すとより確実」とされていたので、許可リストから外す（description の表やリストが文字として表示されてしまう）のではなく、パーサと同じ規則で先に閉じる・捨てるようにした。
+- ヘルパーからは、出力がテンプレートのどこに入るか（div・td・span・label・p・a・h2・option・textarea・属性値）は分からない。スタックの底より外を見ないといけない処理（リストの外の li など）は捨てるので、どの文脈でも出力が外側の要素を閉じない（p・a・h2 の中の場合は下の「副作用・残る点」）。
+- 根本的には、renderGFM で innerHTML を marked に通し直すのをやめ、仕様の元の文字列を marked で変換した後の HTML にサニタイザをかけるべきだが、SwaggerUi.js とテンプレートの変更になるので行わなかった。今回の変更はこのファイルの中だけで、どのテンプレートの文脈でも効く。外部ライブラリ（DOMPurify など）は、このコミットの lib/ に無いので使わなかった。
+
+#### 2. 最後の属性値が `/` で終わるタグは、`>` の前に空白を入れる（L124-127）
+
+```js
+return out + (out.charAt(out.length - 1) === '/' ? ' >' : '>');
+```
+
+- jQuery 1.8.0 の `.html()`/`.append()` は、文字列の `<a …/>` を `<a …></a>` に書き換える（rxhtmlTag。img・br・hr は対象外）。修正コード3 では、description の `<a href=/x/>link</a>` が `<a href=/x></a>link</a>` になり、リンク先が `/x` に変わってリンクの文字も a の外に出ていた（`t6.js` で確認）。修正コード4 では、この書き換えで a がその場で閉じられると、スタックで取った対応がずれる。`<a href=/x/ >` なら書き換えの正規表現に当たらず、ブラウザが読む属性値（`/x/`）も変わらない。
+
+#### 3. 先頭のコメントを補足した（L23-28）
+
+修正コード3 の先頭の説明（`【修正2】`・`【修正3】`）の後に、今回の変更の要約を `【修正4】` のコメントで足した。
+
+### 確認した内容と結果
+
+使ったもの: 同じコミット 14fad2b4 の `lib/jquery-1.8.0.min.js`・`lib/handlebars-4.0.5.js`・`lib/lodash.min.js`・`lib/marked.js`、`src/main/template/*.handlebars`（main・resource・operation・param・param_required・param_readonly・param_readonly_required・param_list・status_code・content_type・parameter_content_type・response_content_type）、`src/main/javascript/SwaggerUi.js`・`doc.js`・`utils/utils.js`・`view/*.js`・`view/partials/signature.js`、`src/main/html/index.html`、`gulpfile.js`、`.jshintrc`（`$R/dl/` に curl で取得）。`$R/bench/` に jsdom 16.7.0（2025 年の仕様変更より前の直列化）・jshint・acorn を、`$R/bench/new/` に jsdom 31.0.1（新しい直列化）を `npm install --ignore-scripts` で入れた（swagger 関係のパッケージは入っていない）。テストスクリプトは `$R/bench/env.js`（jsdom に上のライブラリと、引数で渡した handlebars.js を gulpfile と同じく `(function(){…}).call(this)` で包んで読み込み、テンプレートを compile して、MainView・ResourceView・OperationView・ParameterView・StatusCodeView と同じ順・同じ jQuery の `.html()`/`.append()` で描画し、SwaggerUi.renderGFM と同じ処理をする）と `t1.js`〜`t6.js`・`perf1.js`。比較のため、元のコード・修正コード1・修正コード2・修正コード3 も同じテストで動かした。
+
+1. 構文・静的検査
+   - `node --check`: 構文エラーなし。acorn（ecmaVersion 5）: OK（ES5 の範囲）。jshint（このコミットの .jshintrc。bitwise・quotmark single・undef・unused・strict など）: 警告なし（元のコード・修正コード3 も警告なし）。
+   - gulpfile.js は `src/main/javascript/**/*.js` を連結して 1 つの関数で包むので、追加した名前（`_specialTags`・`_closePTags`・`_headingTags`・`_scopeTags`・`_listScopeTags`・`_tableOnlyTags`・`_tableSectionTags`・`_tablePartTags`・`_maxDepth`・`_findOpen`・`_closeFrom`・`_findListItem`・`_openTag`・`_closeTag`）が、取得した他の src ファイルに出てこないことを確かめた（0 件）。
+2. 不備1 を再現した入力で直ったこと（`t1.js`）
+   - 検証の記録の (a)〜(e): 修正コード4 は 5 件とも、描画直後も renderGFM の後も危険なし、`.markdown` への取り込みなし。(a) の `.markdown` の中は `<div></div>` だけで、input は入らない（`sanitize('<div>')` は `"<div></div>"`）。
+   - 閉じないタグ 28 種 × 取り込む先 13 種 = 364 件: 修正コード3 は renderGFM の後に危険 50 件・取り込み 154 件 → 修正コード4 は危険 0 件・取り込み 0 件。jsdom 31.0.1 でも危険 0 件・取り込み 0 件。
+3. ランダムな description でテンプレートの構造が変わらないこと（`t2.js`）: 許可したタグの開始・終了（大文字や `/>` を含む）、許可しないタグ、文字、markdown の記号、文字参照を 1〜15 個つないだ description を、info・operation・successDescription・param・param_required・param_readonly・param_readonly_required の description に入れてページ全体を描画し、`.markdown` の中身を除いた DOM（テンプレートの骨組み）を、無害な description のときと比べた。さらに後ろの属性（default・x-data-*・enum 値・body の name・externalDocs・license・contact・termsOfServiceUrl）に攻撃の値を入れて renderGFM の後を調べた。
+   - 修正コード4: jsdom 16.7.0 で 3,000 件、jsdom 31.0.1 で 1,000 件とも、骨組みの変化 0 件・危険 0 件・取り込み 0 件・例外 0 件。
+   - 修正コード3（jsdom 16.7.0、同じ生成方法の 1,000 件）: 骨組みの変化 727 件（`.markdown` の数が変わったもの 332 件）、renderGFM の後に危険（`img@onerror`）134 件、取り込み 199 件、描画の例外（`Cannot read properties of null (reading 'lastChild')`）198 件。
+4. テンプレートの文脈ごとの構造（`t4.js` の A）: sanitize の出力を、テンプレートで使われている 10 の文脈（main の `div.markdown`、operation の `div.markdown`、tr の中の `td.markdown`、param_required の `<strong><span class="markdown">`、readOnly の default の td、name の label、ヘッダの description の td、externalDocs.description の p、resource の `<h2><a>name</a> : summary</h2>`、param_list の select の中の option（select は tr の中））に入れ、出力の後ろに置いた目印の要素がテンプレートどおりの親の下にあるかを調べた。tr の中の文脈は jQuery の `.html()` で tr に入れた（wrapMap の解析と同じ）。ランダムな入力 3,000 件（jsdom 31.0.1 では 1,000 件）× 10 文脈で、修正コード4 は崩れ 0 件（修正コード3 は jsdom 16.7.0 で文脈ごとに 886〜2,373 件、jsdom 31.0.1 で 266〜810 件）。
+5. 判定・修正コード1・修正コード2・修正コード3 で直した脆弱性が直ったままであること（`t3.js`。テンプレートで描画し、描画直後と renderGFM の後を調べ、入力欄の要素の属性と値も調べた）
+   - 判定の根拠・修正コード1（renderTextParam）8 件: default の `'` による value からの脱出（required を含め 2 件）、配列 default の `</textarea>`、allowMultiple の `</TEXTAREA >`、x-data-* の値・プロパティ名、`'><img …>`、name の `'`。
+   - 修正コード2 の「元の修正コードの不備」の不備1（sanitize の経路）25 件: required body の default の `</textarea>`（文字列・配列）、readOnly の body・非 body の default、readonly_required の svg、description の img・svg・javascript:・`&#x6A;avascript:`・`java&#x09;script:`・大文字・`=` の前後の空白・`` ` ``・iframe srcdoc・math/style・コメントで分割したタグ・`<!-->`・noscript、enum 値の `'`、param_list の name の `"`、param_readonly の name の `'`、jQuery の rxhtmlTag を使う 4 件。
+   - 修正コード2の検証の記録の不備1 ＝ 修正コード3 の説明の不備1（許可した属性値の `<` `>` による mutation XSS）: 6 入力 × 6 か所 = 36 件。
+   - 結果: 元のコードは 7/8・22/25・36/36 件で問題、修正コード1 は 0/8・22/25・36/36、修正コード2 は 0/8・0/25・36/36、修正コード3 は 0・0・0 → 修正コード4 も 0/8・0/25・0/36（jsdom 31.0.1 でも 0）。default の値は入力どおり（例: `x' autofocus onfocus=alert(document.domain) y='`）。
+6. 個別の確認（`t6.js`）
+   - 表のタグ 14 種 × tr の中の場所 5 種 = 70 件の描画: 元のコード〜修正コード3 は `</table>` の 5 件で TypeError → 修正コード4 は例外 0 件。
+   - description の `<a href=/x/>link</a> after`: 修正コード3 は描画後 `href=/x`・a の中身が空 → 修正コード4 は `href=/x/`・中身 `link`（renderGFM の後も同じ）。
+   - `<div>` を 150 個入れ子にした入力: 出力は `<div>` 100 個・`</div>` 100 個で対応が取れ、文字も残る。
+7. 境界値・ランダム入力・処理時間（`t4.js` の B・C・D、`perf1.js`）
+   - 境界値 58 件（undefined・null・数値・NaN・Infinity・真偽値・空文字・{}・[]・入れ子の配列・オブジェクト、`<` `>` `&` と閉じないタグ、NUL・孤立したサロゲート・U+FFFF、範囲外・0・サロゲートの数値参照、`&LT;`・`&lt`・ゼロ埋めの数値参照、コメントの境界、`<constructor>`・`<__proto__>`・`<toString>`・`</toString>`・`<hasOwnProperty>`、対応しない終了タグ、表の部品、リストの外の li・dd・dt、`<b>` の 4 重、見出しの入れ子、pre の改行など）: 例外 0 件。修正コード3 と出力が違ったのは 19 件で、どれもタグの対応を取ったことによるもの（上の「どう動くか」の例と、`[[1,"<b>"]]` → `1,<b></b>`、`<a constructor=x>` → `<a></a>`、`<a href=/x/>l</a>` → `<a href=/x/ >l</a>` など）。
+   - ランダム入力 20,000 件（許可したタグの開始・終了、許可しないタグ、文字、記号などの断片を 1〜25 個）: 例外 0 件、出力に引用符（`'` `"` `` ` ``）0 件、`a`・`img` の属性値に `<` `>` 0 件、修正コード3 の出力に無い開始タグ（補った `<tr>` を除く）0 件、出力のタグの対応が取れていないもの 0 件。div の中で解析したときの文字の内容は、修正コード3 と比べて、文字そのものが違うものは 0 件（392 件は表の直下の文字がパーサに表の外へ移されるときの並びだけ、15 件は `<pre>` の直後の改行をパーサが捨てるかどうかだけの違い）。jsdom 31.0.1 で別の 5,000 件でも、例外・引用符・属性値の `<` `>`・新しい開始タグ・対応の取れていないもの・文字そのものの違いはすべて 0 件だった（並びだけの違い 10 件、改行だけの違い 5 件）。
+   - 処理時間（約 20 万文字の 21 種。`<div>`・`</div>`・`<li>`・`<ul><li>`・`<table>`・`<td>`・`<table><tr><td>`・`<a href=x>`・`<p>`・`<b>`・`<span><div>`・`<dd><dt>`・`<h2><h3>`・`<div></span>`・`<!--`・`<!--x`・`<script`・閉じない `<a `＋空白・`title="&lt;"` の繰り返し・`&#`・`<b>x</b>` の繰り返し）: 修正コード4 はすべて 190 ms 以内（修正コード3 は 100 ms 以内）。`perf1.js` で 5 万〜40 万文字に伸ばしても、時間は入力の長さにほぼ比例した（例: `<p>` の繰り返しは 40 → 83 → 183 → 338 ms、`<div></span>` は 14 → 25 → 47 → 102 ms）。
+8. 正常な入力での動作（`t5.js`。petstore の説明文、markdown（太字・リスト・見出し・コードブロック）、`<br>`・`<p>`・`<ul>`・表・title 付きの a・alt/title 付きの img・mailto、文字参照、日本語、`<` `>` を含む平文、引用符を含む文、XML の例、class/style 付きの div、コメント、pre、content type、JSON、dl、見出し、blockquote、入れ子のリストなど 37 件 × description（renderGFM 後の `.markdown`）・enum の option・required body の textarea・renderTextParam の value/data-foo の 4 文脈と、renderTextParam の正常な入力 6 件）
+   - 修正コード3 と比べて: 33 件は 4 文脈とも同じ、renderTextParam は 6 件とも同じ。違う 4 件は、閉じタグを省いた HTML（`<ul><li>a<li>b</ul>`、`<p>a<p>b`、`<dl><dt>t1<dd>d1<dt>t2<dd>d2</dl>`）と、入れ子の崩れた `<b>bold <i>both</b> italic</i>`。前の 3 件は、description の表示（renderGFM 後の DOM）は同じで、option・textarea の文字列に閉じタグが補われるだけ。最後の 1 件は、表示で「 italic」が斜体でなくなる。
+   - 元のコードと比べて: 違いは、修正コード3 と元のコードの違い（修正コード1・修正コード2 の「副作用」のとおり）と、上の 4 件だけだった。
+
+### 副作用・残る点
+
+動作の変化（今回の変更によるもの）:
+- ヘルパーの出力は、いつもタグの対応が取れた形になる。description の表示（ブラウザが作る DOM）は、正しく閉じた HTML や、閉じタグを省いた li・p・dd・dt では変わらない。変わるのは次の崩れた HTML の場合だけ。
+  - 入れ子の崩れた書式タグ（`<b>x<i>y</b>z</i>`）: ブラウザは `z` も斜体にするが、修正コード4 では `</b>` の時点で i も閉じるので斜体にならない。
+  - ul・ol・dl の外の li・dd・dt、table の外の tbody・tr・td・th、table・tr などの直下の表以外のタグ、table の直下の table、対応する開始タグの無い終了タグ: タグを捨てる（中の文字は残る）。ブラウザも、表の外の td などは無視する。
+  - 100 段より深い入れ子: それより深い開始タグを捨てる。
+  - `<pre>` の直後に捨てたタグがあると、パーサが捨てる改行が変わることがある（改行 1 つの違い）。
+- required/readOnly の body param の textarea の default、enum 値（option の value と文字）、テンプレートが属性値の中で sanitize を使う箇所（name・id など）では、出力の文字列そのものが値になるので、閉じタグが補われたり、捨てたタグが無くなったりする（例: enum 値 `<b>x` は `<b>x</b>`、textarea の `<p>a<p>b` は `<p>a</p><p>b</p>`）。修正コード2 から、これらの文脈でも許可タグの整形やコメントの削除で値が変わっていたのと同じ種類の変化。本来はテンプレートを `{{{escape …}}}` にすべき（テンプレートの変更になるので行っていない）。
+- `<a href=/x/>` のように属性値が `/` で終わるタグは `<a href=/x/ >` と出力する（表示は同じ。修正コード3 で jQuery が href を `/x` に変えていたのが直る）。
+
+直していない点:
+- テンプレートの p・a・h2 の中で sanitize を使う箇所（main.handlebars L6 の externalDocs.description の `<p>`、resource.handlebars L3 の name の `<a>` と summary の `<h2>`）では、出力にブロック要素・見出し・a があると、HTML パーサがテンプレートの p・a・h2 を早く閉じる（元のコードからの挙動で、出力のタグの対応とは関係なく起きる）。後ろの要素が出力の中や `.markdown` に入ることはなく（`t4.js` の A で確認）、resource.handlebars には `.markdown` も無いので、XSS にはならない。
+- param_list の option の中（select は tr の中にある）で、enum 値に `<table>` があると、HTML パーサが select を閉じる（元のコードからの挙動。後ろの `td.markdown` が出力に取り込まれないことは `t4.js` の A で確認）。
+- 修正コード3 で属性値に `<` `>` を含む属性を捨てる変更（`<a href="/search?q=&lt;x&gt;">` のリンク先が無くなるなど）は、そのまま。
+- 修正コード2・修正コード3 の「副作用・残る点」と、検証の記録の指摘のうち、ヘルパーの外にあるものは今回も対象外: param_list.handlebars L17 の生の `{{{description}}}`（テンプレートを `{{{sanitize description}}}` にすべき）、marked（`sanitize: false`）による markdown の `[x](javascript:…)` のリンク（クリックが必要）、resource.handlebars L21 `href='{{{sanitize url}}}'` の `javascript:`（クリックが必要）、default・x-data-* が `{"toHTML": …}` のときの TypeError、属性値に空行があるときの古い直列化での表示の崩れ。根本的には、renderGFM で innerHTML を marked に通し直すのをやめ、仕様の元の文字列を marked で変換した後の HTML にサニタイザをかけるべき（SwaggerUi.js とテンプレートの変更が必要）。
+- 確認は jsdom（古い直列化の 16.7.0 と新しい直列化の 31.0.1）で行い、実際のブラウザでは試していない。
+
+### 修正コード4 の全文: src/main/javascript/helpers/handlebars.js
+
+```javascript
+'use strict';
+/*jslint eqeq: true*/
+
+// 【修正2】元の _sanitize は「<script>…</script> と一部の on属性 を正規表現で消す」ブラックリストで、
+// 引用符なしのイベント属性（onerror=alert(document.domain)）、= の前後の空白、svg/iframe などのタグ、
+// javascript: の URL、引用符（' "）による属性からの脱出、</textarea> による脱出などがすべて残っていた。
+// sanitize ヘルパーはテンプレートで default 値・description・enum 値・名前などの出力に使われている
+// （param_required.handlebars L9 の textarea、param_readonly*.handlebars、param.handlebars L32、
+//   param_list.handlebars L11 の value='…'、resource.handlebars の href='…' など）ため、
+// renderTextParam だけを直しても、同じ default 値・description から XSS が起きたままだった。
+// そこで _sanitize をホワイトリスト型のサニタイザに置き換えた。
+//   - 入力を「タグ」と「それ以外の文字列」に分け、文字列は < > " ' ` = と、文字参照になっていない & を
+//     実体参照にする（正しい形の文字参照 &amp; &lt; &#60; などは表示が変わらないようにそのまま残す）。
+//   - タグは _allowedTags にあるものだけを、タグ名を小文字にして組み立て直す。それ以外のタグ
+//     （script, svg, math, iframe, style, textarea, select, form など）は、文字列としてエスケープして表示する。
+//   - 属性は _allowedAttrs にあるもの（a の href/title、img の src/alt/title）だけを残し、on* や style は捨てる。
+//     href/src は http・https・（a だけ）mailto・相対 URL だけを許可する。
+//   - 残す属性値は引用符を使わずに出力し、英数字と URL で使う記号以外はすべて &#x..; にする。
+//     出力に ' " が含まれないので、テンプレートが value='…' value="…" name='…' href='…' などの
+//     引用符付きの属性の中でこのヘルパーを使っていても、属性から抜け出せない。
+// 【修正3】文字参照を戻した後の値に < > を含む属性は捨てる（description を renderGFM で marked に通し直すときの
+// mutation XSS を防ぐため。詳しくは _sanitizeTag のコメント）。コメントの除去を線形時間の処理に変えた（_stripComments）。
+// 【修正4】許可したタグの開始タグと終了タグの対応を、スタックで取るようにした（_openTag・_closeTag・_sanitize）。
+// 修正コード3 までは、閉じない <div> や <table><tr><td>、対応する開始タグの無い </div> などをそのまま出していたので、
+// description の中のタグが、テンプレートで後に続く要素（renderTextParam の input、externalDocs・license の <a href="…"> など）を
+// class="markdown" の要素の中に取り込み、renderGFM がそれを marked に通し直すときに、その属性値の < > から mutation XSS が起きていた。
+// 今は、ヘルパーの出力の中でタグが必ず閉じられ、HTML パーサが暗黙に閉じたり外へ移したりするタグも先に明示的に閉じるので、
+// 出力がテンプレートの外側の要素を閉じたり、後に続く要素を取り込んだりすることはない。
+var _has = function(obj, key) {
+    return Object.prototype.hasOwnProperty.call(obj, key);
+};
+
+var _allowedTags = {
+    a: true, b: true, blockquote: true, br: true, code: true, dd: true, del: true, div: true,
+    dl: true, dt: true, em: true, h1: true, h2: true, h3: true, h4: true, h5: true, h6: true,
+    hr: true, i: true, img: true, kbd: true, li: true, ol: true, p: true, pre: true, s: true,
+    small: true, span: true, strike: true, strong: true, sub: true, sup: true, table: true,
+    tbody: true, td: true, tfoot: true, th: true, thead: true, tr: true, u: true, ul: true
+};
+var _voidTags = { br: true, hr: true, img: true };
+var _allowedAttrs = {
+    a: { href: 'url', title: 'text' },
+    img: { src: 'url', alt: 'text', title: 'text' }
+};
+var _textEscapes = { '<': '&lt;', '>': '&gt;', '"': '&quot;', '\'': '&#x27;', '`': '&#x60;', '=': '&#x3D;' };
+var _namedEntities = { amp: '&', lt: '<', gt: '>', quot: '"', apos: '\'' };
+
+// 【修正2】タグ以外の文字列のエスケープ
+var _escapeText = function(text) {
+    return text
+        .replace(/&(?!(?:[a-zA-Z][a-zA-Z0-9]{0,31}|#[0-9]{1,7}|#[xX][0-9a-fA-F]{1,6});)/g, '&amp;')
+        .replace(/[<>"'`=]/g, function(c) {
+            return _textEscapes[c];
+        });
+};
+
+// 【修正2】属性値の文字参照を戻す（数値参照と amp/lt/gt/quot/apos）。戻した値を検査し、出力するときは
+// & も含めて符号化し直すので、ブラウザが受け取る属性値は、ここで検査した値と必ず同じになる。
+var _decodeEntities = function(value) {
+    return value.replace(/&(?:#([0-9]{1,7})|#[xX]([0-9a-fA-F]{1,6})|(amp|lt|gt|quot|apos));/g, function(m, dec, hex, named) {
+        var code;
+        if (named) {
+            return _namedEntities[named];
+        }
+        code = dec ? parseInt(dec, 10) : parseInt(hex, 16);
+        if (code === 0 || code > 0x10FFFF || (code >= 0xD800 && code <= 0xDFFF)) {
+            return '�';
+        }
+        if (code > 0xFFFF) {
+            code -= 0x10000;
+            return String.fromCharCode(0xD800 + Math.floor(code / 0x400), 0xDC00 + code % 0x400);
+        }
+        return String.fromCharCode(code);
+    });
+};
+
+// 【修正2】属性値を引用符なしで出力するための符号化（英数字・URL で使う記号・非 ASCII 文字以外は &#x..; にする。
+// 空白・' " ` = < > & はすべて符号化されるので、属性値の外に出られない）
+var _encodeAttr = function(value) {
+    return value.replace(/[^A-Za-z0-9_.\-:\/?#%~+,;@!$()*\[\]\u0080-￿]/g, function(c) {
+        return '&#x' + c.charCodeAt(0).toString(16) + ';';
+    });
+};
+
+// 【修正2】URL の検査。ブラウザの URL 解析は先頭・末尾の制御文字と空白、途中のタブ・改行を無視するので、
+// 制御文字と空白をすべて除いてから scheme を調べる（java\tscript: なども javascript: として扱う）。
+var _isSafeUrl = function(url, tag) {
+    var scheme = url.replace(/[\u0000- ]/g, '').match(/^([a-zA-Z][a-zA-Z0-9+.\-]*):/);
+    if (!scheme) {
+        return true; // scheme のない相対 URL（#…、/…、//host/… など）
+    }
+    scheme = scheme[1].toLowerCase();
+    return scheme === 'http' || scheme === 'https' || (tag === 'a' && scheme === 'mailto');
+};
+
+// 【修正2】許可したタグだけを組み立て直す。許可しないタグは、文字列としてエスケープする。
+var _sanitizeTag = function(source, slash, name, attrs) {
+    var tag = name.toLowerCase();
+    var allowedAttrs, out;
+    if (!_has(_allowedTags, tag)) {
+        return _escapeText(source);
+    }
+    if (slash) {
+        return _has(_voidTags, tag) ? '' : '</' + tag + '>';
+    }
+    allowedAttrs = _has(_allowedAttrs, tag) ? _allowedAttrs[tag] : {};
+    out = '<' + tag;
+    attrs.replace(/([^\s"'<>\/=]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'<>`=]+)))?/g, function(m, attrName, v1, v2, v3) {
+        var key = attrName.toLowerCase();
+        var value = _decodeEntities(v1 || v2 || v3 || '');
+        // 【修正3】文字参照を戻した後の値に < か > を含む属性は捨てる。
+        // _encodeAttr で符号化しても、ブラウザが属性値を解析すると < > に戻る。2025 年の HTML 仕様の変更より前の
+        // ブラウザは、innerHTML の直列化で属性値の < > を &lt; &gt; にしないので、SwaggerUi.js の renderGFM が
+        // $(this).html(marked($(this).html())) で description を marked に通し直すとき、属性値の中の < > が生のまま渡る。
+        // marked は空行・見出し・リスト・コードスパン（`）などで属性値の途中から区切り、残りの <img src=x onerror=…> を
+        // 生の HTML として出力していた（mutation XSS）。属性値に < > が無ければ、直列化した HTML の中の生の < は
+        // 許可したタグの先頭だけ、> はそのタグの終わりだけになり、marked が新しいタグを作ることはできない。
+        if (_has(allowedAttrs, key) && value !== '' && !/[<>]/.test(value) &&
+            (allowedAttrs[key] !== 'url' || _isSafeUrl(value, tag))) {
+            out += ' ' + key + '=' + _encodeAttr(value);
+        }
+        return m;
+    });
+    // 【修正4】最後の属性値が / で終わるとき（<a href=/x/> など）は、> の前に空白を入れる。jQuery 1.8.0 の .html()/.append() は
+    // 「<a …/>」を「<a …></a>」に書き換える（rxhtmlTag）ので、そのままだと a がその場で閉じられて href の値も変わり、
+    // 下の _openTag・_closeTag で取ったタグの対応がずれる。空白を入れても、ブラウザが読む属性値（/x/）は変わらない。
+    return out + (out.charAt(out.length - 1) === '/' ? ' >' : '>');
+};
+
+// 【修正3】HTML コメント <!--…--> を取り除く。修正コード2 の正規表現 /<!--[\s\S]*?-->/g は、閉じない <!-- ごとに
+// 文字列の末尾まで --> を探し直すため、"<!--" の繰り返しで入力の長さの 2 乗の時間がかかっていた（約 20 万文字で数秒）。
+// indexOf で先頭から 1 回だけ走査する形に変えた。結果は元の正規表現と同じ（<!-- の後で最初に見つかる --> までを消す。
+// 閉じない <!-- があれば、その後ろに --> は無いので、そこから後はそのまま残す）。
+var _stripComments = function(html) {
+    var out = '';
+    var pos = 0;
+    var start, end;
+    for (;;) {
+        start = html.indexOf('<!--', pos);
+        if (start === -1) {
+            break;
+        }
+        end = html.indexOf('-->', start + 4);
+        if (end === -1) {
+            break;
+        }
+        out += html.substring(pos, start);
+        pos = end + 3;
+    }
+    return out + html.substring(pos);
+};
+
+// 【修正4】タグの対応を取るための表（どれも許可したタグの中だけ）。
+// HTML パーサの「special」に当たるタグ（空要素を除く）。li・dd・dt の開始タグで、閉じる相手を探すのをここで止める（div・p を除く）。
+var _specialTags = {
+    blockquote: true, dd: true, div: true, dl: true, dt: true, h1: true, h2: true, h3: true, h4: true, h5: true, h6: true,
+    li: true, ol: true, p: true, pre: true, table: true, tbody: true, td: true, tfoot: true, th: true, thead: true, tr: true, ul: true
+};
+// 開始タグで、開いている p をパーサが暗黙に閉じるタグ
+var _closePTags = {
+    blockquote: true, dd: true, div: true, dl: true, dt: true, h1: true, h2: true, h3: true, h4: true, h5: true, h6: true,
+    hr: true, li: true, ol: true, p: true, pre: true, table: true, ul: true
+};
+var _headingTags = { h1: true, h2: true, h3: true, h4: true, h5: true, h6: true };
+var _scopeTags = { table: true, td: true, th: true };                     // スコープの境界（終了タグや p を探すのを、ここで止める）
+var _listScopeTags = { ol: true, table: true, td: true, th: true, ul: true }; // </li> のときのスコープの境界
+var _tableOnlyTags = { table: true, tbody: true, tfoot: true, thead: true, tr: true }; // 直下に表の構造のタグしか置けない要素
+var _tableSectionTags = { tbody: true, tfoot: true, thead: true };
+var _tablePartTags = { tbody: true, td: true, tfoot: true, th: true, thead: true, tr: true };
+var _maxDepth = 100; // 入れ子の深さの上限（スタックを探す時間を一定以下にして、処理時間を入力の長さに比例させる）
+
+// 【修正4】スタックの上から names のタグを探して、その位置を返す。stops のタグに先に当たったときと、見つからないときは -1。
+// スタックには _allowedTags で確かめた小文字のタグ名しか入らないので、_has ではなく「=== true」で調べる
+// （constructor などのプロトタイプの名前でも true にはならない。_has より速く、深い入れ子での処理時間を抑えられる）。
+var _findOpen = function(stack, names, stops) {
+    var i;
+    for (i = stack.length - 1; i >= 0; i--) {
+        if (names[stack[i]] === true) {
+            return i;
+        }
+        if (stops[stack[i]] === true) {
+            return -1;
+        }
+    }
+    return -1;
+};
+
+// 【修正4】スタックの index の位置から上の要素を、内側から順に閉じる終了タグを返す。
+var _closeFrom = function(stack, index) {
+    var out = '';
+    while (stack.length > index) {
+        out += '</' + stack.pop() + '>';
+    }
+    return out;
+};
+
+// 【修正4】li・dd・dt の開始タグのとき、パーサと同じく、スタックの上から同じ種類のタグを探す。見つかればその位置を、
+// div・p 以外の special のタグに先に当たれば -1（閉じずに開く）を返す。スタックの底まで当たらないときは -2 を返す
+// （パーサはテンプレート側の要素まで探し、外側の li などを閉じてしまうので、このタグは捨てる）。
+var _findListItem = function(stack, names) {
+    var i;
+    for (i = stack.length - 1; i >= 0; i--) {
+        if (_has(names, stack[i])) {
+            return i;
+        }
+        if (_has(_specialTags, stack[i]) && stack[i] !== 'div' && stack[i] !== 'p') {
+            return -1;
+        }
+    }
+    return -2;
+};
+
+// 【修正4】許可したタグの開始タグを出力する。HTML パーサが暗黙に要素を閉じる場合は、先に終了タグを明示的に出し、
+// パーサが無視したり外へ移したりするタグは捨てる。これでパーサが作る要素の入れ子は、スタックと同じになる。
+var _openTag = function(stack, tag, html) {
+    var out = '';
+    var top = stack.length ? stack[stack.length - 1] : '';
+    var i;
+    if (!_has(_voidTags, tag) && stack.length >= _maxDepth) {
+        return '';
+    }
+    if (_has(_tablePartTags, tag)) {
+        // tbody・thead・tfoot・tr・td・th は、この出力の中で開いた table の中だけで使える。table が無いときに出すと、
+        // パーサは無視するか、テンプレートの td（param.handlebars の <td class="markdown"> など）を閉じてしまうので捨てる。
+        i = _findOpen(stack, { table: true }, {});
+        if (i === -1) {
+            return '';
+        }
+        i += 1;
+        if (!_has(_tableSectionTags, tag)) {
+            if (_has(_tableSectionTags, stack[i])) {
+                i += 1;
+            }
+            if (tag !== 'tr') {
+                if (stack[i] === 'tr') {
+                    i += 1;
+                } else {
+                    // tr の無い td・th は、パーサと同じく tr を補う
+                    out = _closeFrom(stack, i) + '<tr>';
+                    stack.push('tr');
+                    i = stack.length;
+                }
+            }
+        }
+        // パーサが暗黙に閉じる td・tr・tbody などを、先に明示的に閉じる
+        out += _closeFrom(stack, i);
+    } else if (_has(_tableOnlyTags, top)) {
+        // table・tbody・tr などの直下の、表の構造以外のタグ（パーサが表の外へ移す、または表を閉じる）は捨てる
+        return '';
+    } else {
+        if (tag === 'li' || tag === 'dd' || tag === 'dt') {
+            i = _findListItem(stack, tag === 'li' ? { li: true } : { dd: true, dt: true });
+            if (i === -2) {
+                return '';
+            }
+            if (i !== -1) {
+                out += _closeFrom(stack, i);
+            }
+        }
+        if (_has(_closePTags, tag)) {
+            i = _findOpen(stack, { p: true }, _scopeTags);
+            if (i !== -1) {
+                out += _closeFrom(stack, i);
+            }
+        }
+        if (_has(_headingTags, tag) && _has(_headingTags, stack[stack.length - 1] || '')) {
+            out += _closeFrom(stack, stack.length - 1);
+        }
+        if (tag === 'a') {
+            // a の中の a は、パーサが外側の a を閉じる（td・th の中は別）
+            i = _findOpen(stack, { a: true }, { td: true, th: true });
+            if (i !== -1) {
+                out += _closeFrom(stack, i);
+            }
+        }
+    }
+    if (!_has(_voidTags, tag)) {
+        stack.push(tag);
+    }
+    return out + html;
+};
+
+// 【修正4】許可したタグの終了タグを出力する。対応する開始タグがスコープの中に開いているときだけ、その要素までを内側から順に閉じる。
+// 対応する開始タグが無い終了タグは捨てる（テンプレートの </div> や </td> を、ヘルパーの出力が閉じることはない）。
+var _closeTag = function(stack, tag) {
+    var names = {};
+    var i;
+    names[tag] = true;
+    if (_has(_headingTags, tag)) {
+        // h1〜h6 の終了タグは、パーサと同じく、開いている見出しをどれでも閉じる
+        i = _findOpen(stack, _headingTags, _scopeTags);
+    } else if (tag === 'table' || _has(_tablePartTags, tag)) {
+        i = _findOpen(stack, names, { table: true });
+    } else if (tag === 'li') {
+        i = _findOpen(stack, names, _listScopeTags);
+    } else {
+        i = _findOpen(stack, names, _scopeTags);
+    }
+    return i === -1 ? '' : _closeFrom(stack, i);
+};
+
+var _sanitize = function(html) {
+    // 【修正4】この出力の中で開いている、許可したタグ（外側から順）
+    var stack = [];
+    var out;
+    // 【修正2】文字列以外（真偽値など）も文字列にしてから処理する（元は真偽値で「html.replace is not a function」の TypeError になっていた）。
+    // コメントは先に取り除く（取り除いた後の文字列も、下のホワイトリストを必ず通る）。
+    // 【修正3】コメントの除去は、上の _stripComments（線形時間）で行う。
+    html = _stripComments(String(html));
+    // 【修正2】先頭から「タグ」「< を含まない文字列」「単独の <」のどれかとして読み、全部の文字を必ずどれかで処理する。
+    out = html.replace(/<(\/?)([a-zA-Z][a-zA-Z0-9]*)((?:[\s\/][^<>]*)?)>|[^<]+|</g, function(m, slash, name, attrs) {
+        var tag;
+        if (name) {
+            // 【修正4】許可したタグ（空要素の終了タグを除く）は、スタックでタグの対応を取ってから出力する。
+            // 許可しないタグ（文字列にする）と、空要素の終了タグ（捨てる）は、これまでどおり _sanitizeTag で処理する。
+            tag = name.toLowerCase();
+            if (_has(_allowedTags, tag) && !(slash && _has(_voidTags, tag))) {
+                return slash ? _closeTag(stack, tag) : _openTag(stack, tag, _sanitizeTag(m, slash, name, attrs));
+            }
+            return _sanitizeTag(m, slash, name, attrs);
+        }
+        return _escapeText(m);
+    });
+    // 【修正4】入力の最後で、開いたままのタグをすべて閉じる（後に続くテンプレートの要素を取り込まないように）。
+    return out + _closeFrom(stack, 0);
+};
+
+var sanitize =function (html) {
+    var _html;
+    if( _.isUndefined(html) || _.isNull(html) || _.isNumber(html))  {
+        return new Handlebars.SafeString(html);
+    }
+
+    if (_.isObject(html)){
+        _html = JSON.stringify(html);
+        // 【修正2】JSON の文字列のまま _sanitize に通すと、" のエスケープで JSON が壊れて JSON.parse できず、
+        // また元のように JSON の文字列を消すだけの処理では、配列の要素などに入れた攻撃の文字列が残る。
+        // 元のコードは JSON.parse で戻したオブジェクトを SafeString にして、文字列連結（'' + オブジェクト）で
+        // 出力していたので、先に同じ文字列にしてから _sanitize に通す（表示される文字列は元と同じ形になる）。
+        return new Handlebars.SafeString(_sanitize('' + JSON.parse(_html)));
+    }
+
+    return new Handlebars.SafeString(_sanitize(html));
+};
+
+Handlebars.registerHelper('sanitize', sanitize);
+
+Handlebars.registerHelper('renderTextParam', function(param) {
+    var result, type = 'text', idAtt = '';
+    var paramType = param.type || param.schema && param.schema.type || '';
+    var isArray = paramType.toLowerCase() === 'array' || param.allowMultiple;
+    var defaultValue = isArray && Array.isArray(param.default) ? param.default.join('\n') : param.default;
+    var name = Handlebars.Utils.escapeExpression(param.name);
+    var valueId = Handlebars.Utils.escapeExpression(param.valueId);
+    paramType = Handlebars.Utils.escapeExpression(paramType);
+
+    var dataVendorExtensions = Object.keys(param).filter(function(property) {
+        // filter X-data- properties
+        // 【修正】属性名に使うプロパティ名は英数字・ハイフン・アンダースコアだけに限定する（属性名からの脱出を防ぐ）
+        return property.match(/^X-data-[A-Za-z0-9_-]+$/i) !== null;
+    }).reduce(function(result, property) {
+        // remove X- from property name, so it results in html attributes like data-foo='bar'
+        // 【修正】属性値 param[property] を escapeExpression でエスケープしてから連結する（' " < > & ` = を実体参照に変換）
+        return result += ' ' + property.substring(2, property.length) + '=\'' + Handlebars.Utils.escapeExpression(param[property]) + '\'';
+    }, '');
+
+    if(param.format && param.format === 'password') {
+        type = 'password';
+    }
+
+    if(valueId) {
+        idAtt = ' id=\'' + valueId + '\'';
+    }
+
+    // 【修正】default 値は HTML として表示する必要がないため、不十分な sanitize() ではなく escapeExpression でエスケープする。
+    // これで value='…' 属性からの脱出（'）や </textarea> によるタグ挿入ができなくなる。
+    // 【修正2】sanitize() はホワイトリスト型に直したが、HTML として表示するためのもの（許可したタグや文字参照を残す）なので、
+    // 値を入力どおりに表示する default 値には、ここは escapeExpression のままにする。
+    defaultValue = Handlebars.Utils.escapeExpression(defaultValue);
+
+    if(isArray) {
+        result = '<textarea class=\'body-textarea' + (param.required ? ' required' : '') + '\' name=\'' + name + '\'' + idAtt + dataVendorExtensions;
+        result += ' placeholder=\'Provide multiple values in new lines' + (param.required ? ' (at least one required).' : '.') + '\'>';
+        result += defaultValue + '</textarea>';
+    } else {
+        var parameterClass = 'parameter';
+        if(param.required) {
+          parameterClass += ' required';
+        }
+        result = '<input class=\'' + parameterClass + '\' minlength=\'' + (param.required ? 1 : 0) + '\'';
+        result += ' name=\'' + name +'\' placeholder=\'' + (param.required ? '(required)' : '') + '\'' + idAtt + dataVendorExtensions;
+        result += ' type=\'' + type + '\' value=\'' + defaultValue + '\'/>';
+    }
+    return new Handlebars.SafeString(result);
+});
+
+Handlebars.registerHelper('ifCond', function (v1, operator, v2, options) {
+
+    switch (operator) {
+        case '==':
+            return (v1 == v2) ? options.fn(this) : options.inverse(this);
+        case '===':
+            return (v1 === v2) ? options.fn(this) : options.inverse(this);
+        case '<':
+            return (v1 < v2) ? options.fn(this) : options.inverse(this);
+        case '<=':
+            return (v1 <= v2) ? options.fn(this) : options.inverse(this);
+        case '>':
+            return (v1 > v2) ? options.fn(this) : options.inverse(this);
+        case '>=':
+            return (v1 >= v2) ? options.fn(this) : options.inverse(this);
+        case '&&':
+            return (v1 && v2) ? options.fn(this) : options.inverse(this);
+        case '||':
+            return (v1 || v2) ? options.fn(this) : options.inverse(this);
+        default:
+            return options.inverse(this);
+    }
+});
+
+Handlebars.registerHelper('escape', function (value) {
+    var text = Handlebars.Utils.escapeExpression(value);
+
+    return new Handlebars.SafeString(text);
+});
+```
+
+---
