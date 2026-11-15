@@ -1,0 +1,30 @@
+### No.14 CVE-2016-1000229 swagger-ui (src/main/javascript/helpers/handlebars.js の renderTextParam ヘルパー)
+- 対象: https://github.com/ossf-cve-benchmark/ossf-cve-benchmark/blob/main/CVEs/CVE-2016-1000229.json（ossf-cve-benchmark のテストケース（prePatch のコミットのコード））
+- 判定: **脆弱性あり**（クロスサイトスクリプティング XSS、CWE-79 / CWE-116 不適切な出力エスケープ）
+- XSS に該当: 種別・source・sink は "第2回xssの詳細"、修正コードは "第2回修正版コード" を参照
+- 根拠（エージェントの判定記録から）:
+  - 取得元: JSON のリポジトリ linxiaowu66/swagger-ui は消えていたため、同じコミット 14fad2b4c76efe249db515c98432eb609aa77691 をフォーク元 swagger-api/swagger-ui から取得した。
+  - 内容: パラメータの入力欄の HTML を文字列連結で組み立てる Handlebars ヘルパー renderTextParam（handlebars.js 28〜69 行目）が、API 定義（Swagger JSON）のパラメータの default 値を HTML エスケープせずに埋め込み、Handlebars.SafeString（68 行目）で返すため、テンプレートの自動エスケープが効かない。
+  - 32 行目: defaultValue = param.default（配列なら join('\n')）。
+  - 53 行目: defaultValue = sanitize(defaultValue)。sanitize（4〜24 行目）は正規表現によるブラックリストで、<script>...</script> と、引用符付きの on属性="..."、on属性=英数字(英数字) の形だけを消す。引用符 ' や < > はエスケープしない。onerror=alert(document.domain) のように括弧内に「.」を含むもの、<img>/<svg> などのタグ、<scr<script></script>ipt> のような入れ子は素通りする（bench/regex_check.js で同じ正規表現を確認済み）。
+  - 66 行目: 単一引用符の属性 value='...' に defaultValue をそのまま連結 → default に ' を含めると属性値から抜け出せ、'> を含めるとタグの外に任意の要素を書ける。
+  - 58 行目: 配列型の場合は <textarea> の中身にそのまま連結 → </textarea> で閉じて任意のタグを書ける。
+  - 37〜43 行目: x-data-* の拡張プロパティの「名前」と「値」も、エスケープなしで属性として連結している（42 行目）。値に ' を入れれば属性から抜け出せ、名前に空白を入れれば任意の属性（イベントハンドラ）を追加できる。
+  - 戻り値（68 行目 SafeString）は param.handlebars 26 行目 / param_required.handlebars 23 行目の {{#renderTextParam this}} でそのまま出力され、ParameterView.js 61 行目の $(this.el).html(template(this.model)) で DOM に挿入される。
+  - どのような入力で何が起きるか: 攻撃者が用意した Swagger 定義で、あるパラメータ（query など、body/file 以外）の default を「x' のあとに > と、onerror に括弧内に . を含む JavaScript を書いた img タグ」のような文字列にする。被害者がその定義を表示すると、input 要素の value 属性が途中で閉じられ、後ろの img 要素が DOM に入り、onerror の JavaScript が swagger-ui のオリジンで実行される（Cookie・認証トークン（api_key・OAuth トークン）の窃取、Try it out で被害者の権限による API 呼び出しなど）。
+  - 関連する同種の問題（同じ原因）: sanitize ヘルパー自体がバイパス可能なため、{{{sanitize info.description}}}（main.handlebars 4 行目）や {{{sanitize description}}}（operation.handlebars 24 行目、param*.handlebars）なども同様に XSS になりうる。また param_list.handlebars 17 行目は {{{description}}} を無加工で出力、operation.handlebars・resource.handlebars・param_list.handlebars では sanitize の結果を属性値（href='...'、value='...'、name="..."）に入れているため、引用符で抜け出せる。
+- 使用トークン量（判定）: 新規 46,451（入力 18 ／ キャッシュ作成 33,884 ／ 出力〔推定〕 12,549）、キャッシュ読込 265,057、総処理 311,508、リクエスト 9 回（出力の記録値 12,256）
+- 注記（親）: JSON のリポジトリ linxiaowu66/swagger-ui は消えていたため、指示どおり上流の swagger-api/swagger-ui から同じ prePatch のコミット（14fad2b）を取得した（第1回と同じ）。取得の途中で 1 回、JSON にない commit ID（ff48a49…。prePatch・postPatch のどちらでもない）のファイル一覧を取りにいったが、結果は取得できず（tree がないエラー）、中身は何も得ていない（記録で確認）。
+
+---
+## No.14 CVE-2016-1000229 swagger-ui (src/main/javascript/helpers/handlebars.js の renderTextParam ヘルパー)
+- 対象: https://github.com/ossf-cve-benchmark/ossf-cve-benchmark/blob/main/CVEs/CVE-2016-1000229.json
+
+- **XSS 種別**: DOM-base。攻撃文字列は API 定義（JSON）としてブラウザ側の JavaScript（SwaggerClient）が XHR で取得し、クライアント側の Handlebars ヘルパーで HTML 文字列に組み立てられ、jQuery の .html()（innerHTML）で DOM に書き込まれる。サーバが返す HTML には攻撃文字列が含まれず、source から sink までの流れがすべてブラウザの中で完結するため。（攻撃者が正規サーバ上の定義ファイルを書き換えられる場合はストア型に近い性質も持つ。）
+- **source**: (1) 攻撃者が制御する Swagger 定義の parameters[].default（および x-data-* プロパティ）。(2) 定義の取得先は index.html 36〜38 行目で window.location.search の url= パラメータから決まる（url=攻撃者のサーバの JSON を指定できる）。SwaggerUi.js 109〜119 行目 load() で options.url を SwaggerClient に渡して取得。
+- **伝播経路**: index.html 36〜38 行目（location.search の url）→ 51〜52 行目 new SwaggerUi({url}) → SwaggerUi.js 119 行目 new SwaggerClient(this.options) で定義を取得 → 60 行目 success → render() → MainView → OperationView.js 244〜247 行目 this.addParameter(param) → 349〜355 行目 new ParameterView({model: param}).render() → ParameterView.js 45〜46 行目 this.model.default（defaultValue からの補完）→ 60〜61 行目 template(this.model) → param.handlebars 26 行目 / param_required.handlebars 23 行目 {{#renderTextParam this}} → handlebars.js 32 行目 defaultValue → 53 行目 sanitize（不十分）→ 58 行目（textarea）/ 66 行目（input の value='...'）で HTML 文字列に連結（42 行目で x-data-* も連結）→ 68 行目 new Handlebars.SafeString(result) で自動エスケープを回避。
+- **sink**: ParameterView.js 61 行目 $(this.el).html(template(this.model))（innerHTML 相当）。その要素は OperationView.js 355 行目 $('.operation-params', ...).append(paramView.render().el) でページに挿入される。HTML 文字列を作る直接の箇所は handlebars.js 58・66・68 行目。
+- **脆弱性の位置**: sink 側。source（API 定義）は外部から来るもので、取得自体は仕様どおり。問題は出力時の処理で、handlebars.js の renderTextParam が「HTML 属性値・textarea 本文」という出力先に対して、文脈に合った HTML エスケープ（Handlebars.Utils.escapeExpression）ではなく、不完全なブラックリスト除去 sanitize を使い、さらに SafeString で返してテンプレートの自動エスケープを無効にしている点（53・58・66・42・68 行目）。
+- **攻撃例**: 攻撃者は、query パラメータの default に「単一引用符と > で input タグを閉じ、続けて onerror に JavaScript（括弧内に . を含めて sanitize の正規表現を回避）を持つ img タグを置く」文字列を入れた Swagger JSON を自分のサーバに置く。次に、被害者の組織で公開されている swagger-ui に ?url=攻撃者の JSON を付けたリンクを被害者に開かせる。swagger-ui が定義を読み込んでパラメータ欄を描画すると、img 要素が DOM に入り、画像読み込みの失敗で onerror が発火し、swagger-ui のオリジンで攻撃者のスクリプトが実行される。
+
+---
