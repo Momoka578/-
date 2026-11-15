@@ -1,0 +1,27 @@
+### No.12 adamdoupe/WackoPicko website/test.php
+- 対象: https://github.com/adamdoupe/WackoPicko/blob/master/website/test.php（GitHub のコード（第1回で取得したときのコミットに固定））
+- 判定: **脆弱性あり**（反射型クロスサイトスクリプティング・CWE-79）
+- XSS に該当: 種別・source・sink は "第2回xssの詳細"、修正コードは "第2回修正版コード" を参照
+- 根拠（エージェントの判定記録から）:
+  - 根拠: website/test.php は GET パラメータ head・title・href・script（2〜5 行目）を、検証もエスケープもせずに 4 か所でそのまま HTML に echo している。
+  -  - 8 行目: <head> 要素の中に $head をそのまま出力。?head= に <script> 要素などを渡すと、そのままタグとして解釈され JavaScript が実行される。
+  -  - 8 行目: <title> 要素の中に $title をそのまま出力。?title= に </title> で要素を閉じる文字列を渡すと、その後に任意のタグを差し込める。
+  -  - 10 行目: <a href="http://..."> の属性値（ダブルクォート内）に $href をそのまま出力。?href= に " を含めると属性から抜け出して onmouseover などのイベントハンドラ属性を追加したり、> でタグを閉じて新しい要素を差し込める。
+  -  - 12 行目: <script> ブロックの中に $script をそのまま出力。?script= に渡した文字列がそのまま JavaScript として実行される（タグの差し込みすら不要）。
+  -  認証・CSRF トークン・入力検証は一切なく、細工した URL を開かせるだけで、被害者のブラウザ上でこのサイトのオリジンとして任意のスクリプトが動く（Cookie の窃取、なりすまし操作など）。
+  -  なお、パラメータが無い場合は未定義インデックスの Notice が出る（情報露出の軽微な問題）が、主たる脆弱性は上記の XSS である。
+- 使用トークン量（判定）: 新規 4,386（入力 4 ／ キャッシュ作成 2,405 ／ 出力〔推定〕 1,977）、キャッシュ読込 38,034、総処理 42,420、リクエスト 2 回（出力の記録値 2,031）
+
+---
+## No.12 adamdoupe/WackoPicko website/test.php
+- 対象: https://github.com/adamdoupe/WackoPicko/blob/master/website/test.php
+
+- **XSS 種別**: 反射型。リクエストの GET パラメータがサーバー側で保存されずに、同じリクエストのレスポンスにそのまま埋め込まれて返るため。
+- **source**: 2 行目 $_GET['head']、3 行目 $_GET['title']、4 行目 $_GET['href']、5 行目 $_GET['script']（いずれも URL のクエリ文字列）
+- **伝播経路**: $_GET['head'] → $head（2 行目）→ echo（8 行目）／ $_GET['title'] → $title（3 行目）→ echo（8 行目）／ $_GET['href'] → $href（4 行目）→ echo（10 行目）／ $_GET['script'] → $script（5 行目）→ echo（12 行目）。途中で変換・検証は一切ない。
+- **sink**: 8 行目 <head> 内の echo $head（HTML 本文の文脈）、8 行目 <title> 内の echo $title（RCDATA の文脈）、10 行目 <a href="http://..."> の echo $href（引用符付き属性値・URL の文脈）、12 行目 <script> 内の echo $script（JavaScript の文脈）
+- **脆弱性の位置**: sink 側。2〜5 行目の source で入力を受け取ること自体は問題ではなく、8・10・12 行目で出力先の文脈に応じたエスケープ（HTML エスケープ・URL エンコード・JS 文字列化）をせずに出力していることが原因。特に 12 行目は、外部入力をスクリプトのコードとしてそのまま埋め込む設計自体が誤り。
+- **攻撃例**: 攻撃者は、script パラメータに Cookie を外部へ送る JavaScript を入れた test.php への URL（または head・title・href に script 要素やイベントハンドラ属性を差し込む URL）を作り、メールや掲示板で被害者にクリックさせる。被害者のブラウザはこのサイトのページとしてその JavaScript を実行し、セッション Cookie が攻撃者に送られて、なりすましが可能になる。
+  - 修正案の方向: 8・10 行目は htmlspecialchars(ENT_QUOTES, UTF-8) でエスケープ（href はさらに rawurlencode 等で URL として扱う）、12 行目は入力をコードとして出力せず json_encode で JS の文字列リテラルとして埋め込む。
+
+---
