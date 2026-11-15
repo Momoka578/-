@@ -1,0 +1,21 @@
+### No.3 SARD 501368 SubmissionController.java（同梱: select-collection.jsp / SelectCollectionTag.java / CollectionDropDown.java / EditCommunitiesServlet.java / edit-community.jsp ほか）
+- 対象: https://samate.nist.gov/SARD/test-cases/501368/versions/1.0.1（SARD のテストケース（v1.0.1、DSpace 6.2 の Java・JSP））
+- 判定: **脆弱性あり**（パストラバーサルによる任意ファイルの作成・上書き・削除、CWE-22（CWE-73）。XSS はなし）
+- 根拠（エージェントの判定記録から）:
+  - 【脆弱性の内容】
+  - 場所: dspace-jspui/src/main/java/org/dspace/app/webui/servlet/SubmissionController.java の resumable.js 分割アップロード処理（DoGetResumable 1589–1633 行、doPostResumable 1635–1712 行、makeFileFromChunks 1715–1792 行、deleteDirectory 1794 行〜）。
+  - 到達条件: /submit は web.xml 93–96 行の registered-only フィルタだけ。ログインした一般ユーザーなら誰でも到達できる。resumable の処理（doDSPost 268–277 行、doDSGet 233–237 行）は、投稿アイテムの所有確認（getSubmissionInfo）より前に動く。
+  - (1) 任意パスへのファイル作成・上書き: makeFileFromChunks 1719・1723–1730 行で、パラメータ resumableFilename を検査せずに `tmpDir + File.separator + resumableFilename` と連結し、createNewFile() と new FileOutputStream(destFile) で開く。`../` を含む値にすると、一時ディレクトリの外の任意のパスにファイルを作る。既存ファイルは切り詰めて上書きする。中身は攻撃者が送ったチャンク（part1, part2, …）をつないだもの。チャンク自体も resumableIdentifier で指したディレクトリに書かれる（上流 DSpace 6.2 の FileUploadRequest 103–109 行。ここにも名前の検査はない）。
+  - (2) 任意ディレクトリの再帰削除・ファイルの 0 バイト化: doPostResumable 1668–1672 行も resumableIdentifier を検査せずにパスへ連結する。resumableTotalChunks=0・resumableTotalSize=0 を送ると、1680 行のチャンク確認ループが 1 回も回らない。そのため foundAll=true のまま 1693 行を通って makeFileFromChunks に進み、1786 行の deleteDirectory(chunkDirPath) が、`../` で指したディレクトリを中身ごと再帰的に削除する。同時に resumableFilename で指したファイルは 0 バイトに切り詰められる。長さ 0 なので 295 行以降の後処理と 317 行の削除はされず、そのまま残る。
+  - (3) GET でも成立する: DoGetResumable 1601–1626 行（GET /submit?resumableFilename=任意の値）。resumableIdentifier と resumableChunkNumber（数値として検証していない）をつないだパスで、mkdir、存在とサイズの確認（応答の 200/404 で分かる）、サイズが合わないときの delete を行う。任意の場所にディレクトリを作れ、part* ファイルの存在を確認でき、削除もできる。GET なので、ログイン中の利用者を罠のリンクに誘導する CSRF でも発火する。
+  - どのような入力で何が起きるか: ログインした利用者が POST /submit を multipart/form-data で送る。フォーム項目は resumableFilename=../../（任意のファイル）、resumableIdentifier=../../（任意のディレクトリ）、resumableTotalChunks=0、resumableTotalSize=0。すると、指定したファイルが 0 バイトになり、指定したディレクトリ（例: assetstore）が丸ごと消える。チャンクに中身を付けて送れば、任意のパスに任意の内容のファイルを書ける。Web アプリのディレクトリに JSP を置ければ、サーバー上でのコード実行につながる。後続の UploadStep が成功すると 317 行で消されるが、書き込みと既存ファイルの上書きはその前に起きる。
+  - 修正案（XSS ではないため修正コードは作らない）: resumableIdentifier は英数字・ハイフンなどの許可リストで検証する。resumableChunkNumber と resumableTotalChunks は 1 以上の整数として検証する。resumableFilename はファイル名の部分だけにする（FilenameUtils.getName など）か、サーバー側で作った名前を使う。連結したパスの getCanonicalPath() が tempDir の下にあることを確かめてから、作成・削除する。
+  - 【XSS はなしと判断した理由】
+  - このテストケースの中心となる経路はコレクション選択画面。コミュニティ名を EditCommunitiesServlet.java 543 行で request.getParameter("name") のまま保存する。CollectionDropDown.collectionPath 67・70 行でコミュニティ名とコレクション名をつなぐ。SelectCollectionTag.java 92 行を経て select-collection.jsp 76 行で表示する。92 行では Utils.addEntities（上流 6.2 の実装は com.coverity.security.Escape.html）で HTML エスケープしてから <option> の本文に出力しているので、XSS は成り立たない。同じタグの 67・71・75 行（name/class/id）は JSP の固定値で、83 行は Messages のリソースの値。
+  - edit-community.jsp 147–168 行の名前・説明・紹介文・著作権・サイドバーは、すべて Utils.addEntities 済み。117 行のハンドルはシステムが付ける値。
+  - select-collection.jsp 79 行の SubmissionController.getSubmissionParameters（1382–1384 行）では、JSPStepManager.getLastJSPDisplayed（629–645 行）が、リクエスト属性 jsp が空のときだけパラメータ jsp をエスケープせずに使う。しかしこの画面は JSPStepManager.showJSP 367 行で属性を設定してから表示されるため、この経路では反射しない（属性を設定しない別の画面がこのメソッドを呼ぶ場合は要注意）。
+  - 不正なコレクション ID のエラー表示（JSPSelectCollectionStep.java 210 行）も、JSPManager.showInvalidIDError（上流）の中で escapeHtml される。
+- 使用トークン量（判定）: 新規 99,675（入力 56 ／ キャッシュ作成 74,857 ／ 出力〔推定〕 24,762）、キャッシュ読込 1,548,705、総処理 1,648,380、リクエスト 28 回（出力の記録値 25,237）
+- 注記（親）: 判定の途中で、エージェントが cat したソースの出力が大きかったため、Claude Code がその出力を自動で ~/.claude/…/tool-results/ に保存した。エージェントはそのファイルを読んでおらず（ツール呼び出しの記録で確認）、sed で同じソースを読み直した。
+
+---
