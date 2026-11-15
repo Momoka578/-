@@ -1,0 +1,32 @@
+### No.11 leizongmin/js-xss lib/index.js（filterXSSWithResult）・lib/xss.js・lib/default.js
+- 対象: https://github.com/leizongmin/js-xss（GitHub のコード（第1回で取得したときのコミットに固定））
+- 判定: **脆弱性あり**（XSS: CWE-79。サニタイズの回避。原因はプロトタイプ汚染のガジェット CWE-1321 と、単一引用符で囲む属性値のエスケープ漏れ CWE-116）
+- XSS に該当: 種別・source・sink は "第2回xssの詳細"、修正コードは "第2回修正版コード" を参照
+- 根拠（エージェントの判定記録から）:
+  - 根拠（コミット 9b42221 の lib/*.js を読み、同じコミットの dist/xss.js〔lib と空行以外同一〕を vm サンドボックスで動かして確認）:
+  - (1) lib/index.js filterXSSWithResult（35-84行）がプロトタイプ汚染への対策を迂回する。
+    - ライブラリ本体はプロトタイプ汚染の対策をしている。xss.js 55-63行の shallowCopyObject と 93-123行の hasOwnProperty で、自身のプロパティだけを options として採用する（test_xss.js に "prototype pollution protection" のテストもある）。
+    - ところが index.js 41-43行の `for (var key in options) opts[key] = options[key];` は、継承された列挙可能なプロパティも opts 自身のプロパティとして複製する。Object.prototype が汚染されていると、whiteList・onTag・escapeHtml・safeAttrValue などが FilterXSS に「利用者が指定した値」として渡る。
+    - また 47-48行の `opts.onIgnoreTag` と `opts.onIgnoreTagAttr` は継承元から読む。options を省略した場合でも Object.prototype.onIgnoreTag や onIgnoreTagAttr が「元のフック」になる。51-62行と65-76行のラッパーがその戻り値を返し、xss.js 221-222行と207-208行がその値を無害化せずに出力する。
+    - 確認: Object.prototype.onIgnoreTag=(t,h)=>h、onIgnoreTagAttr=(t,n,v)=>n+'="'+v+'"' と汚染した。この状態で filterXSS は `&lt;script&gt;…<a href="#">` を返し、対策が効いた。一方 filterXSSWithResult(...).html は `<script>alert(1)</script><a href="#" onclick="alert(2)">` をそのまま返した。Object.prototype.whiteList={script:['src'],img:['src','onerror']} と汚染した状態で options に {} を渡すと、`<script src="//e/x.js"></script><img src onerror="alert(1)">` が出力された。
+    - アプリの別の箇所にプロトタイプ汚染があると、この関数を使う箇所すべてで攻撃者の HTML が無害化されずに出力される。
+  - (2) singleQuotedAttributeValue:true のとき、属性値の ' がエスケープされない（xss.js 108行・201行、default.js 252-254行・326-330行）。
+    - xss.js 108行で attributeWrapSign は "'" になる。しかし default.js の escapeAttrValue（326-330行）は escapeQuote で " を、escapeHtml で < と > をエスケープするだけで、' はそのまま残る。xss.js 201行は name + "='" + value + "'" と出力する。
+    - 確認: 入力 `<a title="' onmouseover=alert(1) '">hi</a>` が `<a title='' onmouseover=alert(1) ''>hi</a>` になり、イベントハンドラ属性が注入された。既定の " で囲む設定では `title="' onmouseover=alert(1) '"` となり安全だった。
+  - (参考・XSS 以外) lib/parser.js parseAttr 169-170行は、空白文字が出るたびに属性文字列全体を `html.replace(/\s|\n|\t/g," ")` で作り直す。そのため処理時間が入力長の 2 乗で増える（計算量の DoS: CWE-407）。
+    - 実測: `<a a a a …>` で 10k 文字 1.5 秒、20k 文字 6.3 秒、40k 文字 24 秒。
+    - 修正案: replace をループの外で 1 回だけ実行する。このコードは修正しない。
+- 使用トークン量（判定）: 新規 66,990（入力 24 ／ キャッシュ作成 44,022 ／ 出力〔推定〕 22,944）、キャッシュ読込 485,434、総処理 552,424、リクエスト 12 回（出力の記録値 22,083）
+
+---
+## No.11 leizongmin/js-xss lib/index.js（filterXSSWithResult）・lib/xss.js・lib/default.js
+- 対象: https://github.com/leizongmin/js-xss
+
+- **XSS 種別**: その他。理由: 対象は HTML サニタイズのライブラリそのもので、特定の入力経路や出力先を持たない。フィルタを回避した文字列がアプリでどう使われるかによって、XSS はストア型（投稿の保存と表示）、反射型、DOM-base（ブラウザ版で innerHTML に入れる場合）のどれにもなりうる。(1) は、別の箇所のプロトタイプ汚染を足がかりにするガジェット型でもある。
+- **source**: 利用側が渡す信頼できない HTML。filterXSS(html, options) の html（index.js 18行）と filterXSSWithResult(html, options) の html（index.js 35行）。(1) では、アプリの別の箇所で汚染された Object.prototype のプロパティも source になる。options を複製する箇所（index.js 41-43行）と、元のフックを読む箇所（47-48行）から入る。
+- **伝播経路**: (1) index.js 41-43行で opts に複製 → 47-48行で継承元のフックを取得 → 78行 filterXSS(html, opts) → xss.js 91行 shallowCopyObject（複製済みのため自身のプロパティ扱い）→ 101-115行で汚染値を whiteList・onTag・escapeHtml などに採用 → 170行 parseTag → 181-182行 onTag／191-211行 parseAttr と onTagAttr・onIgnoreTagAttr／221-222行 onIgnoreTag の戻り値。(2) parser.js parseTag 47行 → xss.js 189-191行 getAttrs と parseAttr → parser.js 160行で引用符内の値を取り出す → xss.js 199行 safeAttrValue → default.js 225行 escapeAttrValue（' はエスケープしない）→ xss.js 201行で ' で囲む。
+- **sink**: xss.js 201行（属性の組み立て）、218行（タグの組み立て）、207-208行と221-222行（フックの戻り値をそのまま返す）。その結果は process の戻り値（234行）と filterXSSWithResult の戻り値 html（index.js 80-81行）になる。利用側はこれを innerHTML やテンプレートで HTML として出力する。
+- **脆弱性の位置**: source と sink の間にある無害化の処理。(1) は filterXSSWithResult の options の複製（index.js 39-48行、source 側の設定の取り込み）にある。(2) は sink の直前にある属性値のエスケープ（xss.js 201行と default.js escapeAttrValue、出力側）で、囲み文字 ' に合わせたエスケープがない。
+- **攻撃例**: (1) アプリにプロトタイプ汚染の脆弱性がある。攻撃者はまず、細工した JSON のマージなどで Object.prototype.onIgnoreTag（または whiteList）を書き換える。その後、コメント投稿に script タグやイベントハンドラ属性を含めると、filterXSSWithResult がそれを除去せずに返す。それを表示した閲覧者のブラウザでスクリプトが実行される。(2) アプリが singleQuotedAttributeValue:true で投稿を無害化している。攻撃者は、title 属性の値に「' 空白 onmouseover=…」を含む a タグを投稿する。出力で ' の囲みが閉じられ、onmouseover 属性が独立した属性として注入される。閲覧者がリンクにマウスを乗せるとスクリプトが実行される。
+
+---
