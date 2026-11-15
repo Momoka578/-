@@ -1,0 +1,26 @@
+### No.17 google/firing-range ToxicDom.java
+- 対象: https://github.com/google/firing-range/blob/master/src/tests/dom/ToxicDom.java（GitHub のコード（第1回で取得したときのコミットに固定））
+- 判定: **脆弱性あり**（DOM-based XSS・CWE-79）
+- XSS に該当: 種別・source・sink は "第2回xssの詳細"、修正コードは "第2回修正版コード" を参照
+- 根拠（エージェントの判定記録から）:
+  - 根拠（内容）: ToxicDom サーブレット（/dom/toxicdom/* にマップ、WEB-INF/web.xml 216-222行）は、URL パスで選んだ source テンプレートと sink テンプレートを連結し、toxicdom.tmpl の <script> ブロック内（toxicdom.tmpl 4-6行の %%PAYLOAD%%）に埋め込んで text/html で返す（ToxicDom.java 52-53行・56-57行・63-64行、75-81行・83-92行［91行で sourceTemplate + sinkTemplate を連結］・94-106行）。応答は Responses.sendXssed で返され、X-XSS-Protection: 0 が付く（Responses.java 73行）。CSP などの防御はない。
+  - source テンプレートは攻撃者が制御できる値を読む: window.name（sources/window/name.tmpl 5行・8行）、document.referrer（sources/document/referrer.tmpl 5行・8行）、document.cookie（sources/document/cookie.tmpl 5行・13行）、localStorage/sessionStorage（sources/localStorage/property.tmpl 4行・7行 など）。
+  - sink テンプレートはその値を無害化せずに危険な API に渡す: eval（sinks/eval.tmpl 2行・6行）、document.write（sinks/documentWrite.tmpl 2行・6行）、innerHTML（sinks/innerHtml.tmpl 5行・9行）。sinks/js_html_sanitize_eval.tmpl 3-5行は < & > を置換してから eval するが、eval に対して HTML エスケープは意味がなく JS コードはそのまま実行される。
+  - 1 区切りのパス（generateAccesslessTemplate, 75-81行）では source と sink が 1 つのテンプレートに入っている: sources/postMessage/eval.tmpl 1-3行・10行は送信元（msg.origin）を確認せずに eval(msg.data)、sources/postMessage/innerHtml.tmpl 4行は JSON の html を innerHTML に代入、sources/postMessage/improperOriginValidationWithRegExp.tmpl 2-4行は先頭・末尾のアンカーがなく「.」もエスケープしていない正規表現で origin を確認するため、https://www.google.com.attacker.example のような別オリジンも通過して eval(msg.data) される。
+  - どの入力で何が起きるか: 例えば /dom/toxicdom/window/name/eval を開くと、そのページは eval(window.name) を実行する。攻撃者のページが window.name に任意の JS を入れてから被害者のタブをこの URL に遷移させると、firing-range のオリジンで攻撃者の JS が動く（Cookie の読み取り、なりすまし操作など）。/dom/toxicdom/postMessage/eval を iframe や window.open で開いて postMessage で JS 文字列を送るだけでも同じことが起きる。
+  - 補足（XSS 以外・軽微）: generateAccesslessTemplate の呼び出し（52-53行）は try/catch の外にあり、存在しないテンプレート名を指定すると IOException がそのまま投げられて 500 になる。また /dom/toxicdom（末尾の / なし）では getPathInfo() が null になり 49行で NullPointerException（CWE-476/755 相当の堅牢性の問題）。パストラバーサルは Templates.getTemplate（Templates.java 61行）の「..」拒否とパス先頭の固定文字列（sources/・sinks/）で防がれており成立しない。generateExternalTemplate は 97-101行で \w+ に制限しているので src 属性への注入もできない。エラー応答（Responses.sendError）は text/plain かつ HTML エスケープ済みで、反射型 XSS にはならない。
+  - なお Firing Range は XSS スキャナを試すために意図的に脆弱に作られたテストベッドであり、この XSS は設計上のもの（クラスの Javadoc 29行「A servlet to provide toxic DOM based XSSes」）だが、コードとしては脆弱性ありと判定する。
+- 使用トークン量（判定）: 新規 29,923（入力 12 ／ キャッシュ作成 16,577 ／ 出力〔推定〕 13,334）、キャッシュ読込 145,784、総処理 175,707、リクエスト 6 回（出力の記録値 13,649）
+
+---
+## No.17 google/firing-range ToxicDom.java
+- 対象: https://github.com/google/firing-range/blob/master/src/tests/dom/ToxicDom.java
+
+- **XSS 種別**: DOM-base。サーバー（ToxicDom.java）はユーザー入力を HTML に反射も保存もしておらず、配信したページ内の JavaScript がブラウザ側の値（window.name、document.referrer、document.cookie、Web Storage、postMessage のデータ）を読み、クライアント側で eval／document.write／innerHTML に渡すため。
+- **source**: sources/window/name.tmpl 5行・8行（window.name）、sources/document/referrer.tmpl 5行・8行（document.referrer）、sources/document/cookie.tmpl 5行・13行（document.cookie）、sources/localStorage/property.tmpl 4行・7行（localStorage）、sources/postMessage/eval.tmpl 2行（msg.data）など。どの source を使うかは ToxicDom.java 49行の pathInfo（52-53行・56-57行）で選ばれる。
+- **伝播経路**: source テンプレートが値を JS 変数 payload に入れる、または trigger(値) を非同期に呼ぶ → ToxicDom.java 91行（または 80行）で source と sink のテンプレートを連結 → Templates.replacePayload で toxicdom.tmpl の <script> 内（4-6行）に埋め込み → ToxicDom.java 52行・56行の Responses.sendXssed で text/html として配信 → ブラウザで実行されると sink テンプレートの payload／trigger(payload) に値が渡る。3 区切りのパス（63-64行・94-106行）では toxicdomexternal.tmpl の <script src="/dom/toxicdomscripts/..."> を通じて同じ組み合わせ（ToxicDomScripts）が読み込まれる。
+- **sink**: sinks/eval.tmpl 2行・6行 eval(payload)、sinks/documentWrite.tmpl 2行・6行 document.write(payload)、sinks/innerHtml.tmpl 5行・9行 div.innerHTML = payload、sinks/js_html_sanitize_eval.tmpl 3行 eval(...)、sources/postMessage/eval.tmpl 3行 eval(content)、sources/postMessage/innerHtml.tmpl 4行 div.innerHTML。これらを含むページを出力しているのが ToxicDom.java 52行・56行・63行の Responses.sendXssed。
+- **脆弱性の位置**: sink 側。source の値（window.name など）は攻撃者が自由に決められるものであり、それを検証・エスケープせずに eval／document.write／innerHTML という危険な sink に渡しているところが問題（postMessage では送信元オリジンの確認がない、または不十分な点も sink 直前の欠陥）。さらにサーバー側（ToxicDom.java）が、この危険な組み合わせを CSP などの防御なし・X-XSS-Protection: 0 で配信している。
+- **攻撃例**: 攻撃者は自分のサイトに罠ページを置き、そのページで window.name に「Cookie を攻撃者のサーバーへ送る JS」を設定してから、被害者のタブを firing-range の /dom/toxicdom/window/name/eval に遷移させる。遷移後も window.name は引き継がれるため、ページ内の eval(window.name) によって攻撃者の JS が firing-range のオリジンで実行される。postMessage の場合は、罠ページから /dom/toxicdom/postMessage/eval を iframe で開き、JS 文字列を postMessage で送ると、送信元の確認がないまま eval される。
+
+---
