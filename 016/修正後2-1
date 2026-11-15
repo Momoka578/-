@@ -1,0 +1,379 @@
+## No.16 google/firing-range src/tests/dom/EventTriggering.java
+- 対象: https://github.com/google/firing-range/blob/master/src/tests/dom/EventTriggering.java
+- XSS 種別: DOM-base（source・sink は "第2回xssの詳細"）
+- 修正したファイル: EventTriggering.java、documentWrite.tmpl、eval.tmpl、innerHtml.tmpl
+- 注記（親）: エージェントは MARK END の後の確認（6 通りの組み合わせでの構文確認と、簡易な DOM の模擬環境での攻撃文字列の確認）の後、MARK REVISE を記録して説明ファイルの行番号 2 か所を直した。修正コード本体は直していない。ここに載せた説明は直した後のもの。
+
+### 修正コードの説明
+
+#### No.16 google/firing-range `src/tests/dom/EventTriggering.java` の修正説明（DOM-based XSS・CWE-79）
+
+対象コミット: `4f991a6418b07a66cd63006f4a2bec27c84b72f4`
+
+修正ファイル:
+
+| 修正ファイル | 元のファイル |
+|---|---|
+| `fix01_EventTriggering.java` | `src/tests/dom/EventTriggering.java` |
+| `fix01_eval.tmpl` | `src/tests/dom/data/sinks/eval.tmpl` |
+| `fix01_innerHtml.tmpl` | `src/tests/dom/data/sinks/innerHtml.tmpl` |
+| `fix01_documentWrite.tmpl` | `src/tests/dom/data/sinks/documentWrite.tmpl` |
+
+---
+
+#### 1. 修正の方針
+
+##### 防ぐ脆弱性（source → sink）
+
+- **source**: 入力欄の値。`sources/document/inputTyping.tmpl` 8行 `payload = e.target.value;` と、`sources/document/formSubmission.tmpl` 15行 `payload = document.getElementById('userInput').value;`。
+- **伝播**: グローバル変数 `payload` → イベントハンドラ（keyup／change／submit）から `deferredPayload()` を呼ぶ → `deferred.tmpl` に埋め込まれたシンクの処理が `payload` を参照する。
+- **sink**: `sinks/eval.tmpl` 2・6行 `eval(payload)`、`sinks/innerHtml.tmpl` 5・9行 `div.innerHTML = payload`、`sinks/documentWrite.tmpl` 2・6行 `document.write(payload)`。
+- **入口の問題**: `EventTriggering.java` 62-67行は、URL パスの3要素をそのままテンプレート名に使う。そのため `sources/` 以下のどのテンプレートとも組み合わせられる。たとえば次のソースにも到達できる。
+  - `window/name`: 他サイトが iframe の name 属性で値を仕込める。ページ読み込み時に同期トリガーで eval される。
+  - `postMessage/*`: テンプレートの中に、origin を確認しない eval や innerHTML がある。
+
+##### どこで、どのように防ぐか
+
+二段構えで防ぐ。
+
+1. **sink 側（主対策）: 3つのシンクテンプレートを「文字列として出力する」処理に置き換える。**
+   - `eval(payload)` → `document.createTextNode(String(payload))` を追加して表示する。
+   - `div.innerHTML = payload` → `div.textContent = payload`
+   - `document.write(payload)` → `document.write(escapeHtmlForWrite(payload))`。書き込む前に HTML エスケープする。
+2. **入口側（補助対策）: `EventTriggering.java` で source/sink を許可リストに限定する。**
+   - ソースは `document/formSubmission` と `document/inputTyping` だけを許可する。
+   - シンクは `eval`、`innerHtml`、`documentWrite` だけを許可する。どれも上の 1. で安全化したもの。
+   - それ以外の組み合わせは、テンプレートを読み込む前に 400 で拒否する。
+
+##### この方法を選んだ理由
+
+- XSS が実際に起きるのは、クライアント側の JavaScript が入力値を「コードや HTML として解釈する API」に渡す箇所（sink）である。サーバ側は固定のテンプレートを返すだけで、入力値はレスポンスに含まれない。そのため、サーバ側でエスケープしても効果はない。根本的に直すには、シンク自体を「文字列として扱う API」に変えるしかない。
+- `innerHTML` → `textContent` と `eval` → テキストノードは、ブラウザが文字列をマークアップやコードとして解釈しない API への置き換えである。エスケープ漏れが起きる余地がない。
+- `document.write` は、元の動きを大きく変えないよう API 自体は残した。書き込む値だけをエスケープする最小限の変更にしている。
+- シンクを直しただけでは、`postMessage/*` のように「テンプレート内に独自の危険なシンクを持つソース」を、このサーブレット経由で読み込めてしまう。そこで、このサーブレット本来の目的（イベント発火型。`dom/index.html` に載っている6つの URL）に合わせて、許可リスト（ポジティブリスト）で入口を絞った。拒否リストと違い、将来 `sources/` にテンプレートが増えても自動的には公開されない。
+
+---
+
+#### 2. 変更箇所ごとの説明
+
+##### 2-1. `fix01_EventTriggering.java`（元: `src/tests/dom/EventTriggering.java`）
+
+**(a) import の追加**（修正後 18行）
+
+修正前: なし
+
+修正後:
+```java
+import com.google.common.collect.ImmutableSet;  // 修正: 許可リスト用に追加
+```
+
+- 許可リストを、変更できない集合（Guava の `ImmutableSet`）として持つために追加した。Guava は元のコードでも `CharMatcher` に使われており、新しい依存は増えない。
+
+**(b) 許可リストの定数を追加**（修正後 45-52行）
+
+修正前: なし（元の 42-43行の定数の後）
+
+修正後:
+```java
+private static final ImmutableSet<String> ALLOWED_SOURCES =
+    ImmutableSet.of("document/formSubmission", "document/inputTyping");
+private static final ImmutableSet<String> ALLOWED_SINKS =
+    ImmutableSet.of("eval", "innerHtml", "documentWrite");
+```
+
+- `ALLOWED_SOURCES`: `"source/accessType"` の形で、イベント発火型のソースだけを登録する。`window/name`、`document/cookie`、`document/referrer`、`localStorage/*`、`sessionStorage/*`、`postMessage/*` は含めない。
+- `ALLOWED_SINKS`: 2-2〜2-4 で安全化した3つのシンクだけを登録する。`js_html_sanitize_eval`（HTML 文書を丸ごと含み、`eval` を使うテンプレート）は含めない。
+
+**(c) generateTemplate の先頭に検証を追加**（修正後 74-78行。元の 62-63行の直後）
+
+修正前:
+```java
+private String generateTemplate(String source, String accessType, String sink)
+    throws IOException {
+  String sourcePath = "sources/" + source + "/" + accessType + ".tmpl";
+```
+
+修正後:
+```java
+private String generateTemplate(String source, String accessType, String sink)
+    throws IOException {
+  if (!ALLOWED_SOURCES.contains(source + "/" + accessType) || !ALLOWED_SINKS.contains(sink)) {
+    throw new IllegalArgumentException("Unsupported source or sink.");
+  }
+  String sourcePath = "sources/" + source + "/" + accessType + ".tmpl";
+```
+
+- URL パス由来の `source`・`accessType`・`sink` が許可リストにない場合、テンプレートを読み込む前に `IllegalArgumentException` を投げる。
+- この例外は、元の `doGet`（修正後 66行）の `catch (IllegalArgumentException | IOException e)` で捕捉される。`Responses.sendError` によって、400・`text/plain`・HTML エスケープ済みのメッセージで返る。固定の文字列なので、利用者の入力は反射されない。
+- これで、他サイトから値を仕込めるソースや、origin を確認しない postMessage ハンドラを含むページを、このサーブレットが返すことはなくなる。
+
+**(d) Javadoc の例の変更**（修正後 37-38行、コメントのみ）
+
+- 説明の例 `/dom/eventtriggering/document/cookie/eval` は、許可リストによって拒否される URL になった。そのため、許可される例 `/dom/eventtriggering/document/formSubmission/eval` に書き換えた。動作には影響しない。
+
+##### 2-2. `fix01_eval.tmpl`（元: `src/tests/dom/data/sinks/eval.tmpl`）
+
+修正前（2行・6行）:
+```javascript
+eval(payload);
+```
+
+修正後（4行・9行）:
+```javascript
+(document.body || document.documentElement).appendChild(document.createTextNode(String(payload)));
+```
+
+- `String(payload)`: 値を文字列に変換する。`payload` が数値や `undefined` でも例外にならない。
+- `document.createTextNode(...)`: 文字列から**テキストノード**を作る。テキストノードの中身は、HTML としてもスクリプトとしても解釈されない。
+- `(document.body || document.documentElement).appendChild(...)`: ページに追加して表示する。`toxicdom.tmpl` ではスクリプトが `<body>` 内にあるので、通常は `document.body` に追加される。`body` がまだない状況でも例外にならないよう、`documentElement` を予備にしている。
+- 1-2行・8行は修正コメント。
+- XSS が防げる理由: 入力値を JavaScript として実行する `eval` を取り除いた。入力は画面に文字として出るだけになり、コードとして実行される経路がなくなる。
+
+##### 2-3. `fix01_innerHtml.tmpl`（元: `src/tests/dom/data/sinks/innerHtml.tmpl`）
+
+修正前（5行・9行）:
+```javascript
+div.innerHTML = payload;
+```
+
+修正後（6行・11行）:
+```javascript
+div.textContent = payload;
+```
+
+- `textContent` は、要素の中身を**純粋なテキスト**として設定する。`<img ...>` や `<svg ...>` のようなタグを含む文字列でも、要素は作られない。文字がそのまま表示される。
+- `div` の作成と追加（1-2行）は、元のまま変えていない。
+- 5行・10行は修正コメント。
+- XSS が防げる理由: HTML パーサを通らないため、イベントハンドラ属性などが DOM 要素として生成されず、スクリプトは実行されない。
+
+##### 2-4. `fix01_documentWrite.tmpl`（元: `src/tests/dom/data/sinks/documentWrite.tmpl`）
+
+**(a) エスケープ関数の追加**（修正後 3-9行）
+
+```javascript
+function escapeHtmlForWrite(s) {
+  return String(s).replace(/&/g, '&amp;')
+                  .replace(/</g, '&lt;')
+                  .replace(/>/g, '&gt;')
+                  .replace(/"/g, '&quot;')
+                  .replace(/'/g, '&#39;');
+}
+```
+
+- `String(s)`: 文字列に変換する。`undefined` などでも動く。
+- `&` → `&amp;` を**最初に**置換する。後の置換で作った `&lt;` などを、二重にエスケープしないためである。
+- `<` → `&lt;` と `>` → `&gt;` により、タグを作れなくする。
+- `"` → `&quot;` と `'` → `&#39;` により、属性値の文脈でも引用符から抜け出せなくする。`document.write` の書き込み先は本文なので、本来は不要である。念のための対策として入れている。
+- このテンプレートは、`deferredPayload()` の中とトップレベルの2か所に連結される（`EventTriggering.java` 修正後 87-88行）。関数宣言なので、それぞれのスコープで定義される。二重に定義しても衝突しない。
+
+**(b) 書き込み箇所の変更**
+
+修正前（2行・6行）:
+```javascript
+document.write(payload);
+```
+
+修正後（13行・18行）:
+```javascript
+document.write(escapeHtmlForWrite(payload));
+```
+
+- エスケープ済みの文字列を書き込む。ブラウザは `&lt;script&gt;` を文字 `<script>` として表示するだけで、要素は作らない。
+- 1-2行・12行・17行は修正コメント。
+- XSS が防げる理由: `document.write` に渡す文字列に、HTML として意味を持つ文字が残らない。そのため、入力からタグや属性を作ることができない。
+
+---
+
+#### 3. 修正の結果
+
+##### 攻撃例の入力の扱い
+
+| 攻撃例 | 修正前 | 修正後 |
+|---|---|---|
+| 攻撃者のページの iframe（name 属性に JavaScript）で `/dom/eventtriggering/window/name/eval` を開く | 読み込み時に `eval(window.name)` が実行され、サイトのオリジンで任意のスクリプトが動く | 許可リストにないので **400 `Unsupported source or sink.`**（text/plain）。スクリプトを含むページ自体が返らない |
+| `/dom/eventtriggering/postMessage/eval/eval` を開き、postMessage で任意の文字列を送る | origin を確認しない handler 内の `eval(msg.data)` で実行される | 許可リストにないので **400**。handler を含むページは返らない |
+| `/dom/eventtriggering/document/inputTyping/eval`（または `formSubmission/eval`）で、細工したコード文字列を入力する | 入力やフォーム送信のたびに `eval` で実行される | 入力した文字列がそのまま**テキストとして**ページに表示されるだけ |
+| `.../inputTyping/innerHtml` で、イベントハンドラ属性付きのタグを入力する | `innerHTML` で要素が生成され、ハンドラが実行される | `textContent` によって、タグの文字列がそのまま表示される。要素は作られない |
+| `.../inputTyping/documentWrite` で `<script>` を含む文字列を入力する | `document.write` でスクリプト要素が書き込まれて実行される | `&lt;script&gt;...` にエスケープして書き込まれ、文字として表示される |
+| `../` を含むパスなど | `Templates.getTemplate` の `..` チェックで例外になる | その前に許可リストで拒否される（400） |
+
+##### 正常な入力での動作への影響
+
+- **変わらない点**
+  - `dom/index.html` に載っている6つの URL（`document/formSubmission` と `document/inputTyping` × `eval`／`innerHtml`／`documentWrite`）は、これまでどおり 200 で返る。入力欄やフォームも表示される。
+  - イベント（keyup／change／submit）で `deferredPayload()` が呼ばれる流れや、同期・非同期トリガーの構造は変えていない。
+  - 英数字だけの普通の入力は、どのシンクでも同じ文字が表示される。
+  - `documentWrite` シンクの場合、ページ読み込み後に `document.write` を呼ぶと文書が書き換わる。この挙動は元のコードと同じである。
+- **変わる点**
+  - 入力は「実行」されず「表示」されるだけになる。このページは本来、XSS スキャナを評価するために**わざと脆弱にした**テストページである。修正後は、スキャナが XSS を検出できなくなる（テスト用ページとしての役割はなくなる）。
+  - `eval` シンクでは、イベントのたびにテキストノードが追加される。そのため `inputTyping` では、キー入力ごとに文字列が積み重なって表示される。
+  - `&`、`<`、`>`、`"`、`'` を含む入力は、`documentWrite` シンクでも文字どおりに表示される。元のコードではマークアップとして解釈されていた。
+  - 許可リストにない組み合わせ（`document/cookie`、`document/referrer`、`window/name`、`localStorage/*`、`sessionStorage/*`、`postMessage/*`、`js_html_sanitize_eval` など）は、`/dom/eventtriggering/` 経由では 400 になる。
+
+---
+
+#### 4. 注意点
+
+- **共有テンプレートへの影響**: `sinks/eval.tmpl`、`sinks/innerHtml.tmpl`、`sinks/documentWrite.tmpl` は、同じパッケージの `ToxicDom`（`/dom/toxicdom/...`）でも使われている。この修正を反映すると、それらのページのシンクも同じく安全化される（テストページとしての挙動も変わる）。
+- **修正していないもの**
+  - `sources/postMessage/*.tmpl`（eval・innerHTML・`document.write` によるスクリプト読み込み、origin 検証の不備など）は修正していない。`EventTriggering` からは許可リストで到達できなくした。ただし、`ToxicDom` 経由（`/dom/toxicdom/postMessage/...`）では引き続き脆弱である。
+  - `sinks/js_html_sanitize_eval.tmpl` も修正していない（このサーブレットからは到達不可）。
+  - `Responses.sendXssed` が付ける `X-XSS-Protection: 0` や、CSP がないことは変えていない。XSS 対策の本体は、上記のシンクの置き換えである。
+  - XSS 以外の堅牢性の問題も直していない。たとえば、パス情報がない（`/dom/eventtriggering` だけの）リクエストでは、`request.getPathInfo()` が `null` になり、`NullPointerException`（500）になる。
+- **残る制約**
+  - 許可リストは、このサーブレットが本来扱う組み合わせに限定している。別のソースを追加する場合は、そのテンプレートが「独自の危険なシンクを含まない」ことを確認してから `ALLOWED_SOURCES` に加える必要がある。
+  - 修正後の各シンクは安全だが、元のソーステンプレートは引き続き値を `payload` に入れている。今後、別の危険な API で `payload` を使うシンクを追加すれば、同じ問題が再び起きる。シンクを追加するときは、テキストとして扱う API（`textContent`、`createTextNode`、エスケープ）を使うこと。
+
+### 修正したコード: EventTriggering.java
+
+```java
+/*
+ * Copyright 2014 Google Inc. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
+ * in compliance with the License. You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software distributed under the License
+ * is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
+ * or implied. See the License for the specific language governing permissions and limitations under
+ * the License.
+ */
+
+package com.google.testing.security.firingrange.tests.dom;
+
+import com.google.common.base.CharMatcher;
+import com.google.common.collect.ImmutableSet;  // 修正: 許可リスト用に追加
+import com.google.testing.security.firingrange.utils.Responses;
+import com.google.testing.security.firingrange.utils.Templates;
+
+import java.io.IOException;
+
+import javax.servlet.http.HttpServlet;
+import javax.servlet.http.HttpServletRequest;
+import javax.servlet.http.HttpServletResponse;
+
+/**
+ * A servlet to provide XSSs that occur after event firing. It is mapped to the
+ * /dom/eventtriggering/ directory and maps paths as follows:
+ * <ul>
+ *     <li> Source object
+ *     <li> Source property
+ *     <li> Sink
+ * </ul>
+ *
+ * Thus, {@code /dom/eventtriggering/document/formSubmission/eval} will map to the form submission
+ * source, and the eval sink.
+ */
+public class EventTriggering extends HttpServlet {
+
+  private static final String TOXIC_TEMPLATE = "toxicdom.tmpl";
+  private static final String DEFERRED_TEMPLATE = "deferred.tmpl";
+
+  // 修正: このサーブレットで使ってよいソース（"source/accessType"）とシンクを許可リストで限定する。
+  // パスの値をそのままテンプレート名に使うと、window.name のように他サイトから値を仕込めるソースや、
+  // postMessage/* のように origin を確認せずに eval・innerHTML などを実行するテンプレートまで
+  // 読み込めてしまうため、イベント発火型のソースと、安全化したシンクだけを許可する。
+  private static final ImmutableSet<String> ALLOWED_SOURCES =
+      ImmutableSet.of("document/formSubmission", "document/inputTyping");
+  private static final ImmutableSet<String> ALLOWED_SINKS =
+      ImmutableSet.of("eval", "innerHtml", "documentWrite");
+
+  @Override
+  public void doGet(HttpServletRequest request, HttpServletResponse response) throws IOException {
+    String pathInfo = request.getPathInfo().substring(1);
+    if (CharMatcher.is('/').countIn(pathInfo) != 2) {
+      String errorMsg = String.format("Missing sink, not enough sinks or too many sinks :(."
+          + "Got %d, expected 2", CharMatcher.is('/').countIn(pathInfo));
+      Responses.sendError(response, errorMsg, 400);
+    } else {
+      try {
+        String template = generateTemplate(
+            pathInfo.split("/")[0], pathInfo.split("/")[1], pathInfo.split("/")[2]);
+        Responses.sendXssed(response, template);
+      } catch (IllegalArgumentException | IOException e) {
+        Responses.sendError(response, e.getMessage(), 400);
+      }
+    }
+  }
+
+  private String generateTemplate(String source, String accessType, String sink)
+      throws IOException {
+    // 修正: 許可リストにないソース・シンクの組み合わせは、テンプレートを読み込む前に拒否する。
+    // IllegalArgumentException は doGet で捕捉され、400（text/plain・HTML エスケープ済み）で返る。
+    if (!ALLOWED_SOURCES.contains(source + "/" + accessType) || !ALLOWED_SINKS.contains(sink)) {
+      throw new IllegalArgumentException("Unsupported source or sink.");
+    }
+    String sourcePath = "sources/" + source + "/" + accessType + ".tmpl";
+    String sourceTemplate = Templates.getTemplate(sourcePath, EventTriggering.class);
+    String sinkPath = "sinks/" + sink + ".tmpl";
+    String sinkTemplate = Templates.getTemplate(sinkPath, EventTriggering.class);
+
+    String toxicTemplate = Templates.getTemplate(TOXIC_TEMPLATE, EventTriggering.class);
+    String deferredTemplate = Templates.getTemplate(DEFERRED_TEMPLATE, EventTriggering.class);
+    // Wrap each sink with code to defer its execution.
+    String deferredPayload = Templates.replacePayload(deferredTemplate, sinkTemplate);
+    return Templates.replacePayload(toxicTemplate, deferredPayload + sourceTemplate + sinkTemplate);
+  }
+
+}
+```
+
+### 修正したコード: documentWrite.tmpl
+
+```html
+// 修正: document.write() に渡す前に、HTML の特殊文字（& < > " '）を文字参照にエスケープする関数を追加。
+// & を最初に置換し、後から作った &lt; などを二重にエスケープしないようにする。
+function escapeHtmlForWrite(s) {
+  return String(s).replace(/&/g, '&amp;')
+                  .replace(/</g, '&lt;')
+                  .replace(/>/g, '&gt;')
+                  .replace(/"/g, '&quot;')
+                  .replace(/'/g, '&#39;');
+}
+
+// Sync trigger.
+// 修正: エスケープ後の文字列を書き込む（タグとして解釈されず、文字として表示される）。
+document.write(escapeHtmlForWrite(payload));
+
+// Async trigger.
+function trigger(payload) {
+  // 修正: 非同期トリガーも同様に、エスケープしてから書き込む。
+  document.write(escapeHtmlForWrite(payload));
+}
+```
+
+### 修正したコード: eval.tmpl
+
+```html
+// 修正: payload を eval() でコードとして実行せず、テキストノードとして表示するだけにする。
+// createTextNode は文字列を HTML としてもスクリプトとしても解釈しないため、入力はそのまま文字として出る。
+// Sync trigger.
+(document.body || document.documentElement).appendChild(document.createTextNode(String(payload)));
+
+// Async trigger.
+function trigger(payload) {
+  // 修正: 非同期トリガーも同様に、eval() をやめてテキストとして表示する。
+  (document.body || document.documentElement).appendChild(document.createTextNode(String(payload)));
+};
+```
+
+### 修正したコード: innerHtml.tmpl
+
+```html
+var div = document.createElement('div');
+document.documentElement.appendChild(div);
+
+// Sync trigger.
+// 修正: innerHTML（HTML として解釈する）ではなく textContent（文字列として設定する）を使う。
+div.textContent = payload;
+
+// Async trigger.
+function trigger(payload) {
+  // 修正: 非同期トリガーも同様に textContent を使う。
+  div.textContent = payload;
+};
+```
+
+---
