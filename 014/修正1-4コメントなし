@@ -4,6 +4,7 @@
 var _has = function(obj, key) {
     return Object.prototype.hasOwnProperty.call(obj, key);
 };
+
 var _allowedTags = {
     a: true, b: true, blockquote: true, br: true, code: true, dd: true, del: true, div: true,
     dl: true, dt: true, em: true, h1: true, h2: true, h3: true, h4: true, h5: true, h6: true,
@@ -26,6 +27,7 @@ var _escapeText = function(text) {
             return _textEscapes[c];
         });
 };
+
 var _decodeEntities = function(value) {
     return value.replace(/&(?:#([0-9]{1,7})|#[xX]([0-9a-fA-F]{1,6})|(amp|lt|gt|quot|apos));/g, function(m, dec, hex, named) {
         var code;
@@ -299,8 +301,7 @@ Handlebars.registerHelper('renderTextParam', function(param) {
         if(param.required) {
           parameterClass += ' required';
         }
-      
-　　　　 result = '<input class=\'' + parameterClass + '\' minlength=\'' + (param.required ? 1 : 0) + '\'';
+        result = '<input class=\'' + parameterClass + '\' minlength=\'' + (param.required ? 1 : 0) + '\'';
         result += ' name=\'' + name +'\' placeholder=\'' + (param.required ? '(required)' : '') + '\'' + idAtt + dataVendorExtensions;
         result += ' type=\'' + type + '\' value=\'' + defaultValue + '\'/>';
     }
@@ -336,175 +337,4 @@ Handlebars.registerHelper('escape', function (value) {
 
     return new Handlebars.SafeString(text);
 });
-
-
-
-
-
-
-
-
-No.96 lib/fetch-package-metadata.js
-
-'use strict'
-
-const deprCheck = require('./utils/depr-check')
-const path = require('path')
-const log = require('npmlog')
-const readPackageTree = require('read-package-tree')
-const rimraf = require('rimraf')
-const validate = require('aproba')
-const npa = require('npm-package-arg')
-const npm = require('./npm')
-let npmConfig
-const npmlog = require('npmlog')
-const limit = require('call-limit')
-const tempFilename = require('./utils/temp-filename')
-const pacote = require('pacote')
-const isWindows = require('./utils/is-windows.js')
-
-const URL_CREDENTIALS = /:([/\\]+)[^\s/\\?#]*@/g
-const URL_CREDENTIALS_IN_SPEC = /:([/\\]+)[^/\\?#]*@/g
-const SPEC_STARTS_WITH_SCHEME = /^[\x00-\x20\s]*[a-z0-9.+-]+:/i
-const SPEC_URL_CREDENTIALS = /^([\x00-\x20\s]*(?!(?:[a-z]|npm|file):)[a-z0-9.+-]+:[/\\]*)[^/\\?#]*@/i
-const URL_CREDENTIALS_NO_SLASH = /(^|\s)(['"`(<[{]*(?:(?:@[\w.!~*'()-]+\/)?[\w.!~*)-][\w.!~*'()-]*@)?(?!(?:[a-z]|npm|file):)[a-z0-9.+-]+:[/\\]*)[^\s/\\?#]*@/gi
-function redactUrlCredentials (str, inSpec) {
-  if (typeof str !== 'string') return str
-  if (inSpec) return redactSpecCredentials(str).replace(URL_CREDENTIALS_IN_SPEC, ':$1***@')
-  return str.replace(URL_CREDENTIALS, ':$1***@').replace(URL_CREDENTIALS_NO_SLASH, '$1$2***@')
-}
-function redactSpecCredentials (spec) {
-  let start = 0
-  if (!SPEC_STARTS_WITH_SCHEME.test(spec)) {
-    const at = spec.indexOf('@', spec[0] === '@' ? 1 : 0)
-    if (at !== -1) start = at + 1
-  }
-  return spec.slice(0, start) + spec.slice(start).replace(SPEC_URL_CREDENTIALS, '$1***@')
-}
-function redactSpecInMessage (message, spec, specString) {
-  if (typeof message !== 'string') return message
-  const forms = [specString]
-  if (spec && typeof spec === 'object') {
-    const name = typeof spec.name === 'string' ? spec.name : ''
-    for (const key of ['raw', 'rawSpec', 'saveSpec', 'fetchSpec']) {
-      const value = spec[key]
-      if (typeof value !== 'string') continue
-      forms.push(value)
-      if (name) forms.push(name + '@' + value)
-    }
-  }
-  forms.sort((a, b) => b.length - a.length)
-  const seen = new Set()
-  for (const form of forms) {
-    if (!form || seen.has(form)) continue
-    seen.add(form)
-    if (message.indexOf(form) === -1) continue
-    const redacted = redactUrlCredentials(form, true)
-    if (redacted !== form) message = message.split(form).join(redacted)
-  }
-  return message
-}
-
-function andLogAndFinish (spec, tracker, done) {
-  validate('SOF|SZF|OOF|OZF', [spec, tracker, done])
-  return (er, pkg) => {
-    if (er) {
-      const specString = String(spec)
-      log.silly('fetchPackageMetaData', 'error for ' + redactUrlCredentials(specString, true), redactUrlCredentials(redactSpecInMessage(er.message, spec, specString)))
-      if (tracker) tracker.finish()
-    }
-    return done(er, pkg)
-  }
-}
-
-const LRUCache = require('lru-cache')
-const CACHE = new LRUCache({
-  max: 300 * 1024 * 1024,
-  length: (p) => p._contentLength
-})
-
-module.exports = limit(fetchPackageMetadata, npm.limit.fetch)
-function fetchPackageMetadata (spec, where, opts, done) {
-  validate('SSOF|SSFZ|OSOF|OSFZ', [spec, where, opts, done])
-
-  if (!done) {
-    done = opts
-    opts = {}
-  }
-  var tracker = opts.tracker
-  const logAndFinish = andLogAndFinish(spec, tracker, done)
-
-  if (typeof spec === 'object') {
-    var dep = spec
-  } else {
-    dep = npa(spec)
-  }
-  if (!isWindows && dep.type === 'directory' && /^[a-zA-Z]:/.test(dep.fetchSpec)) {
-    var err = new Error(`Can't install from windows path on a non-windows system: ${dep.fetchSpec.replace(/[/]/g, '\\')}`)
-    err.code = 'EWINDOWSPATH'
-    return logAndFinish(err)
-  }
-  if (!npmConfig) {
-    npmConfig = require('./config/figgy-config.js')
-  }
-  pacote.manifest(dep, npmConfig({
-    annotate: true,
-    fullMetadata: opts.fullMetadata,
-    log: tracker || npmlog,
-    memoize: CACHE,
-    where: where
-  })).then(
-    (pkg) => logAndFinish(null, deprCheck(pkg)),
-    (err) => {
-      if (dep.type !== 'directory') return logAndFinish(err)
-      if (err.code === 'ENOTDIR') {
-        var enolocal = new Error(`Could not install "${path.relative(process.cwd(), dep.fetchSpec)}" as it is not a directory and is not a file with a name ending in .tgz, .tar.gz or .tar`)
-        enolocal.code = 'ENOLOCAL'
-        if (err.stack) enolocal.stack = err.stack
-        return logAndFinish(enolocal)
-      } else if (err.code === 'ENOPACKAGEJSON') {
-        var enopackage = new Error(`Could not install from "${path.relative(process.cwd(), dep.fetchSpec)}" as it does not contain a package.json file.`)
-        enopackage.code = 'ENOLOCAL'
-        if (err.stack) enopackage.stack = err.stack
-        return logAndFinish(enopackage)
-      } else {
-        return logAndFinish(err)
-      }
-    }
-  )
-}
-
-module.exports.addBundled = addBundled
-function addBundled (pkg, next) {
-  validate('OF', arguments)
-  if (pkg._bundled !== undefined) return next(null, pkg)
-
-  if (!pkg.bundleDependencies && pkg._requested.type !== 'directory') return next(null, pkg)
-  const requested = pkg._requested || npa(pkg._from)
-  if (requested.type === 'directory') {
-    pkg._bundled = null
-    return readPackageTree(pkg._requested.fetchSpec, function (er, tree) {
-      if (tree) pkg._bundled = tree.children
-      return next(null, pkg)
-    })
-  }
-  pkg._bundled = null
-  const target = tempFilename('unpack')
-  if (!npmConfig) {
-    npmConfig = require('./config/figgy-config.js')
-  }
-  const opts = npmConfig({integrity: pkg._integrity})
-  pacote.extract(pkg._resolved || pkg._requested || npa.resolve(pkg.name, pkg.version), target, opts).then(() => {
-    log.silly('addBundled', 'read tarball')
-    readPackageTree(target, (err, tree) => {
-      if (err) { return next(err) }
-      log.silly('cleanup', 'remove extracted module')
-      rimraf(target, function () {
-        if (tree) {
-          pkg._bundled = tree.children
-        }
-        next(null, pkg)
-      })
-    })
-  }, next)
-}
+```
