@@ -1,0 +1,590 @@
+## 元のコード（変わった部分を含む範囲）
+
+`_sanitize` と `sanitize` ヘルパー（元 L4-24）:
+
+```
+  4 | var _sanitize = function(html) {
+  5 |     // Strip the script tags from the html and inline evenhandlers
+  6 |     html = html.replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, '');
+  7 |     html = html.replace(/(on\w+="[^"]*")*(on\w+='[^']*')*(on\w+=\w*\(\w*\))*/gi, '');
+  8 | 
+  9 |     return html;
+ 10 | };
+ 11 | 
+ 12 | var sanitize =function (html) {
+ 13 |     var _html;
+ 14 |     if( _.isUndefined(html) || _.isNull(html) || _.isNumber(html))  {
+ 15 |         return new Handlebars.SafeString(html);
+ 16 |     }
+ 17 | 
+ 18 |     if (_.isObject(html)){
+ 19 |         _html = JSON.stringify(html);
+ 20 |         return new Handlebars.SafeString(JSON.parse(_sanitize(_html)));
+ 21 |     }
+ 22 | 
+ 23 |     return new Handlebars.SafeString(_sanitize(html));
+ 24 | };
+```
+
+`renderTextParam` ヘルパー（元 L28-69）:
+
+```
+ 28 | Handlebars.registerHelper('renderTextParam', function(param) {
+ 29 |     var result, type = 'text', idAtt = '';
+ 30 |     var paramType = param.type || param.schema && param.schema.type || '';
+ 31 |     var isArray = paramType.toLowerCase() === 'array' || param.allowMultiple;
+ 32 |     var defaultValue = isArray && Array.isArray(param.default) ? param.default.join('\n') : param.default;
+ 33 |     var name = Handlebars.Utils.escapeExpression(param.name);
+ 34 |     var valueId = Handlebars.Utils.escapeExpression(param.valueId);
+ 35 |     paramType = Handlebars.Utils.escapeExpression(paramType);
+ 36 | 
+ 37 |     var dataVendorExtensions = Object.keys(param).filter(function(property) {
+ 38 |         // filter X-data- properties
+ 39 |         return property.match(/^X-data-/i) !== null;
+ 40 |     }).reduce(function(result, property) {
+ 41 |         // remove X- from property name, so it results in html attributes like data-foo='bar'
+ 42 |         return result += ' ' + property.substring(2, property.length) + '=\'' + param[property] + '\'';
+ 43 |     }, '');
+ 44 | 
+ 45 |     if(param.format && param.format === 'password') {
+ 46 |         type = 'password';
+ 47 |     }
+ 48 | 
+ 49 |     if(valueId) {
+ 50 |         idAtt = ' id=\'' + valueId + '\'';
+ 51 |     }
+ 52 | 
+ 53 |     defaultValue = sanitize(defaultValue);
+ 54 | 
+ 55 |     if(isArray) {
+ 56 |         result = '<textarea class=\'body-textarea' + (param.required ? ' required' : '') + '\' name=\'' + name + '\'' + idAtt + dataVendorExtensions;
+ 57 |         result += ' placeholder=\'Provide multiple values in new lines' + (param.required ? ' (at least one required).' : '.') + '\'>';
+ 58 |         result += defaultValue + '</textarea>';
+ 59 |     } else {
+ 60 |         var parameterClass = 'parameter';
+ 61 |         if(param.required) {
+ 62 |           parameterClass += ' required';
+ 63 |         }
+ 64 |         result = '<input class=\'' + parameterClass + '\' minlength=\'' + (param.required ? 1 : 0) + '\'';
+ 65 |         result += ' name=\'' + name +'\' placeholder=\'' + (param.required ? '(required)' : '') + '\'' + idAtt + dataVendorExtensions;
+ 66 |         result += ' type=\'' + type + '\' value=\'' + defaultValue + '\'/>';
+ 67 |     }
+ 68 |     return new Handlebars.SafeString(result);
+ 69 | });
+```
+
+### 何がバグだったか
+
+攻撃者は、自分のサーバーに API 仕様の JSON を置き、被害者に「対象の swagger-ui の URL ?url=攻撃者の仕様の URL」を開かせる。swagger-ui はその仕様をブラウザの中で HTML に組み立てるので、仕様の値（default 値・x-data-*・description・enum 値など）に入れた文字列で、swagger-ui のオリジンでスクリプトが動く（判定・"xssの詳細" の記録）。
+
+| バグ | 元の行 | 内容 |
+|---|---|---|
+| バグ1: サニタイザがブラックリスト | L4-10 | `<script>…</script>`（L6）と、`on属性="…"`・`on属性='…'`・`on属性=単語(単語)` の 3 つの形（L7）だけを消す。それ以外はすべて素通りする: 引用符なしで記号を含むイベント属性（`onerror=alert(document.domain)`）、大文字や `=` の前後の空白、svg・iframe などのタグ、`javascript:` の URL、`'` `"` による属性からの脱出、`</textarea>` による脱出。`<` `>` `'` `"` は 1 つもエスケープしない |
+| バグ2: default 値が属性・textarea から抜け出せる | L32・L53 → L58・L66 | default 値（API 仕様の parameters[].default）を、バグ1 の `sanitize()` に通しただけで、textarea の中（L58）と `value='…'`（L66）に連結する。`'` や `</textarea>` で抜け出して、イベント属性やタグを入れられる |
+| バグ3: X-data-* の名前と値をエスケープしない | L37-43 → L56・L65 | `X-data-` で始まるプロパティなら、名前の残りの部分も値もそのまま属性にする（L39・L42）。名前に空白や `=` を入れれば属性を自由に足せ、値の `'` で属性から抜け出せる |
+| バグ4: 同じサニタイザを、テンプレートのほかの出力にも使っている | L12-26 | テンプレートが `{{{sanitize description}}}`（param.handlebars L32 など）、`<textarea>{{{sanitize default}}}</textarea>`（param_required.handlebars L9）、`value='{{{sanitize value}}}'`（param_list.handlebars L11 の enum 値）などで使っている。バグ1 があるので、これらの経路でも XSS になる |
+| バグ5（付随）: 文字列以外とオブジェクトの扱い | L6・L20 | 真偽値を渡すと `html.replace is not a function` の例外で描画が止まる。オブジェクト・配列は JSON の文字列にしてから消す処理をするので、配列の要素の攻撃の文字列が残る |
+
+- `renderTextParam` は結果を `Handlebars.SafeString` で返す（L68）ので、テンプレート側でも自動エスケープされない。`name`・`valueId`・`paramType`（L33-35）だけは escapeExpression 済みだった。
+- XSS の経路（"xssの詳細"）: index.html の `?url=`（source）→ 仕様の JSON → ParameterView の `template(this.model)` → `renderTextParam`（L32・L37-43・L53）→ L56-66 の文字列連結 → `$(this.el).html(…)`（sink）。
+
+### 元のコードでの動きの例（node で確かめた）
+
+| 入力 | 元のコードの出力 | 何が起きるか |
+|---|---|---|
+| `sanitize('<img src=x onerror=alert(document.domain)>')` | `<img src=x onerror=alert(document.domain)>` | 消えない（引用符なしで `.` を含むので、L7 の 3 つの形のどれにも当たらない）。画像の読み込みに失敗するとスクリプトが動く |
+| `sanitize('<IMG SRC=x ONERROR = "alert(1)">')` | そのまま | `=` の前後の空白で、L7 に当たらない |
+| `sanitize('<a href="javascript:alert(1)">x</a>')` | そのまま | URL を調べないので、クリックでスクリプトが動く |
+| `sanitize('</textarea><script>alert(1)</script>')` | `</textarea>` | script は消えるが、`</textarea>` は残るので、textarea から抜け出せる |
+| `sanitize(true)` | 例外 `html.replace is not a function` | 描画が止まる |
+| `renderTextParam({ name: 'q', type: 'string', default: "x' autofocus onfocus='alert(1)", 'X-data-a': "b' onclick='c", valueId: 'v' })` | `<input … id='v' data-a='b' onclick='c' type='text' value='x' autofocus onfocus='alert(1)'/>` | default 値（バグ2）と X-data-* の値（バグ3）から、onfocus・onclick の属性ができる |
+| `renderTextParam({ name: 'q', type: 'array', default: ['</textarea><img src=x onerror=alert(document.domain)>'], 'X-data-a b="1" onclick': 'z' })` | `<textarea class='body-textarea' name='q' data-a b="1" onclick='z' placeholder='…'></textarea><img src=x onerror=alert(document.domain)></textarea>` | 名前から onclick の属性ができ（バグ3）、default 値が textarea から抜け出して img が動く（バグ2） |
+
+## 修正の内容（元のコード → 修正コード4）
+
+### 4-1. `_sanitize` の本体（元 L4-10 → 修4 L302-326）
+
+```diff
+  元 L  4  修 L302 | var _sanitize = function(html) {
+- 元 L  5           |     // Strip the script tags from the html and inline evenhandlers
+- 元 L  6           |     html = html.replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, '');
+- 元 L  7           |     html = html.replace(/(on\w+="[^"]*")*(on\w+='[^']*')*(on\w+=\w*\(\w*\))*/gi, '');
+- 元 L  8           | 
+- 元 L  9           |     return html;
++           修 L304 |     var stack = [];
++           修 L305 |     var out;
++           修 L309 |     html = _stripComments(String(html));
++           修 L311 |     out = html.replace(/<(\/?)([a-zA-Z][a-zA-Z0-9]*)((?:[\s\/][^<>]*)?)>|[^<]+|</g, function(m, slash, name, attrs) {
++           修 L312 |         var tag;
++           修 L313 |         if (name) {
++           修 L316 |             tag = name.toLowerCase();
++           修 L317 |             if (_has(_allowedTags, tag) && !(slash && _has(_voidTags, tag))) {
++           修 L318 |                 return slash ? _closeTag(stack, tag) : _openTag(stack, tag, _sanitizeTag(m, slash, name, attrs));
++           修 L319 |             }
++           修 L320 |             return _sanitizeTag(m, slash, name, attrs);
++           修 L321 |         }
++           修 L322 |         return _escapeText(m);
++           修 L323 |     });
++           修 L325 |     return out + _closeFrom(stack, 0);
+  元 L 10  修 L326 | };
+```
+
+- 元の L5-9（正規表現で script と一部の on 属性を消して、残りをそのまま返す）を、すべて取り除いた。
+- 修4 L309: 入力を `String()` で文字列にし（真偽値などでも例外にならない。バグ5）、HTML コメント `<!--…-->` を `_stripComments`（L134-151）で取り除く。
+- 修4 L311-323: 入力を先頭から「タグ」「`<` を含まない文字列」「単独の `<`」のどれかとして読む。3 つの選択肢で全部の文字が必ずどれかに当たるので、処理されずに素通りする文字が無い。
+  - 許可したタグ（空要素の終了タグを除く）は、`_sanitizeTag`（L97-128）で組み立て直したうえで、開始タグは `_openTag`（L215-281）、終了タグは `_closeTag`（L285-300）で、タグの対応を取ってから出す（L316-319）。
+  - 許可しないタグと空要素の終了タグは、`_sanitizeTag` が文字として表示する形にするか、捨てる（L320）。
+  - タグ以外の文字列は `_escapeText`（L49-55）でエスケープする（L322）。
+- 修4 L304・L325: この出力の中で開いているタグをスタック `stack` で覚え、最後に開いたままのタグをすべて閉じる。
+
+### 4-2. 新しく足した部品（修4 L29-300。元のコードの L3 と L4 の間に入った）
+
+#### (a) 許可の表と、文字列のエスケープ（修4 L29-55）
+
+```
+ 29 | var _has = function(obj, key) {
+ 30 |     return Object.prototype.hasOwnProperty.call(obj, key);
+ 31 | };
+ 32 | 
+ 33 | var _allowedTags = {
+ 34 |     a: true, b: true, blockquote: true, br: true, code: true, dd: true, del: true, div: true,
+ 35 |     dl: true, dt: true, em: true, h1: true, h2: true, h3: true, h4: true, h5: true, h6: true,
+ 36 |     hr: true, i: true, img: true, kbd: true, li: true, ol: true, p: true, pre: true, s: true,
+ 37 |     small: true, span: true, strike: true, strong: true, sub: true, sup: true, table: true,
+ 38 |     tbody: true, td: true, tfoot: true, th: true, thead: true, tr: true, u: true, ul: true
+ 39 | };
+ 40 | var _voidTags = { br: true, hr: true, img: true };
+ 41 | var _allowedAttrs = {
+ 42 |     a: { href: 'url', title: 'text' },
+ 43 |     img: { src: 'url', alt: 'text', title: 'text' }
+ 44 | };
+ 45 | var _textEscapes = { '<': '&lt;', '>': '&gt;', '"': '&quot;', '\'': '&#x27;', '`': '&#x60;', '=': '&#x3D;' };
+ 46 | var _namedEntities = { amp: '&', lt: '<', gt: '>', quot: '"', apos: '\'' };
+ 47 | 
+ 49 | var _escapeText = function(text) {
+ 50 |     return text
+ 51 |         .replace(/&(?!(?:[a-zA-Z][a-zA-Z0-9]{0,31}|#[0-9]{1,7}|#[xX][0-9a-fA-F]{1,6});)/g, '&amp;')
+ 52 |         .replace(/[<>"'`=]/g, function(c) {
+ 53 |             return _textEscapes[c];
+ 54 |         });
+ 55 | };
+```
+
+- `_has`（L29-31）: オブジェクトが自分のプロパティとしてキーを持つかを調べる。`<constructor>`・`__proto__=` のようなプロトタイプの名前を「許可」と取り違えないため。
+- `_allowedTags`（L33-39）: 残してよいタグ。script・svg・iframe・style・textarea・select・form などは入っていない。
+- `_voidTags`（L40）: 閉じタグの無い要素（br, hr, img）。
+- `_allowedAttrs`（L41-44）: 残してよい属性は、a の href・title、img の src・alt・title だけ。on 属性・style・class・id などは残らない。`'url'` の属性は URL として調べる。
+- `_escapeText`（L49-55）: タグ以外の文字列の `<` `>` `"` `'` `` ` `` `=` を文字参照にする。`&` は、正しい形の文字参照（`&amp;`・`&lt;`・`&#60;` など）になっていないものだけを `&amp;` にする（説明文に書かれた文字参照の表示を変えないため）。→ バグ1 の「`<` `>` `'` `"` をエスケープしない」を直す。
+
+#### (b) 属性値の文字参照の扱い（修4 L59-83）
+
+```
+ 59 | var _decodeEntities = function(value) {
+ 60 |     return value.replace(/&(?:#([0-9]{1,7})|#[xX]([0-9a-fA-F]{1,6})|(amp|lt|gt|quot|apos));/g, function(m, dec, hex, named) {
+ 61 |         var code;
+ 62 |         if (named) {
+ 63 |             return _namedEntities[named];
+ 64 |         }
+ 65 |         code = dec ? parseInt(dec, 10) : parseInt(hex, 16);
+ 66 |         if (code === 0 || code > 0x10FFFF || (code >= 0xD800 && code <= 0xDFFF)) {
+ 67 |             return '\uFFFD';
+ 68 |         }
+ 69 |         if (code > 0xFFFF) {
+ 70 |             code -= 0x10000;
+ 71 |             return String.fromCharCode(0xD800 + Math.floor(code / 0x400), 0xDC00 + code % 0x400);
+ 72 |         }
+ 73 |         return String.fromCharCode(code);
+ 74 |     });
+ 75 | };
+ 76 | 
+ 79 | var _encodeAttr = function(value) {
+ 80 |     return value.replace(/[^A-Za-z0-9_.\-:\/?#%~+,;@!$()*\[\]\u0080-\uFFFF]/g, function(c) {
+ 81 |         return '&#x' + c.charCodeAt(0).toString(16) + ';';
+ 82 |     });
+ 83 | };
+```
+
+- `_decodeEntities`（L59-75）: 属性値の文字参照（数値参照と amp・lt・gt・quot・apos）を文字に戻してから検査する。`java&#x73;cript:` のように、文字参照で検査をすり抜ける形を防ぐ。
+- `_encodeAttr`（L79-83）: 残す属性値は引用符を使わずに出し、英数字・URL で使う記号（`_ . - : / ? # % ~ + , ; @ ! $ ( ) * [ ]`）・U+0080 以上の文字以外は、すべて `&#x..;` にする。空白・`'` `"` `` ` `` `=` `<` `>` `&` は必ず符号化されるので、テンプレートが引用符付きの属性（`value='…'` など）の中でこのヘルパーを使っていても、属性から抜け出せない（バグ4）。
+
+#### (c) URL の検査（修4 L87-94）
+
+```
+ 87 | var _isSafeUrl = function(url, tag) {
+ 88 |     var scheme = url.replace(/[\u0000- ]/g, '').match(/^([a-zA-Z][a-zA-Z0-9+.\-]*):/);
+ 89 |     if (!scheme) {
+ 90 |         return true;
+ 91 |     }
+ 92 |     scheme = scheme[1].toLowerCase();
+ 93 |     return scheme === 'http' || scheme === 'https' || (tag === 'a' && scheme === 'mailto');
+ 94 | };
+```
+
+- 制御文字と空白（U+0000〜U+0020）をすべて除いてからスキームを調べる（ブラウザは `java\tscript:` なども `javascript:` と読むため）。
+- スキームの無い相対 URL（`#…`・`/…`・`//host/…`）は許す。スキームがあれば http・https・（a だけ）mailto だけを許す。`javascript:`・`data:` などの属性は捨てる（バグ1）。
+
+#### (d) タグの組み立て直し `_sanitizeTag`（修4 L97-128）
+
+```
+ 97 | var _sanitizeTag = function(source, slash, name, attrs) {
+ 98 |     var tag = name.toLowerCase();
+ 99 |     var allowedAttrs, out;
+100 |     if (!_has(_allowedTags, tag)) {
+101 |         return _escapeText(source);
+102 |     }
+103 |     if (slash) {
+104 |         return _has(_voidTags, tag) ? '' : '</' + tag + '>';
+105 |     }
+106 |     allowedAttrs = _has(_allowedAttrs, tag) ? _allowedAttrs[tag] : {};
+107 |     out = '<' + tag;
+108 |     attrs.replace(/([^\s"'<>\/=]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'<>`=]+)))?/g, function(m, attrName, v1, v2, v3) {
+109 |         var key = attrName.toLowerCase();
+110 |         var value = _decodeEntities(v1 || v2 || v3 || '');
+118 |         if (_has(allowedAttrs, key) && value !== '' && !/[<>]/.test(value) &&
+119 |             (allowedAttrs[key] !== 'url' || _isSafeUrl(value, tag))) {
+120 |             out += ' ' + key + '=' + _encodeAttr(value);
+121 |         }
+122 |         return m;
+123 |     });
+127 |     return out + (out.charAt(out.length - 1) === '/' ? ' >' : '>');
+128 | };
+```
+
+- L100-102: 許可しないタグは、タグ全体を `_escapeText` で文字として表示する（`<svg onload=…>` は `&lt;svg onload&#x3D;…&gt;` になり、タグとして働かない）。
+- L103-105: 終了タグは `</タグ名>` だけを出す（属性は付けない。空要素の終了タグは捨てる）。
+- L106-123: 開始タグは `<タグ名` から組み立て直し、属性を 1 つずつ読んで、次の条件をすべて満たすものだけを ` 属性名=符号化した値` の形で付ける。
+  - `_allowedAttrs` にある属性で、値が空でない。
+  - 文字参照を戻した後の値に `<` も `>` も含まない（L118 の `!/[<>]/.test(value)`）。description は描画の後に marked に通し直される（SwaggerUi.js の renderGFM）。古いブラウザは innerHTML の直列化で属性値の `<` `>` をそのまま出すので、属性値に `<` `>` があると、そこから新しいタグができてしまう（mutation XSS）。
+  - URL の属性は `_isSafeUrl` が許すもの（L119）。
+- L127: 最後の属性値が `/` で終わるとき（`<a href=/x/>` など）は、`>` の前に空白を入れる。jQuery 1.8.0 の `.html()` が `<a …/>` を `<a …></a>` に書き換えて、タグの対応がずれるのを防ぐ。
+
+#### (e) HTML コメントの除去 `_stripComments`（修4 L134-151）
+
+```
+134 | var _stripComments = function(html) {
+135 |     var out = '';
+136 |     var pos = 0;
+137 |     var start, end;
+138 |     for (;;) {
+139 |         start = html.indexOf('<!--', pos);
+140 |         if (start === -1) {
+141 |             break;
+142 |         }
+143 |         end = html.indexOf('-->', start + 4);
+144 |         if (end === -1) {
+145 |             break;
+146 |         }
+147 |         out += html.substring(pos, start);
+148 |         pos = end + 3;
+149 |     }
+150 |     return out + html.substring(pos);
+151 | };
+```
+
+- `<!--` を見つけたら、その後の最初の `-->` までを消し、続きを探す。`-->` が無ければ、そこから後はそのまま残す（残った `<!--` は、`_sanitize` で文字として表示される）。
+- `indexOf` で先頭から 1 回だけ走査するので、`<!--` を繰り返す長い入力でも、時間は入力の長さに比例する（正規表現 `/<!--[\s\S]*?-->/g` だと 2 乗の時間になる）。
+
+#### (f) タグの対応を取るための表（修4 L155-170）
+
+```
+155 | var _specialTags = {
+156 |     blockquote: true, dd: true, div: true, dl: true, dt: true, h1: true, h2: true, h3: true, h4: true, h5: true, h6: true,
+157 |     li: true, ol: true, p: true, pre: true, table: true, tbody: true, td: true, tfoot: true, th: true, thead: true, tr: true, ul: true
+158 | };
+160 | var _closePTags = {
+161 |     blockquote: true, dd: true, div: true, dl: true, dt: true, h1: true, h2: true, h3: true, h4: true, h5: true, h6: true,
+162 |     hr: true, li: true, ol: true, p: true, pre: true, table: true, ul: true
+163 | };
+164 | var _headingTags = { h1: true, h2: true, h3: true, h4: true, h5: true, h6: true };
+165 | var _scopeTags = { table: true, td: true, th: true };
+166 | var _listScopeTags = { ol: true, table: true, td: true, th: true, ul: true };
+167 | var _tableOnlyTags = { table: true, tbody: true, tfoot: true, thead: true, tr: true };
+168 | var _tableSectionTags = { tbody: true, tfoot: true, thead: true };
+169 | var _tablePartTags = { tbody: true, td: true, tfoot: true, th: true, thead: true, tr: true };
+170 | var _maxDepth = 100;
+```
+
+- HTML パーサの規則を写した表。どれも許可したタグの中だけ。
+  - `_specialTags`: パーサの「special」に当たるタグ。li・dd・dt の開始タグで、閉じる相手を探すのをここで止める。
+  - `_closePTags`: 開始タグで、開いている p をパーサが暗黙に閉じるタグ。
+  - `_scopeTags`・`_listScopeTags`: 終了タグの相手を探すのを止める境界。
+  - `_tableOnlyTags`・`_tableSectionTags`・`_tablePartTags`: 表の構造のタグ。
+  - `_maxDepth`: 入れ子の深さの上限（100）。スタックを探す時間を一定以下にして、処理時間を入力の長さに比例させる。
+
+#### (g) スタックの操作（修4 L175-211）
+
+```
+175 | var _findOpen = function(stack, names, stops) {
+176 |     var i;
+177 |     for (i = stack.length - 1; i >= 0; i--) {
+178 |         if (names[stack[i]] === true) {
+179 |             return i;
+180 |         }
+181 |         if (stops[stack[i]] === true) {
+182 |             return -1;
+183 |         }
+184 |     }
+185 |     return -1;
+186 | };
+187 | 
+189 | var _closeFrom = function(stack, index) {
+190 |     var out = '';
+191 |     while (stack.length > index) {
+192 |         out += '</' + stack.pop() + '>';
+193 |     }
+194 |     return out;
+195 | };
+196 | 
+200 | var _findListItem = function(stack, names) {
+201 |     var i;
+202 |     for (i = stack.length - 1; i >= 0; i--) {
+203 |         if (_has(names, stack[i])) {
+204 |             return i;
+205 |         }
+206 |         if (_has(_specialTags, stack[i]) && stack[i] !== 'div' && stack[i] !== 'p') {
+207 |             return -1;
+208 |         }
+209 |     }
+210 |     return -2;
+211 | };
+```
+
+- `_findOpen`（L175-186）: スタックの上から、指定のタグを探して位置を返す。境界のタグに先に当たったときや、見つからないときは -1。
+- `_closeFrom`（L189-195）: スタックの指定の位置から上の要素を、内側から順に閉じる終了タグを作る。
+- `_findListItem`（L200-211）: li・dd・dt の開始タグのとき、パーサと同じく、閉じるべき前の項目を探す。出力の中にリストが無いとき（スタックの底まで当たらないとき）は -2 を返し、そのタグは捨てる。
+
+#### (h) 開始タグの出力 `_openTag`（修4 L215-281）
+
+```
+215 | var _openTag = function(stack, tag, html) {
+216 |     var out = '';
+217 |     var top = stack.length ? stack[stack.length - 1] : '';
+218 |     var i;
+219 |     if (!_has(_voidTags, tag) && stack.length >= _maxDepth) {
+220 |         return '';
+221 |     }
+222 |     if (_has(_tablePartTags, tag)) {
+225 |         i = _findOpen(stack, { table: true }, {});
+226 |         if (i === -1) {
+227 |             return '';
+228 |         }
+229 |         i += 1;
+230 |         if (!_has(_tableSectionTags, tag)) {
+231 |             if (_has(_tableSectionTags, stack[i])) {
+232 |                 i += 1;
+233 |             }
+234 |             if (tag !== 'tr') {
+235 |                 if (stack[i] === 'tr') {
+236 |                     i += 1;
+237 |                 } else {
+239 |                     out = _closeFrom(stack, i) + '<tr>';
+240 |                     stack.push('tr');
+241 |                     i = stack.length;
+242 |                 }
+243 |             }
+244 |         }
+246 |         out += _closeFrom(stack, i);
+247 |     } else if (_has(_tableOnlyTags, top)) {
+249 |         return '';
+250 |     } else {
+251 |         if (tag === 'li' || tag === 'dd' || tag === 'dt') {
+252 |             i = _findListItem(stack, tag === 'li' ? { li: true } : { dd: true, dt: true });
+253 |             if (i === -2) {
+254 |                 return '';
+255 |             }
+256 |             if (i !== -1) {
+257 |                 out += _closeFrom(stack, i);
+258 |             }
+259 |         }
+260 |         if (_has(_closePTags, tag)) {
+261 |             i = _findOpen(stack, { p: true }, _scopeTags);
+262 |             if (i !== -1) {
+263 |                 out += _closeFrom(stack, i);
+264 |             }
+265 |         }
+266 |         if (_has(_headingTags, tag) && _has(_headingTags, stack[stack.length - 1] || '')) {
+267 |             out += _closeFrom(stack, stack.length - 1);
+268 |         }
+269 |         if (tag === 'a') {
+271 |             i = _findOpen(stack, { a: true }, { td: true, th: true });
+272 |             if (i !== -1) {
+273 |                 out += _closeFrom(stack, i);
+274 |             }
+275 |         }
+276 |     }
+277 |     if (!_has(_voidTags, tag)) {
+278 |         stack.push(tag);
+279 |     }
+280 |     return out + html;
+281 | };
+```
+
+- L219-221: 入れ子が 100 段を超える開始タグは捨てる。
+- L222-246: 表の部品（tbody・thead・tfoot・tr・td・th）は、この出力の中で開いた table の中だけで使える。table が無ければ捨てる（そのまま出すと、パーサがテンプレート側の `<td class="markdown">` などを閉じてしまう）。table の中では、パーサが暗黙に閉じる前の td・tr などを先に明示的に閉じ、tr の無い td・th には tr を補う。
+- L247-249: table・tbody・tr などの直下に表の部品以外のタグが来たら捨てる（パーサは表の外へ移してしまう）。
+- L251-259: li・dd・dt は、開いている前の同じ種類の項目を閉じてから開く。
+- L260-265: 開いている p をパーサが暗黙に閉じるタグ（div・table・ul など）では、先に `</p>` を出す。
+- L266-268: 見出しの中の見出しは、先に外側の見出しを閉じる。
+- L269-275: a の中の a は、先に外側の a を閉じる。
+- L277-280: 空要素以外はスタックに積み、先に出す終了タグと、このタグを返す。
+
+#### (i) 終了タグの出力 `_closeTag`（修4 L285-300）
+
+```
+285 | var _closeTag = function(stack, tag) {
+286 |     var names = {};
+287 |     var i;
+288 |     names[tag] = true;
+289 |     if (_has(_headingTags, tag)) {
+291 |         i = _findOpen(stack, _headingTags, _scopeTags);
+292 |     } else if (tag === 'table' || _has(_tablePartTags, tag)) {
+293 |         i = _findOpen(stack, names, { table: true });
+294 |     } else if (tag === 'li') {
+295 |         i = _findOpen(stack, names, _listScopeTags);
+296 |     } else {
+297 |         i = _findOpen(stack, names, _scopeTags);
+298 |     }
+299 |     return i === -1 ? '' : _closeFrom(stack, i);
+300 | };
+```
+
+- 対応する開始タグが、この出力の中で（スコープの中に）開いているときだけ、その要素までを内側から順に閉じる。
+- 対応する開始タグが無い終了タグは捨てる。テンプレート側の `</div>` や `</td>` を、ヘルパーの出力が閉じることはない。
+- h1〜h6 の終了タグは、開いている見出しをどれでも閉じる（パーサと同じ）。
+
+### 4-3. `sanitize` のオブジェクトの扱い（元 L20 → 修4 L340）
+
+```diff
+  元 L 19  修 L335 |         _html = JSON.stringify(html);
+- 元 L 20           |         return new Handlebars.SafeString(JSON.parse(_sanitize(_html)));
++           修 L340 |         return new Handlebars.SafeString(_sanitize('' + JSON.parse(_html)));
+  元 L 21  修 L341 |     }
+```
+
+- 元のコードは、オブジェクト・配列を JSON の文字列にしてからサニタイズし、`JSON.parse` で戻していた。新しいサニタイザは `"` をエスケープするので、この順番だと JSON が壊れる。また元のように JSON の文字列のまま処理すると、配列の要素の攻撃の文字列が残る（バグ5）。
+- 修正コード4 は、先に `JSON.parse` で戻して、表示と同じ文字列（`'' + …`）にしてから `_sanitize` に通す。表示される文字列の形は元と同じ。
+
+### 4-4. `renderTextParam` の 3 行（元 L39・L42・L53 → 修4 L360・L364・L379）
+
+```diff
+  元 L 38  修 L358 |         // filter X-data- properties
+- 元 L 39           |         return property.match(/^X-data-/i) !== null;
++           修 L360 |         return property.match(/^X-data-[A-Za-z0-9_-]+$/i) !== null;
+  元 L 40  修 L361 |     }).reduce(function(result, property) {
+```
+
+- X-data-* のプロパティ名を、`X-data-` の後が英数字・`-`・`_` だけのものに限る（バグ3）。
+
+```diff
+  元 L 41  修 L362 |         // remove X- from property name, so it results in html attributes like data-foo='bar'
+- 元 L 42           |         return result += ' ' + property.substring(2, property.length) + '=\'' + param[property] + '\'';
++           修 L364 |         return result += ' ' + property.substring(2, property.length) + '=\'' + Handlebars.Utils.escapeExpression(param[property]) + '\'';
+  元 L 43  修 L365 |     }, '');
+```
+
+- X-data-* の値を、`Handlebars.Utils.escapeExpression`（Handlebars 4.0.5。`&` `<` `>` `"` `'` `` ` `` `=` を文字参照にする）でエスケープしてから属性にする（バグ3）。
+
+```diff
+  元 L 51  修 L373 |     }
+  元 L 52  修 L374 | 
+- 元 L 53           |     defaultValue = sanitize(defaultValue);
++           修 L379 |     defaultValue = Handlebars.Utils.escapeExpression(defaultValue);
+  元 L 54  修 L380 | 
+  元 L 55  修 L381 |     if(isArray) {
+```
+
+- default 値は HTML として表示する必要がなく、入力欄に入力どおりに表示すべき値なので、`sanitize()` ではなく `escapeExpression` でエスケープする（バグ2）。新しい `sanitize` は許可したタグや文字参照を残すので、ここには使わない。
+
+## 5. 修正の過程（どの回で、何が分かり、修正コード4 のどこができたか）
+
+### 5-1. 一覧
+
+| 回 | 日付（2026 年） | 直す前に分かっていた不備 | 修正コード4 の中で、この回にできた部分 | 次の検証の結果 |
+|---|---|---|---|---|
+| 修正1 | 10-12 | 判定のバグ2・バグ3 | L360・L364・L379（元 L39・L42・L53 の書き換え） | 検証1（11-05）: **不備あり** |
+| 修正2 | 11-05 | バグ1・バグ4・バグ5（弱い `_sanitize` が元のまま残っていた） | ホワイトリスト型のサニタイザ: L29-55、L59-94、`_sanitizeTag` の L97-123（L118 の `<` `>` の条件を除く）、`_sanitize` の本体（L309 の `String()` と L311-323 の読み取り）、L340 | 検証2（11-06）: **不備あり** |
+| 修正3 | 11-14 | 許可した属性値の `<` `>` による mutation XSS。コメント除去の処理時間 | L118 の条件 `!/[<>]/.test(value)`、`_stripComments`（L134-151）と L309 での呼び出し | 検証3（11-14）: **不備あり** |
+| 修正4 | 11-14 | 閉じないタグで、後に続くテンプレートの要素を取り込む mutation XSS。`</table>` による描画の例外 | タグの対応を取る部品（L155-300）、`_sanitize` のスタックの部分（L304-305・L311-312・L316-319・L325）、L127 | 検証4（11-14〜15）: **問題なし** |
+
+### 5-2. 修正1
+
+- きっかけ: 判定。判定は、弱い `_sanitize`（バグ1）を根拠の 1 つ目にあげ、`renderTextParam` の default 値（バグ2）と X-data-*（バグ3）を主な経路にあげた。
+- この回に変えたこと: 元 L39・L42・L53 の 3 行（いまの修4 L360・L364・L379。4-4 の diff のとおりで、修正コード4 まで変わっていない）。`_sanitize` と `sanitize` ヘルパーは、「このブラックリストは不十分」というコメントを付けただけで、コードは元のままにした。
+- 検証1（プロンプトファイル2）の結果: **不備あり**。
+  - `renderTextParam` の 3 か所は直っていた（攻撃 7 件で危険なし）。
+  - しかし、バグ1 の `_sanitize` とバグ4 の `sanitize` ヘルパーが元のままなので、同じ source（default 値・description）と enum 値から、次の経路で XSS が残っていた（jsdom で描画して確認）。
+    - required の body パラメータの textarea（param_required.handlebars L9）: default `</textarea><img src=x onerror=alert(document.domain)>` → img に onerror ができる（default が配列でも同じ）。
+    - readOnly のパラメータの default → img に onerror。
+    - description（param.handlebars L32 など）: `<img src=x onerror=…>`・`<svg/onload=…>` → onerror・onload ができる。
+    - enum 値（param_list.handlebars L11）: `x' autofocus onfocus=alert(document.domain) y='` → option に onfocus ができる。
+  - `sanitize` をテンプレートの 7 つの文脈で直接呼んだ 36 入力 × 7 文脈 = 252 件で、元のコードと同じ 46 件が危険だった。
+
+### 5-3. 修正2
+
+- きっかけ: 検証1 の不備（バグ1・バグ4 が残っていた）。
+- この回に変えたこと: 「危ないものを消す」ブラックリストをやめ、「安全と分かっているタグと属性だけを組み立て直し、それ以外は文字として表示する」ホワイトリストのサニタイザにした。いまの修正コード4 の (a)〜(d)（L29-128。ただし L118 の `<` `>` の条件と L127 を除く）と、`_sanitize` の本体（L309・L311-323 の、タグ・文字列・単独の `<` を読み分ける部分）、オブジェクトの扱い（L340）がこの回のもの。コメントの除去は、このときは正規表現 `/<!--[\s\S]*?-->/g` だった。
+- 作ったエージェントの確認: 検証1 の 7 経路はすべて危険なし。252 件で危険 46 件 → 0 件。ランダムな入力 20,000 件 × 5 文脈で 0 件。
+- 検証2（修正コード2の検証）の結果: **不備あり**。
+  - 1 回の HTML の解析で入る経路（textarea・引用符付きの属性値・本文）は直っていた（攻撃 266 件で、元のコードの 82 件 → 0 件）。
+  - しかし description は、描画の後に SwaggerUi.js の renderGFM（`$(this).html(marked($(this).html()))`）で marked に通し直される。2025 年の HTML 仕様の変更より前のブラウザは、innerHTML の直列化で属性値の `<` `>` をそのまま出すので、許可した属性値（title・alt・href・src）に文字参照で書いた `<` `>` が生の HTML に戻り、marked が属性値の途中から区切って `<img src=x onerror=…>` を HTML として出力した（mutation XSS）。
+    - 入力の例: `foo <img title="x&#10;&#10;&lt;img src=x onerror=alert(document.domain)&gt;">`
+    - jQuery 1.8.0＋jsdom 16.7.0（古い直列化）で、990 の組み合わせのうち 585 件で img@onerror ができた（新しい直列化の jsdom 31 では 0 件）。
+  - 指摘: コメント除去の正規表現が、閉じない `<!--` を繰り返す入力で 2 乗の時間になる（約 20 万文字で 4.6 秒）。
+
+### 5-4. 修正3
+
+- きっかけ: 検証2 の不備（属性値の `<` `>` による mutation XSS）と指摘（コメント除去の処理時間）。
+- この回に変えたこと:
+  - `_sanitizeTag` の属性を残す条件に `!/[<>]/.test(value)` を足した（いまの修4 L118）。古い直列化で生のまま出る `<` `>` は属性値の中のものだけなので、属性値に `<` `>` が無ければ、marked に渡る文字列の中の生の `<` は許可したタグの先頭だけになる。符号化では防げない（ブラウザが解析した時点で `<` に戻る）ので、属性ごと捨てる。
+  - コメントの除去を、`indexOf` で 1 回だけ走査する `_stripComments`（いまの修4 L134-151）に替え、`_sanitize` から呼ぶようにした（L309）。
+- 作ったエージェントの確認: 検証2 の入力 66 件で、危険は元のコード〜修正コード2 の 54 件 → 0 件。21,600 の組み合わせで 8,624 件 → 0 件。`<!--` の繰り返し（約 20 万文字）は 4,566 ms → 148 ms。
+- 検証3（修正コード3の検証）の結果: **不備あり**。
+  - サニタイザが、開始タグと閉じタグの対応を取っていなかった。`sanitize('<div>')` は `<div>`、`sanitize('</div>')` は `</div>` を返していた（修正2 からの作り）。
+  - description に閉じない `<div>` や `<table><tr><td>` があると、テンプレートで後に続く要素（パラメータの入力欄、externalDocs・license の `<a href="…">` など）が `class="markdown"` の要素の中に取り込まれる。それらの属性値には、エスケープされた `&lt;` `&gt;` が入っており、renderGFM の再解析で生の `<` `>` に戻って mutation XSS になる。修正3 の条件は、サニタイザが出す属性しか見ないので効かない。
+    - 入力の例: info.description に `<div>`、externalDocs の url に `x\n\n<img src=x onerror=alert(document.domain)>`。
+    - jsdom 16.7.0 で 49 件中 14 件（元のコード〜修正コード2 も同じ）。修正3 で入ったものではなく、元のコードからある description の XSS が直し切れていなかったもの。
+  - 修正4 を作ったエージェントが、同じ原因の別の問題も見つけた: description などに対応の無い `</table>` があると、jQuery 1.8.0 の `.html()` の中で `TypeError: Cannot read properties of null (reading 'lastChild')` が起き、ページ全体の描画が止まる（元のコードから。XSS ではない）。
+
+### 5-5. 修正4
+
+- きっかけ: 検証3 の不備（閉じないタグによる取り込みと mutation XSS）と、同じ原因の描画の例外。
+- この回に変えたこと: 4-2 の (f)〜(i)（L155-300）を足し、`_sanitize` で、許可したタグの対応をスタックで取るようにした（L304-305・L311-312・L316-319・L325）。また `_sanitizeTag` の最後の行（L127）で、属性値が `/` で終わるときは `>` の前に空白を入れるようにした。
+  - 考え方: ヘルパーの出力の中でタグが必ず閉じられ、HTML パーサが暗黙に閉じたり外へ移したりするタグも先に明示的に閉じる。これで、出力がテンプレートの外側の要素を閉じたり、後に続く要素を取り込んだりしなくなる。
+- 作ったエージェントの確認: 閉じないタグ 28 種 × 取り込む先 13 種 = 364 件で、修正コード3 の危険 50 件・取り込み 154 件 → 0 件・0 件。ページ全体のランダムな description 3,000 件で、テンプレートの構造の変化・危険・取り込み・例外はすべて 0 件。表のタグ 70 件で、`</table>` の例外 5 件 → 0 件。約 20 万文字の 21 種の入力で 190 ms 以内。
+- 検証4（修正コード4の検証）の結果: **問題なし**。
+  - 検証3 の記録の入力 5 件は、元のコード〜修正コード3 で img@onerror ができ、修正コード4 は 0 件。364 件では、修正コード3 の取り込み 233 件・XSS 81 件 → 0 件。`</table>` の例外も直っている。
+  - 13 の文脈でランダムな 32 万 5 千件・組み合わせ 61 万件・ページ全体 6,000 件ともに失敗 0 件（jsdom 16.7.0・31.0.1）。判定の根拠と、修正2・修正3 で直した不備も 0 件のまま。約 20 万文字で 154 ms 以内。
+
+## 6. 修正コード4 の行と、入った回
+
+| 修4 の行 | 中身 | 入った回 |
+|---|---|---|
+| L1-3 | `'use strict'` など | 元のコード |
+| L4-28 | 修正の理由のコメント | 修正2（L4-20）、修正3（L21-22）、修正4（L23-28） |
+| L29-94 | `_has`・許可の表・`_escapeText`・`_decodeEntities`・`_encodeAttr`・`_isSafeUrl` | 修正2 |
+| L96-128 | `_sanitizeTag` | 修正2。L118 の `<` `>` の条件は修正3、L127 は修正4 |
+| L130-151 | `_stripComments` | 修正3 |
+| L153-300 | タグの対応の表と関数（`_findOpen`〜`_closeTag`） | 修正4 |
+| L302-326 | `_sanitize` | 入口（L302）と最後の `};`（L326）は元のコード。本体は修正2、L309 の `_stripComments` は修正3、スタックの部分（L304-305・L311-312・L316-319・L325）は修正4 |
+| L328-346 | `sanitize` ヘルパー | 元のコード。L340 は修正2 |
+| L348-395 | `renderTextParam` | 元のコード。L360・L364・L379 は修正1 |
+| L397-425 | `ifCond`・`escape` | 元のコード（変わっていない） |
+
+## 7. 変化の例（元のコードと修正コード4 の出力。node で確かめた）
+
+| 入力 | 元のコード | 修正コード4 | 効いている回 |
+|---|---|---|---|
+| `<img src=x onerror=alert(document.domain)>` | そのまま | `<img src=x>` | 修正2 |
+| `<IMG SRC=x ONERROR = "alert(1)">` | そのまま | `<img src=x>` | 修正2 |
+| `<a href="javascript:alert(1)">x</a>` | そのまま | `<a>x</a>` | 修正2 |
+| `<svg onload=alert(1)>` | `<svg >` | `&lt;svg onload&#x3D;alert(1)&gt;`（文字として表示） | 修正2 |
+| `x' onmouseover='alert(1)` | そのまま | `x&#x27; onmouseover&#x3D;&#x27;alert(1)` | 修正2 |
+| `</textarea><script>alert(1)</script>` | `</textarea>` | `&lt;/textarea&gt;&lt;script&gt;alert(1)&lt;/script&gt;` | 修正2 |
+| `true`（真偽値） | 例外 | `true` | 修正2 |
+| `<img title="&lt;img src=x onerror=alert(1)&gt;" src=a.png>` | `<img title="&lt;img src=x &gt;" src=a.png>` | `<img src=a.png>` | 修正3 |
+| `<div>abc` | `<div>abc` | `<div>abc</div>` | 修正4 |
+| `</div></td>abc` | そのまま | `abc` | 修正4 |
+| `<table><tr><td>a` | そのまま | `<table><tr><td>a</td></tr></table>` | 修正4 |
+| `<p>a<div>b</div>` | そのまま | `<p>a</p><div>b</div>` | 修正4 |
+| `<a href=/x/>t</a>` | そのまま | `<a href=/x/ >t</a>` | 修正4 |
+| renderTextParam の default `x' autofocus onfocus='alert(1)` | `value='x' autofocus onfocus='alert(1)'` | `value='x&#x27; autofocus onfocus&#x3D;&#x27;alert(1)'` | 修正1 |
