@@ -1,4 +1,6 @@
-## 元のコード（変わった部分を含む範囲）
+##  元のバグ
+
+###  元のコード（変わった部分を含む範囲）
 
 `_sanitize` と `sanitize` ヘルパー（元 L4-24）:
 
@@ -73,7 +75,7 @@
  69 | });
 ```
 
-### 何がバグだったか
+###  何がバグだったか
 
 攻撃者は、自分のサーバーに API 仕様の JSON を置き、被害者に「対象の swagger-ui の URL ?url=攻撃者の仕様の URL」を開かせる。swagger-ui はその仕様をブラウザの中で HTML に組み立てるので、仕様の値（default 値・x-data-*・description・enum 値など）に入れた文字列で、swagger-ui のオリジンでスクリプトが動く（判定・"xssの詳細" の記録）。
 
@@ -88,7 +90,7 @@
 - `renderTextParam` は結果を `Handlebars.SafeString` で返す（L68）ので、テンプレート側でも自動エスケープされない。`name`・`valueId`・`paramType`（L33-35）だけは escapeExpression 済みだった。
 - XSS の経路（"xssの詳細"）: index.html の `?url=`（source）→ 仕様の JSON → ParameterView の `template(this.model)` → `renderTextParam`（L32・L37-43・L53）→ L56-66 の文字列連結 → `$(this.el).html(…)`（sink）。
 
-### 元のコードでの動きの例（node で確かめた）
+### 3-3. 元のコードでの動きの例（node で確かめた）
 
 | 入力 | 元のコードの出力 | 何が起きるか |
 |---|---|---|
@@ -102,206 +104,206 @@
 
 ## 修正の内容（元のコード → 修正コード4）
 
-### 4-1. `_sanitize` の本体（元 L4-10 → 修4 L302-326）
+### 4-1. `_sanitize` の本体（元 L4-10 → 修4 L234-250）
 
 ```diff
-  元 L  4  修 L302 | var _sanitize = function(html) {
+  元 L  4  修 L234 | var _sanitize = function(html) {
 - 元 L  5           |     // Strip the script tags from the html and inline evenhandlers
 - 元 L  6           |     html = html.replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, '');
 - 元 L  7           |     html = html.replace(/(on\w+="[^"]*")*(on\w+='[^']*')*(on\w+=\w*\(\w*\))*/gi, '');
 - 元 L  8           | 
 - 元 L  9           |     return html;
-+           修 L304 |     var stack = [];
-+           修 L305 |     var out;
-+           修 L309 |     html = _stripComments(String(html));
-+           修 L311 |     out = html.replace(/<(\/?)([a-zA-Z][a-zA-Z0-9]*)((?:[\s\/][^<>]*)?)>|[^<]+|</g, function(m, slash, name, attrs) {
-+           修 L312 |         var tag;
-+           修 L313 |         if (name) {
-+           修 L316 |             tag = name.toLowerCase();
-+           修 L317 |             if (_has(_allowedTags, tag) && !(slash && _has(_voidTags, tag))) {
-+           修 L318 |                 return slash ? _closeTag(stack, tag) : _openTag(stack, tag, _sanitizeTag(m, slash, name, attrs));
-+           修 L319 |             }
-+           修 L320 |             return _sanitizeTag(m, slash, name, attrs);
-+           修 L321 |         }
-+           修 L322 |         return _escapeText(m);
-+           修 L323 |     });
-+           修 L325 |     return out + _closeFrom(stack, 0);
-  元 L 10  修 L326 | };
++           修 L235 |     var stack = [];
++           修 L236 |     var out;
++           修 L237 |     html = _stripComments(String(html));
++           修 L238 |     out = html.replace(/<(\/?)([a-zA-Z][a-zA-Z0-9]*)((?:[\s\/][^<>]*)?)>|[^<]+|</g, function(m, slash, name, attrs) {
++           修 L239 |         var tag;
++           修 L240 |         if (name) {
++           修 L241 |             tag = name.toLowerCase();
++           修 L242 |             if (_has(_allowedTags, tag) && !(slash && _has(_voidTags, tag))) {
++           修 L243 |                 return slash ? _closeTag(stack, tag) : _openTag(stack, tag, _sanitizeTag(m, slash, name, attrs));
++           修 L244 |             }
++           修 L245 |             return _sanitizeTag(m, slash, name, attrs);
++           修 L246 |         }
++           修 L247 |         return _escapeText(m);
++           修 L248 |     });
++           修 L249 |     return out + _closeFrom(stack, 0);
+  元 L 10  修 L250 | };
 ```
 
 - 元の L5-9（正規表現で script と一部の on 属性を消して、残りをそのまま返す）を、すべて取り除いた。
-- 修4 L309: 入力を `String()` で文字列にし（真偽値などでも例外にならない。バグ5）、HTML コメント `<!--…-->` を `_stripComments`（L134-151）で取り除く。
-- 修4 L311-323: 入力を先頭から「タグ」「`<` を含まない文字列」「単独の `<`」のどれかとして読む。3 つの選択肢で全部の文字が必ずどれかに当たるので、処理されずに素通りする文字が無い。
-  - 許可したタグ（空要素の終了タグを除く）は、`_sanitizeTag`（L97-128）で組み立て直したうえで、開始タグは `_openTag`（L215-281）、終了タグは `_closeTag`（L285-300）で、タグの対応を取ってから出す（L316-319）。
-  - 許可しないタグと空要素の終了タグは、`_sanitizeTag` が文字として表示する形にするか、捨てる（L320）。
-  - タグ以外の文字列は `_escapeText`（L49-55）でエスケープする（L322）。
-- 修4 L304・L325: この出力の中で開いているタグをスタック `stack` で覚え、最後に開いたままのタグをすべて閉じる。
+- 修4 L237: 入力を `String()` で文字列にし（真偽値などでも例外にならない。バグ5）、HTML コメント `<!--…-->` を `_stripComments`（L87-104）で取り除く。
+- 修4 L238-248: 入力を先頭から「タグ」「`<` を含まない文字列」「単独の `<`」のどれかとして読む。3 つの選択肢で全部の文字が必ずどれかに当たるので、処理されずに素通りする文字が無い。
+  - 許可したタグ（空要素の終了タグを除く）は、`_sanitizeTag`（L64-85）で組み立て直したうえで、開始タグは `_openTag`（L156-216）、終了タグは `_closeTag`（L218-232）で、タグの対応を取ってから出す（L241-244）。
+  - 許可しないタグと空要素の終了タグは、`_sanitizeTag` が文字として表示する形にするか、捨てる（L245）。
+  - タグ以外の文字列は `_escapeText`（L23-29）でエスケープする（L247）。
+- 修4 L235・L249: この出力の中で開いているタグをスタック `stack` で覚え、最後に開いたままのタグをすべて閉じる。
 
-### 4-2. 新しく足した部品（修4 L29-300。元のコードの L3 と L4 の間に入った）
+### 4-2. 新しく足した部品（修4 L4-232。元のコードの L3 と L4 の間に入った）
 
-#### (a) 許可の表と、文字列のエスケープ（修4 L29-55）
-
-```
- 29 | var _has = function(obj, key) {
- 30 |     return Object.prototype.hasOwnProperty.call(obj, key);
- 31 | };
- 32 | 
- 33 | var _allowedTags = {
- 34 |     a: true, b: true, blockquote: true, br: true, code: true, dd: true, del: true, div: true,
- 35 |     dl: true, dt: true, em: true, h1: true, h2: true, h3: true, h4: true, h5: true, h6: true,
- 36 |     hr: true, i: true, img: true, kbd: true, li: true, ol: true, p: true, pre: true, s: true,
- 37 |     small: true, span: true, strike: true, strong: true, sub: true, sup: true, table: true,
- 38 |     tbody: true, td: true, tfoot: true, th: true, thead: true, tr: true, u: true, ul: true
- 39 | };
- 40 | var _voidTags = { br: true, hr: true, img: true };
- 41 | var _allowedAttrs = {
- 42 |     a: { href: 'url', title: 'text' },
- 43 |     img: { src: 'url', alt: 'text', title: 'text' }
- 44 | };
- 45 | var _textEscapes = { '<': '&lt;', '>': '&gt;', '"': '&quot;', '\'': '&#x27;', '`': '&#x60;', '=': '&#x3D;' };
- 46 | var _namedEntities = { amp: '&', lt: '<', gt: '>', quot: '"', apos: '\'' };
- 47 | 
- 49 | var _escapeText = function(text) {
- 50 |     return text
- 51 |         .replace(/&(?!(?:[a-zA-Z][a-zA-Z0-9]{0,31}|#[0-9]{1,7}|#[xX][0-9a-fA-F]{1,6});)/g, '&amp;')
- 52 |         .replace(/[<>"'`=]/g, function(c) {
- 53 |             return _textEscapes[c];
- 54 |         });
- 55 | };
-```
-
-- `_has`（L29-31）: オブジェクトが自分のプロパティとしてキーを持つかを調べる。`<constructor>`・`__proto__=` のようなプロトタイプの名前を「許可」と取り違えないため。
-- `_allowedTags`（L33-39）: 残してよいタグ。script・svg・iframe・style・textarea・select・form などは入っていない。
-- `_voidTags`（L40）: 閉じタグの無い要素（br, hr, img）。
-- `_allowedAttrs`（L41-44）: 残してよい属性は、a の href・title、img の src・alt・title だけ。on 属性・style・class・id などは残らない。`'url'` の属性は URL として調べる。
-- `_escapeText`（L49-55）: タグ以外の文字列の `<` `>` `"` `'` `` ` `` `=` を文字参照にする。`&` は、正しい形の文字参照（`&amp;`・`&lt;`・`&#60;` など）になっていないものだけを `&amp;` にする（説明文に書かれた文字参照の表示を変えないため）。→ バグ1 の「`<` `>` `'` `"` をエスケープしない」を直す。
-
-#### (b) 属性値の文字参照の扱い（修4 L59-83）
+#### (a) 許可の表と、文字列のエスケープ（修4 L4-29）
 
 ```
- 59 | var _decodeEntities = function(value) {
- 60 |     return value.replace(/&(?:#([0-9]{1,7})|#[xX]([0-9a-fA-F]{1,6})|(amp|lt|gt|quot|apos));/g, function(m, dec, hex, named) {
- 61 |         var code;
- 62 |         if (named) {
- 63 |             return _namedEntities[named];
- 64 |         }
- 65 |         code = dec ? parseInt(dec, 10) : parseInt(hex, 16);
- 66 |         if (code === 0 || code > 0x10FFFF || (code >= 0xD800 && code <= 0xDFFF)) {
- 67 |             return '\uFFFD';
- 68 |         }
- 69 |         if (code > 0xFFFF) {
- 70 |             code -= 0x10000;
- 71 |             return String.fromCharCode(0xD800 + Math.floor(code / 0x400), 0xDC00 + code % 0x400);
- 72 |         }
- 73 |         return String.fromCharCode(code);
- 74 |     });
- 75 | };
- 76 | 
- 79 | var _encodeAttr = function(value) {
- 80 |     return value.replace(/[^A-Za-z0-9_.\-:\/?#%~+,;@!$()*\[\]\u0080-\uFFFF]/g, function(c) {
- 81 |         return '&#x' + c.charCodeAt(0).toString(16) + ';';
- 82 |     });
- 83 | };
+  4 | var _has = function(obj, key) {
+  5 |     return Object.prototype.hasOwnProperty.call(obj, key);
+  6 | };
+  7 | 
+  8 | var _allowedTags = {
+  9 |     a: true, b: true, blockquote: true, br: true, code: true, dd: true, del: true, div: true,
+ 10 |     dl: true, dt: true, em: true, h1: true, h2: true, h3: true, h4: true, h5: true, h6: true,
+ 11 |     hr: true, i: true, img: true, kbd: true, li: true, ol: true, p: true, pre: true, s: true,
+ 12 |     small: true, span: true, strike: true, strong: true, sub: true, sup: true, table: true,
+ 13 |     tbody: true, td: true, tfoot: true, th: true, thead: true, tr: true, u: true, ul: true
+ 14 | };
+ 15 | var _voidTags = { br: true, hr: true, img: true };
+ 16 | var _allowedAttrs = {
+ 17 |     a: { href: 'url', title: 'text' },
+ 18 |     img: { src: 'url', alt: 'text', title: 'text' }
+ 19 | };
+ 20 | var _textEscapes = { '<': '&lt;', '>': '&gt;', '"': '&quot;', '\'': '&#x27;', '`': '&#x60;', '=': '&#x3D;' };
+ 21 | var _namedEntities = { amp: '&', lt: '<', gt: '>', quot: '"', apos: '\'' };
+ 22 | 
+ 23 | var _escapeText = function(text) {
+ 24 |     return text
+ 25 |         .replace(/&(?!(?:[a-zA-Z][a-zA-Z0-9]{0,31}|#[0-9]{1,7}|#[xX][0-9a-fA-F]{1,6});)/g, '&amp;')
+ 26 |         .replace(/[<>"'`=]/g, function(c) {
+ 27 |             return _textEscapes[c];
+ 28 |         });
+ 29 | };
 ```
 
-- `_decodeEntities`（L59-75）: 属性値の文字参照（数値参照と amp・lt・gt・quot・apos）を文字に戻してから検査する。`java&#x73;cript:` のように、文字参照で検査をすり抜ける形を防ぐ。
-- `_encodeAttr`（L79-83）: 残す属性値は引用符を使わずに出し、英数字・URL で使う記号（`_ . - : / ? # % ~ + , ; @ ! $ ( ) * [ ]`）・U+0080 以上の文字以外は、すべて `&#x..;` にする。空白・`'` `"` `` ` `` `=` `<` `>` `&` は必ず符号化されるので、テンプレートが引用符付きの属性（`value='…'` など）の中でこのヘルパーを使っていても、属性から抜け出せない（バグ4）。
+- `_has`（L4-6）: オブジェクトが自分のプロパティとしてキーを持つかを調べる。`<constructor>`・`__proto__=` のようなプロトタイプの名前を「許可」と取り違えないため。
+- `_allowedTags`（L8-14）: 残してよいタグ。script・svg・iframe・style・textarea・select・form などは入っていない。
+- `_voidTags`（L15）: 閉じタグの無い要素（br, hr, img）。
+- `_allowedAttrs`（L16-19）: 残してよい属性は、a の href・title、img の src・alt・title だけ。on 属性・style・class・id などは残らない。`'url'` の属性は URL として調べる。
+- `_escapeText`（L23-29）: タグ以外の文字列の `<` `>` `"` `'` `` ` `` `=` を文字参照にする。`&` は、正しい形の文字参照（`&amp;`・`&lt;`・`&#60;` など）になっていないものだけを `&amp;` にする（説明文に書かれた文字参照の表示を変えないため）。→ バグ1 の「`<` `>` `'` `"` をエスケープしない」を直す。
 
-#### (c) URL の検査（修4 L87-94）
+#### (b) 属性値の文字参照の扱い（修4 L31-53）
 
 ```
- 87 | var _isSafeUrl = function(url, tag) {
- 88 |     var scheme = url.replace(/[\u0000- ]/g, '').match(/^([a-zA-Z][a-zA-Z0-9+.\-]*):/);
- 89 |     if (!scheme) {
- 90 |         return true;
- 91 |     }
- 92 |     scheme = scheme[1].toLowerCase();
- 93 |     return scheme === 'http' || scheme === 'https' || (tag === 'a' && scheme === 'mailto');
- 94 | };
+ 31 | var _decodeEntities = function(value) {
+ 32 |     return value.replace(/&(?:#([0-9]{1,7})|#[xX]([0-9a-fA-F]{1,6})|(amp|lt|gt|quot|apos));/g, function(m, dec, hex, named) {
+ 33 |         var code;
+ 34 |         if (named) {
+ 35 |             return _namedEntities[named];
+ 36 |         }
+ 37 |         code = dec ? parseInt(dec, 10) : parseInt(hex, 16);
+ 38 |         if (code === 0 || code > 0x10FFFF || (code >= 0xD800 && code <= 0xDFFF)) {
+ 39 |             return '\uFFFD';
+ 40 |         }
+ 41 |         if (code > 0xFFFF) {
+ 42 |             code -= 0x10000;
+ 43 |             return String.fromCharCode(0xD800 + Math.floor(code / 0x400), 0xDC00 + code % 0x400);
+ 44 |         }
+ 45 |         return String.fromCharCode(code);
+ 46 |     });
+ 47 | };
+ 48 | 
+ 49 | var _encodeAttr = function(value) {
+ 50 |     return value.replace(/[^A-Za-z0-9_.\-:\/?#%~+,;@!$()*\[\]\u0080-\uFFFF]/g, function(c) {
+ 51 |         return '&#x' + c.charCodeAt(0).toString(16) + ';';
+ 52 |     });
+ 53 | };
+```
+
+- `_decodeEntities`（L31-47）: 属性値の文字参照（数値参照と amp・lt・gt・quot・apos）を文字に戻してから検査する。`java&#x73;cript:` のように、文字参照で検査をすり抜ける形を防ぐ。
+- `_encodeAttr`（L49-53）: 残す属性値は引用符を使わずに出し、英数字・URL で使う記号（`_ . - : / ? # % ~ + , ; @ ! $ ( ) * [ ]`）・U+0080 以上の文字以外は、すべて `&#x..;` にする。空白・`'` `"` `` ` `` `=` `<` `>` `&` は必ず符号化されるので、テンプレートが引用符付きの属性（`value='…'` など）の中でこのヘルパーを使っていても、属性から抜け出せない（バグ4）。
+
+#### (c) URL の検査（修4 L55-62）
+
+```
+ 55 | var _isSafeUrl = function(url, tag) {
+ 56 |     var scheme = url.replace(/[\u0000- ]/g, '').match(/^([a-zA-Z][a-zA-Z0-9+.\-]*):/);
+ 57 |     if (!scheme) {
+ 58 |         return true;
+ 59 |     }
+ 60 |     scheme = scheme[1].toLowerCase();
+ 61 |     return scheme === 'http' || scheme === 'https' || (tag === 'a' && scheme === 'mailto');
+ 62 | };
 ```
 
 - 制御文字と空白（U+0000〜U+0020）をすべて除いてからスキームを調べる（ブラウザは `java\tscript:` なども `javascript:` と読むため）。
 - スキームの無い相対 URL（`#…`・`/…`・`//host/…`）は許す。スキームがあれば http・https・（a だけ）mailto だけを許す。`javascript:`・`data:` などの属性は捨てる（バグ1）。
 
-#### (d) タグの組み立て直し `_sanitizeTag`（修4 L97-128）
+#### (d) タグの組み立て直し `_sanitizeTag`（修4 L64-85）
 
 ```
- 97 | var _sanitizeTag = function(source, slash, name, attrs) {
- 98 |     var tag = name.toLowerCase();
- 99 |     var allowedAttrs, out;
-100 |     if (!_has(_allowedTags, tag)) {
-101 |         return _escapeText(source);
-102 |     }
-103 |     if (slash) {
-104 |         return _has(_voidTags, tag) ? '' : '</' + tag + '>';
-105 |     }
-106 |     allowedAttrs = _has(_allowedAttrs, tag) ? _allowedAttrs[tag] : {};
-107 |     out = '<' + tag;
-108 |     attrs.replace(/([^\s"'<>\/=]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'<>`=]+)))?/g, function(m, attrName, v1, v2, v3) {
-109 |         var key = attrName.toLowerCase();
-110 |         var value = _decodeEntities(v1 || v2 || v3 || '');
-118 |         if (_has(allowedAttrs, key) && value !== '' && !/[<>]/.test(value) &&
-119 |             (allowedAttrs[key] !== 'url' || _isSafeUrl(value, tag))) {
-120 |             out += ' ' + key + '=' + _encodeAttr(value);
-121 |         }
-122 |         return m;
-123 |     });
-127 |     return out + (out.charAt(out.length - 1) === '/' ? ' >' : '>');
-128 | };
+ 64 | var _sanitizeTag = function(source, slash, name, attrs) {
+ 65 |     var tag = name.toLowerCase();
+ 66 |     var allowedAttrs, out;
+ 67 |     if (!_has(_allowedTags, tag)) {
+ 68 |         return _escapeText(source);
+ 69 |     }
+ 70 |     if (slash) {
+ 71 |         return _has(_voidTags, tag) ? '' : '</' + tag + '>';
+ 72 |     }
+ 73 |     allowedAttrs = _has(_allowedAttrs, tag) ? _allowedAttrs[tag] : {};
+ 74 |     out = '<' + tag;
+ 75 |     attrs.replace(/([^\s"'<>\/=]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'<>`=]+)))?/g, function(m, attrName, v1, v2, v3) {
+ 76 |         var key = attrName.toLowerCase();
+ 77 |         var value = _decodeEntities(v1 || v2 || v3 || '');
+ 78 |         if (_has(allowedAttrs, key) && value !== '' && !/[<>]/.test(value) &&
+ 79 |             (allowedAttrs[key] !== 'url' || _isSafeUrl(value, tag))) {
+ 80 |             out += ' ' + key + '=' + _encodeAttr(value);
+ 81 |         }
+ 82 |         return m;
+ 83 |     });
+ 84 |     return out + (out.charAt(out.length - 1) === '/' ? ' >' : '>');
+ 85 | };
 ```
 
-- L100-102: 許可しないタグは、タグ全体を `_escapeText` で文字として表示する（`<svg onload=…>` は `&lt;svg onload&#x3D;…&gt;` になり、タグとして働かない）。
-- L103-105: 終了タグは `</タグ名>` だけを出す（属性は付けない。空要素の終了タグは捨てる）。
-- L106-123: 開始タグは `<タグ名` から組み立て直し、属性を 1 つずつ読んで、次の条件をすべて満たすものだけを ` 属性名=符号化した値` の形で付ける。
+- L67-69: 許可しないタグは、タグ全体を `_escapeText` で文字として表示する（`<svg onload=…>` は `&lt;svg onload&#x3D;…&gt;` になり、タグとして働かない）。
+- L70-72: 終了タグは `</タグ名>` だけを出す（属性は付けない。空要素の終了タグは捨てる）。
+- L73-83: 開始タグは `<タグ名` から組み立て直し、属性を 1 つずつ読んで、次の条件をすべて満たすものだけを ` 属性名=符号化した値` の形で付ける。
   - `_allowedAttrs` にある属性で、値が空でない。
-  - 文字参照を戻した後の値に `<` も `>` も含まない（L118 の `!/[<>]/.test(value)`）。description は描画の後に marked に通し直される（SwaggerUi.js の renderGFM）。古いブラウザは innerHTML の直列化で属性値の `<` `>` をそのまま出すので、属性値に `<` `>` があると、そこから新しいタグができてしまう（mutation XSS）。
-  - URL の属性は `_isSafeUrl` が許すもの（L119）。
-- L127: 最後の属性値が `/` で終わるとき（`<a href=/x/>` など）は、`>` の前に空白を入れる。jQuery 1.8.0 の `.html()` が `<a …/>` を `<a …></a>` に書き換えて、タグの対応がずれるのを防ぐ。
+  - 文字参照を戻した後の値に `<` も `>` も含まない（L78 の `!/[<>]/.test(value)`）。description は描画の後に marked に通し直される（SwaggerUi.js の renderGFM）。古いブラウザは innerHTML の直列化で属性値の `<` `>` をそのまま出すので、属性値に `<` `>` があると、そこから新しいタグができてしまう（mutation XSS）。
+  - URL の属性は `_isSafeUrl` が許すもの（L79）。
+- L84: 最後の属性値が `/` で終わるとき（`<a href=/x/>` など）は、`>` の前に空白を入れる。jQuery 1.8.0 の `.html()` が `<a …/>` を `<a …></a>` に書き換えて、タグの対応がずれるのを防ぐ。
 
-#### (e) HTML コメントの除去 `_stripComments`（修4 L134-151）
+#### (e) HTML コメントの除去 `_stripComments`（修4 L87-104）
 
 ```
-134 | var _stripComments = function(html) {
-135 |     var out = '';
-136 |     var pos = 0;
-137 |     var start, end;
-138 |     for (;;) {
-139 |         start = html.indexOf('<!--', pos);
-140 |         if (start === -1) {
-141 |             break;
-142 |         }
-143 |         end = html.indexOf('-->', start + 4);
-144 |         if (end === -1) {
-145 |             break;
-146 |         }
-147 |         out += html.substring(pos, start);
-148 |         pos = end + 3;
-149 |     }
-150 |     return out + html.substring(pos);
-151 | };
+ 87 | var _stripComments = function(html) {
+ 88 |     var out = '';
+ 89 |     var pos = 0;
+ 90 |     var start, end;
+ 91 |     for (;;) {
+ 92 |         start = html.indexOf('<!--', pos);
+ 93 |         if (start === -1) {
+ 94 |             break;
+ 95 |         }
+ 96 |         end = html.indexOf('-->', start + 4);
+ 97 |         if (end === -1) {
+ 98 |             break;
+ 99 |         }
+100 |         out += html.substring(pos, start);
+101 |         pos = end + 3;
+102 |     }
+103 |     return out + html.substring(pos);
+104 | };
 ```
 
 - `<!--` を見つけたら、その後の最初の `-->` までを消し、続きを探す。`-->` が無ければ、そこから後はそのまま残す（残った `<!--` は、`_sanitize` で文字として表示される）。
 - `indexOf` で先頭から 1 回だけ走査するので、`<!--` を繰り返す長い入力でも、時間は入力の長さに比例する（正規表現 `/<!--[\s\S]*?-->/g` だと 2 乗の時間になる）。
 
-#### (f) タグの対応を取るための表（修4 L155-170）
+#### (f) タグの対応を取るための表（修4 L106-120）
 
 ```
-155 | var _specialTags = {
-156 |     blockquote: true, dd: true, div: true, dl: true, dt: true, h1: true, h2: true, h3: true, h4: true, h5: true, h6: true,
-157 |     li: true, ol: true, p: true, pre: true, table: true, tbody: true, td: true, tfoot: true, th: true, thead: true, tr: true, ul: true
-158 | };
-160 | var _closePTags = {
-161 |     blockquote: true, dd: true, div: true, dl: true, dt: true, h1: true, h2: true, h3: true, h4: true, h5: true, h6: true,
-162 |     hr: true, li: true, ol: true, p: true, pre: true, table: true, ul: true
-163 | };
-164 | var _headingTags = { h1: true, h2: true, h3: true, h4: true, h5: true, h6: true };
-165 | var _scopeTags = { table: true, td: true, th: true };
-166 | var _listScopeTags = { ol: true, table: true, td: true, th: true, ul: true };
-167 | var _tableOnlyTags = { table: true, tbody: true, tfoot: true, thead: true, tr: true };
-168 | var _tableSectionTags = { tbody: true, tfoot: true, thead: true };
-169 | var _tablePartTags = { tbody: true, td: true, tfoot: true, th: true, thead: true, tr: true };
-170 | var _maxDepth = 100;
+106 | var _specialTags = {
+107 |     blockquote: true, dd: true, div: true, dl: true, dt: true, h1: true, h2: true, h3: true, h4: true, h5: true, h6: true,
+108 |     li: true, ol: true, p: true, pre: true, table: true, tbody: true, td: true, tfoot: true, th: true, thead: true, tr: true, ul: true
+109 | };
+110 | var _closePTags = {
+111 |     blockquote: true, dd: true, div: true, dl: true, dt: true, h1: true, h2: true, h3: true, h4: true, h5: true, h6: true,
+112 |     hr: true, li: true, ol: true, p: true, pre: true, table: true, ul: true
+113 | };
+114 | var _headingTags = { h1: true, h2: true, h3: true, h4: true, h5: true, h6: true };
+115 | var _scopeTags = { table: true, td: true, th: true };
+116 | var _listScopeTags = { ol: true, table: true, td: true, th: true, ul: true };
+117 | var _tableOnlyTags = { table: true, tbody: true, tfoot: true, thead: true, tr: true };
+118 | var _tableSectionTags = { tbody: true, tfoot: true, thead: true };
+119 | var _tablePartTags = { tbody: true, td: true, tfoot: true, th: true, thead: true, tr: true };
+120 | var _maxDepth = 100;
 ```
 
 - HTML パーサの規則を写した表。どれも許可したタグの中だけ。
@@ -311,186 +313,186 @@
   - `_tableOnlyTags`・`_tableSectionTags`・`_tablePartTags`: 表の構造のタグ。
   - `_maxDepth`: 入れ子の深さの上限（100）。スタックを探す時間を一定以下にして、処理時間を入力の長さに比例させる。
 
-#### (g) スタックの操作（修4 L175-211）
+#### (g) スタックの操作（修4 L122-154）
 
 ```
-175 | var _findOpen = function(stack, names, stops) {
-176 |     var i;
-177 |     for (i = stack.length - 1; i >= 0; i--) {
-178 |         if (names[stack[i]] === true) {
-179 |             return i;
-180 |         }
-181 |         if (stops[stack[i]] === true) {
-182 |             return -1;
-183 |         }
-184 |     }
-185 |     return -1;
-186 | };
-187 | 
-189 | var _closeFrom = function(stack, index) {
-190 |     var out = '';
-191 |     while (stack.length > index) {
-192 |         out += '</' + stack.pop() + '>';
-193 |     }
-194 |     return out;
-195 | };
-196 | 
-200 | var _findListItem = function(stack, names) {
-201 |     var i;
-202 |     for (i = stack.length - 1; i >= 0; i--) {
-203 |         if (_has(names, stack[i])) {
-204 |             return i;
-205 |         }
-206 |         if (_has(_specialTags, stack[i]) && stack[i] !== 'div' && stack[i] !== 'p') {
-207 |             return -1;
-208 |         }
-209 |     }
-210 |     return -2;
-211 | };
+122 | var _findOpen = function(stack, names, stops) {
+123 |     var i;
+124 |     for (i = stack.length - 1; i >= 0; i--) {
+125 |         if (names[stack[i]] === true) {
+126 |             return i;
+127 |         }
+128 |         if (stops[stack[i]] === true) {
+129 |             return -1;
+130 |         }
+131 |     }
+132 |     return -1;
+133 | };
+134 | 
+135 | var _closeFrom = function(stack, index) {
+136 |     var out = '';
+137 |     while (stack.length > index) {
+138 |         out += '</' + stack.pop() + '>';
+139 |     }
+140 |     return out;
+141 | };
+142 | 
+143 | var _findListItem = function(stack, names) {
+144 |     var i;
+145 |     for (i = stack.length - 1; i >= 0; i--) {
+146 |         if (_has(names, stack[i])) {
+147 |             return i;
+148 |         }
+149 |         if (_has(_specialTags, stack[i]) && stack[i] !== 'div' && stack[i] !== 'p') {
+150 |             return -1;
+151 |         }
+152 |     }
+153 |     return -2;
+154 | };
 ```
 
-- `_findOpen`（L175-186）: スタックの上から、指定のタグを探して位置を返す。境界のタグに先に当たったときや、見つからないときは -1。
-- `_closeFrom`（L189-195）: スタックの指定の位置から上の要素を、内側から順に閉じる終了タグを作る。
-- `_findListItem`（L200-211）: li・dd・dt の開始タグのとき、パーサと同じく、閉じるべき前の項目を探す。出力の中にリストが無いとき（スタックの底まで当たらないとき）は -2 を返し、そのタグは捨てる。
+- `_findOpen`（L122-133）: スタックの上から、指定のタグを探して位置を返す。境界のタグに先に当たったときや、見つからないときは -1。
+- `_closeFrom`（L135-141）: スタックの指定の位置から上の要素を、内側から順に閉じる終了タグを作る。
+- `_findListItem`（L143-154）: li・dd・dt の開始タグのとき、パーサと同じく、閉じるべき前の項目を探す。出力の中にリストが無いとき（スタックの底まで当たらないとき）は -2 を返し、そのタグは捨てる。
 
-#### (h) 開始タグの出力 `_openTag`（修4 L215-281）
-
-```
-215 | var _openTag = function(stack, tag, html) {
-216 |     var out = '';
-217 |     var top = stack.length ? stack[stack.length - 1] : '';
-218 |     var i;
-219 |     if (!_has(_voidTags, tag) && stack.length >= _maxDepth) {
-220 |         return '';
-221 |     }
-222 |     if (_has(_tablePartTags, tag)) {
-225 |         i = _findOpen(stack, { table: true }, {});
-226 |         if (i === -1) {
-227 |             return '';
-228 |         }
-229 |         i += 1;
-230 |         if (!_has(_tableSectionTags, tag)) {
-231 |             if (_has(_tableSectionTags, stack[i])) {
-232 |                 i += 1;
-233 |             }
-234 |             if (tag !== 'tr') {
-235 |                 if (stack[i] === 'tr') {
-236 |                     i += 1;
-237 |                 } else {
-239 |                     out = _closeFrom(stack, i) + '<tr>';
-240 |                     stack.push('tr');
-241 |                     i = stack.length;
-242 |                 }
-243 |             }
-244 |         }
-246 |         out += _closeFrom(stack, i);
-247 |     } else if (_has(_tableOnlyTags, top)) {
-249 |         return '';
-250 |     } else {
-251 |         if (tag === 'li' || tag === 'dd' || tag === 'dt') {
-252 |             i = _findListItem(stack, tag === 'li' ? { li: true } : { dd: true, dt: true });
-253 |             if (i === -2) {
-254 |                 return '';
-255 |             }
-256 |             if (i !== -1) {
-257 |                 out += _closeFrom(stack, i);
-258 |             }
-259 |         }
-260 |         if (_has(_closePTags, tag)) {
-261 |             i = _findOpen(stack, { p: true }, _scopeTags);
-262 |             if (i !== -1) {
-263 |                 out += _closeFrom(stack, i);
-264 |             }
-265 |         }
-266 |         if (_has(_headingTags, tag) && _has(_headingTags, stack[stack.length - 1] || '')) {
-267 |             out += _closeFrom(stack, stack.length - 1);
-268 |         }
-269 |         if (tag === 'a') {
-271 |             i = _findOpen(stack, { a: true }, { td: true, th: true });
-272 |             if (i !== -1) {
-273 |                 out += _closeFrom(stack, i);
-274 |             }
-275 |         }
-276 |     }
-277 |     if (!_has(_voidTags, tag)) {
-278 |         stack.push(tag);
-279 |     }
-280 |     return out + html;
-281 | };
-```
-
-- L219-221: 入れ子が 100 段を超える開始タグは捨てる。
-- L222-246: 表の部品（tbody・thead・tfoot・tr・td・th）は、この出力の中で開いた table の中だけで使える。table が無ければ捨てる（そのまま出すと、パーサがテンプレート側の `<td class="markdown">` などを閉じてしまう）。table の中では、パーサが暗黙に閉じる前の td・tr などを先に明示的に閉じ、tr の無い td・th には tr を補う。
-- L247-249: table・tbody・tr などの直下に表の部品以外のタグが来たら捨てる（パーサは表の外へ移してしまう）。
-- L251-259: li・dd・dt は、開いている前の同じ種類の項目を閉じてから開く。
-- L260-265: 開いている p をパーサが暗黙に閉じるタグ（div・table・ul など）では、先に `</p>` を出す。
-- L266-268: 見出しの中の見出しは、先に外側の見出しを閉じる。
-- L269-275: a の中の a は、先に外側の a を閉じる。
-- L277-280: 空要素以外はスタックに積み、先に出す終了タグと、このタグを返す。
-
-#### (i) 終了タグの出力 `_closeTag`（修4 L285-300）
+#### (h) 開始タグの出力 `_openTag`（修4 L156-216）
 
 ```
-285 | var _closeTag = function(stack, tag) {
-286 |     var names = {};
-287 |     var i;
-288 |     names[tag] = true;
-289 |     if (_has(_headingTags, tag)) {
-291 |         i = _findOpen(stack, _headingTags, _scopeTags);
-292 |     } else if (tag === 'table' || _has(_tablePartTags, tag)) {
-293 |         i = _findOpen(stack, names, { table: true });
-294 |     } else if (tag === 'li') {
-295 |         i = _findOpen(stack, names, _listScopeTags);
-296 |     } else {
-297 |         i = _findOpen(stack, names, _scopeTags);
-298 |     }
-299 |     return i === -1 ? '' : _closeFrom(stack, i);
-300 | };
+156 | var _openTag = function(stack, tag, html) {
+157 |     var out = '';
+158 |     var top = stack.length ? stack[stack.length - 1] : '';
+159 |     var i;
+160 |     if (!_has(_voidTags, tag) && stack.length >= _maxDepth) {
+161 |         return '';
+162 |     }
+163 |     if (_has(_tablePartTags, tag)) {
+164 |         i = _findOpen(stack, { table: true }, {});
+165 |         if (i === -1) {
+166 |             return '';
+167 |         }
+168 |         i += 1;
+169 |         if (!_has(_tableSectionTags, tag)) {
+170 |             if (_has(_tableSectionTags, stack[i])) {
+171 |                 i += 1;
+172 |             }
+173 |             if (tag !== 'tr') {
+174 |                 if (stack[i] === 'tr') {
+175 |                     i += 1;
+176 |                 } else {
+177 |                     out = _closeFrom(stack, i) + '<tr>';
+178 |                     stack.push('tr');
+179 |                     i = stack.length;
+180 |                 }
+181 |             }
+182 |         }
+183 |         out += _closeFrom(stack, i);
+184 |     } else if (_has(_tableOnlyTags, top)) {
+185 |         return '';
+186 |     } else {
+187 |         if (tag === 'li' || tag === 'dd' || tag === 'dt') {
+188 |             i = _findListItem(stack, tag === 'li' ? { li: true } : { dd: true, dt: true });
+189 |             if (i === -2) {
+190 |                 return '';
+191 |             }
+192 |             if (i !== -1) {
+193 |                 out += _closeFrom(stack, i);
+194 |             }
+195 |         }
+196 |         if (_has(_closePTags, tag)) {
+197 |             i = _findOpen(stack, { p: true }, _scopeTags);
+198 |             if (i !== -1) {
+199 |                 out += _closeFrom(stack, i);
+200 |             }
+201 |         }
+202 |         if (_has(_headingTags, tag) && _has(_headingTags, stack[stack.length - 1] || '')) {
+203 |             out += _closeFrom(stack, stack.length - 1);
+204 |         }
+205 |         if (tag === 'a') {
+206 |             i = _findOpen(stack, { a: true }, { td: true, th: true });
+207 |             if (i !== -1) {
+208 |                 out += _closeFrom(stack, i);
+209 |             }
+210 |         }
+211 |     }
+212 |     if (!_has(_voidTags, tag)) {
+213 |         stack.push(tag);
+214 |     }
+215 |     return out + html;
+216 | };
+```
+
+- L160-162: 入れ子が 100 段を超える開始タグは捨てる。
+- L163-183: 表の部品（tbody・thead・tfoot・tr・td・th）は、この出力の中で開いた table の中だけで使える。table が無ければ捨てる（そのまま出すと、パーサがテンプレート側の `<td class="markdown">` などを閉じてしまう）。table の中では、パーサが暗黙に閉じる前の td・tr などを先に明示的に閉じ、tr の無い td・th には tr を補う。
+- L184-185: table・tbody・tr などの直下に表の部品以外のタグが来たら捨てる（パーサは表の外へ移してしまう）。
+- L187-195: li・dd・dt は、開いている前の同じ種類の項目を閉じてから開く。
+- L196-201: 開いている p をパーサが暗黙に閉じるタグ（div・table・ul など）では、先に `</p>` を出す。
+- L202-204: 見出しの中の見出しは、先に外側の見出しを閉じる。
+- L205-210: a の中の a は、先に外側の a を閉じる。
+- L212-215: 空要素以外はスタックに積み、先に出す終了タグと、このタグを返す。
+
+#### (i) 終了タグの出力 `_closeTag`（修4 L218-232）
+
+```
+218 | var _closeTag = function(stack, tag) {
+219 |     var names = {};
+220 |     var i;
+221 |     names[tag] = true;
+222 |     if (_has(_headingTags, tag)) {
+223 |         i = _findOpen(stack, _headingTags, _scopeTags);
+224 |     } else if (tag === 'table' || _has(_tablePartTags, tag)) {
+225 |         i = _findOpen(stack, names, { table: true });
+226 |     } else if (tag === 'li') {
+227 |         i = _findOpen(stack, names, _listScopeTags);
+228 |     } else {
+229 |         i = _findOpen(stack, names, _scopeTags);
+230 |     }
+231 |     return i === -1 ? '' : _closeFrom(stack, i);
+232 | };
 ```
 
 - 対応する開始タグが、この出力の中で（スコープの中に）開いているときだけ、その要素までを内側から順に閉じる。
 - 対応する開始タグが無い終了タグは捨てる。テンプレート側の `</div>` や `</td>` を、ヘルパーの出力が閉じることはない。
 - h1〜h6 の終了タグは、開いている見出しをどれでも閉じる（パーサと同じ）。
 
-### 4-3. `sanitize` のオブジェクトの扱い（元 L20 → 修4 L340）
+### 4-3. `sanitize` のオブジェクトの扱い（元 L20 → 修4 L260）
 
 ```diff
-  元 L 19  修 L335 |         _html = JSON.stringify(html);
+  元 L 19  修 L259 |         _html = JSON.stringify(html);
 - 元 L 20           |         return new Handlebars.SafeString(JSON.parse(_sanitize(_html)));
-+           修 L340 |         return new Handlebars.SafeString(_sanitize('' + JSON.parse(_html)));
-  元 L 21  修 L341 |     }
++           修 L260 |         return new Handlebars.SafeString(_sanitize('' + JSON.parse(_html)));
+  元 L 21  修 L261 |     }
 ```
 
 - 元のコードは、オブジェクト・配列を JSON の文字列にしてからサニタイズし、`JSON.parse` で戻していた。新しいサニタイザは `"` をエスケープするので、この順番だと JSON が壊れる。また元のように JSON の文字列のまま処理すると、配列の要素の攻撃の文字列が残る（バグ5）。
 - 修正コード4 は、先に `JSON.parse` で戻して、表示と同じ文字列（`'' + …`）にしてから `_sanitize` に通す。表示される文字列の形は元と同じ。
 
-### 4-4. `renderTextParam` の 3 行（元 L39・L42・L53 → 修4 L360・L364・L379）
+### 4-4. `renderTextParam` の 3 行（元 L39・L42・L53 → 修4 L279・L282・L293）
 
 ```diff
-  元 L 38  修 L358 |         // filter X-data- properties
+  元 L 38  修 L278 |         // filter X-data- properties
 - 元 L 39           |         return property.match(/^X-data-/i) !== null;
-+           修 L360 |         return property.match(/^X-data-[A-Za-z0-9_-]+$/i) !== null;
-  元 L 40  修 L361 |     }).reduce(function(result, property) {
++           修 L279 |         return property.match(/^X-data-[A-Za-z0-9_-]+$/i) !== null;
+  元 L 40  修 L280 |     }).reduce(function(result, property) {
 ```
 
 - X-data-* のプロパティ名を、`X-data-` の後が英数字・`-`・`_` だけのものに限る（バグ3）。
 
 ```diff
-  元 L 41  修 L362 |         // remove X- from property name, so it results in html attributes like data-foo='bar'
+  元 L 41  修 L281 |         // remove X- from property name, so it results in html attributes like data-foo='bar'
 - 元 L 42           |         return result += ' ' + property.substring(2, property.length) + '=\'' + param[property] + '\'';
-+           修 L364 |         return result += ' ' + property.substring(2, property.length) + '=\'' + Handlebars.Utils.escapeExpression(param[property]) + '\'';
-  元 L 43  修 L365 |     }, '');
++           修 L282 |         return result += ' ' + property.substring(2, property.length) + '=\'' + Handlebars.Utils.escapeExpression(param[property]) + '\'';
+  元 L 43  修 L283 |     }, '');
 ```
 
 - X-data-* の値を、`Handlebars.Utils.escapeExpression`（Handlebars 4.0.5。`&` `<` `>` `"` `'` `` ` `` `=` を文字参照にする）でエスケープしてから属性にする（バグ3）。
 
 ```diff
-  元 L 51  修 L373 |     }
-  元 L 52  修 L374 | 
+  元 L 51  修 L291 |     }
+  元 L 52  修 L292 | 
 - 元 L 53           |     defaultValue = sanitize(defaultValue);
-+           修 L379 |     defaultValue = Handlebars.Utils.escapeExpression(defaultValue);
-  元 L 54  修 L380 | 
-  元 L 55  修 L381 |     if(isArray) {
++           修 L293 |     defaultValue = Handlebars.Utils.escapeExpression(defaultValue);
+  元 L 54  修 L294 | 
+  元 L 55  修 L295 |     if(isArray) {
 ```
 
 - default 値は HTML として表示する必要がなく、入力欄に入力どおりに表示すべき値なので、`sanitize()` ではなく `escapeExpression` でエスケープする（バグ2）。新しい `sanitize` は許可したタグや文字参照を残すので、ここには使わない。
@@ -501,15 +503,15 @@
 
 | 回 | 日付（2026 年） | 直す前に分かっていた不備 | 修正コード4 の中で、この回にできた部分 | 次の検証の結果 |
 |---|---|---|---|---|
-| 修正1 | 10-12 | 判定のバグ2・バグ3 | L360・L364・L379（元 L39・L42・L53 の書き換え） | 検証1（11-05）: **不備あり** |
-| 修正2 | 11-05 | バグ1・バグ4・バグ5（弱い `_sanitize` が元のまま残っていた） | ホワイトリスト型のサニタイザ: L29-55、L59-94、`_sanitizeTag` の L97-123（L118 の `<` `>` の条件を除く）、`_sanitize` の本体（L309 の `String()` と L311-323 の読み取り）、L340 | 検証2（11-06）: **不備あり** |
-| 修正3 | 11-14 | 許可した属性値の `<` `>` による mutation XSS。コメント除去の処理時間 | L118 の条件 `!/[<>]/.test(value)`、`_stripComments`（L134-151）と L309 での呼び出し | 検証3（11-14）: **不備あり** |
-| 修正4 | 11-14 | 閉じないタグで、後に続くテンプレートの要素を取り込む mutation XSS。`</table>` による描画の例外 | タグの対応を取る部品（L155-300）、`_sanitize` のスタックの部分（L304-305・L311-312・L316-319・L325）、L127 | 検証4（11-14〜15）: **問題なし** |
+| 修正1 | 10-12 | 判定のバグ2・バグ3 | L279・L282・L293（元 L39・L42・L53 の書き換え） | 検証1（11-05）: **不備あり** |
+| 修正2 | 11-05 | バグ1・バグ4・バグ5（弱い `_sanitize` が元のまま残っていた） | ホワイトリスト型のサニタイザ: L4-29、L31-62、`_sanitizeTag` の L64-83（L78 の `<` `>` の条件を除く）、`_sanitize` の本体（L237 の `String()` と L238-248 の読み取り）、L260 | 検証2（11-06）: **不備あり** |
+| 修正3 | 11-14 | 許可した属性値の `<` `>` による mutation XSS。コメント除去の処理時間 | L78 の条件 `!/[<>]/.test(value)`、`_stripComments`（L87-104）と L237 での呼び出し | 検証3（11-14）: **不備あり** |
+| 修正4 | 11-14 | 閉じないタグで、後に続くテンプレートの要素を取り込む mutation XSS。`</table>` による描画の例外 | タグの対応を取る部品（L106-232）、`_sanitize` のスタックの部分（L235-236・L238-239・L241-244・L249）、L84 | 検証4（11-14〜15）: **問題なし** |
 
-### 5-2. 修正1
+### 5-2. 修正1（"修正版コード"）
 
 - きっかけ: 判定。判定は、弱い `_sanitize`（バグ1）を根拠の 1 つ目にあげ、`renderTextParam` の default 値（バグ2）と X-data-*（バグ3）を主な経路にあげた。
-- この回に変えたこと: 元 L39・L42・L53 の 3 行（いまの修4 L360・L364・L379。4-4 の diff のとおりで、修正コード4 まで変わっていない）。`_sanitize` と `sanitize` ヘルパーは、「このブラックリストは不十分」というコメントを付けただけで、コードは元のままにした。
+- この回に変えたこと: 元 L39・L42・L53 の 3 行（いまの修4 L279・L282・L293。4-4 の diff のとおりで、修正コード4 まで変わっていない）。`_sanitize` と `sanitize` ヘルパーは、「このブラックリストは不十分」というコメントを付けただけで、コードは元のままにした。
 - 検証1（プロンプトファイル2）の結果: **不備あり**。
   - `renderTextParam` の 3 か所は直っていた（攻撃 7 件で危険なし）。
   - しかし、バグ1 の `_sanitize` とバグ4 の `sanitize` ヘルパーが元のままなので、同じ source（default 値・description）と enum 値から、次の経路で XSS が残っていた（jsdom で描画して確認）。
@@ -519,10 +521,10 @@
     - enum 値（param_list.handlebars L11）: `x' autofocus onfocus=alert(document.domain) y='` → option に onfocus ができる。
   - `sanitize` をテンプレートの 7 つの文脈で直接呼んだ 36 入力 × 7 文脈 = 252 件で、元のコードと同じ 46 件が危険だった。
 
-### 5-3. 修正2
+### 5-3. 修正2（"修正コード2"）
 
 - きっかけ: 検証1 の不備（バグ1・バグ4 が残っていた）。
-- この回に変えたこと: 「危ないものを消す」ブラックリストをやめ、「安全と分かっているタグと属性だけを組み立て直し、それ以外は文字として表示する」ホワイトリストのサニタイザにした。いまの修正コード4 の (a)〜(d)（L29-128。ただし L118 の `<` `>` の条件と L127 を除く）と、`_sanitize` の本体（L309・L311-323 の、タグ・文字列・単独の `<` を読み分ける部分）、オブジェクトの扱い（L340）がこの回のもの。コメントの除去は、このときは正規表現 `/<!--[\s\S]*?-->/g` だった。
+- この回に変えたこと: 「危ないものを消す」ブラックリストをやめ、「安全と分かっているタグと属性だけを組み立て直し、それ以外は文字として表示する」ホワイトリストのサニタイザにした。いまの修正コード4 の (a)〜(d)（L4-85。ただし L78 の `<` `>` の条件と L84 を除く）と、`_sanitize` の本体（L237・L238-248 の、タグ・文字列・単独の `<` を読み分ける部分）、オブジェクトの扱い（L260）がこの回のもの。コメントの除去は、このときは正規表現 `/<!--[\s\S]*?-->/g` だった。
 - 作ったエージェントの確認: 検証1 の 7 経路はすべて危険なし。252 件で危険 46 件 → 0 件。ランダムな入力 20,000 件 × 5 文脈で 0 件。
 - 検証2（修正コード2の検証）の結果: **不備あり**。
   - 1 回の HTML の解析で入る経路（textarea・引用符付きの属性値・本文）は直っていた（攻撃 266 件で、元のコードの 82 件 → 0 件）。
@@ -531,12 +533,12 @@
     - jQuery 1.8.0＋jsdom 16.7.0（古い直列化）で、990 の組み合わせのうち 585 件で img@onerror ができた（新しい直列化の jsdom 31 では 0 件）。
   - 指摘: コメント除去の正規表現が、閉じない `<!--` を繰り返す入力で 2 乗の時間になる（約 20 万文字で 4.6 秒）。
 
-### 5-4. 修正3
+### 5-4. 修正3（"修正コード3"）
 
 - きっかけ: 検証2 の不備（属性値の `<` `>` による mutation XSS）と指摘（コメント除去の処理時間）。
 - この回に変えたこと:
-  - `_sanitizeTag` の属性を残す条件に `!/[<>]/.test(value)` を足した（いまの修4 L118）。古い直列化で生のまま出る `<` `>` は属性値の中のものだけなので、属性値に `<` `>` が無ければ、marked に渡る文字列の中の生の `<` は許可したタグの先頭だけになる。符号化では防げない（ブラウザが解析した時点で `<` に戻る）ので、属性ごと捨てる。
-  - コメントの除去を、`indexOf` で 1 回だけ走査する `_stripComments`（いまの修4 L134-151）に替え、`_sanitize` から呼ぶようにした（L309）。
+  - `_sanitizeTag` の属性を残す条件に `!/[<>]/.test(value)` を足した（いまの修4 L78）。古い直列化で生のまま出る `<` `>` は属性値の中のものだけなので、属性値に `<` `>` が無ければ、marked に渡る文字列の中の生の `<` は許可したタグの先頭だけになる。符号化では防げない（ブラウザが解析した時点で `<` に戻る）ので、属性ごと捨てる。
+  - コメントの除去を、`indexOf` で 1 回だけ走査する `_stripComments`（いまの修4 L87-104）に替え、`_sanitize` から呼ぶようにした（L237）。
 - 作ったエージェントの確認: 検証2 の入力 66 件で、危険は元のコード〜修正コード2 の 54 件 → 0 件。21,600 の組み合わせで 8,624 件 → 0 件。`<!--` の繰り返し（約 20 万文字）は 4,566 ms → 148 ms。
 - 検証3（修正コード3の検証）の結果: **不備あり**。
   - サニタイザが、開始タグと閉じタグの対応を取っていなかった。`sanitize('<div>')` は `<div>`、`sanitize('</div>')` は `</div>` を返していた（修正2 からの作り）。
@@ -545,10 +547,10 @@
     - jsdom 16.7.0 で 49 件中 14 件（元のコード〜修正コード2 も同じ）。修正3 で入ったものではなく、元のコードからある description の XSS が直し切れていなかったもの。
   - 修正4 を作ったエージェントが、同じ原因の別の問題も見つけた: description などに対応の無い `</table>` があると、jQuery 1.8.0 の `.html()` の中で `TypeError: Cannot read properties of null (reading 'lastChild')` が起き、ページ全体の描画が止まる（元のコードから。XSS ではない）。
 
-### 5-5. 修正4
+### 5-5. 修正4（"修正コード4"）
 
 - きっかけ: 検証3 の不備（閉じないタグによる取り込みと mutation XSS）と、同じ原因の描画の例外。
-- この回に変えたこと: 4-2 の (f)〜(i)（L155-300）を足し、`_sanitize` で、許可したタグの対応をスタックで取るようにした（L304-305・L311-312・L316-319・L325）。また `_sanitizeTag` の最後の行（L127）で、属性値が `/` で終わるときは `>` の前に空白を入れるようにした。
+- この回に変えたこと: 4-2 の (f)〜(i)（L106-232）を足し、`_sanitize` で、許可したタグの対応をスタックで取るようにした（L235-236・L238-239・L241-244・L249）。また `_sanitizeTag` の最後の行（L84）で、属性値が `/` で終わるときは `>` の前に空白を入れるようにした。
   - 考え方: ヘルパーの出力の中でタグが必ず閉じられ、HTML パーサが暗黙に閉じたり外へ移したりするタグも先に明示的に閉じる。これで、出力がテンプレートの外側の要素を閉じたり、後に続く要素を取り込んだりしなくなる。
 - 作ったエージェントの確認: 閉じないタグ 28 種 × 取り込む先 13 種 = 364 件で、修正コード3 の危険 50 件・取り込み 154 件 → 0 件・0 件。ページ全体のランダムな description 3,000 件で、テンプレートの構造の変化・危険・取り込み・例外はすべて 0 件。表のタグ 70 件で、`</table>` の例外 5 件 → 0 件。約 20 万文字の 21 種の入力で 190 ms 以内。
 - 検証4（修正コード4の検証）の結果: **問題なし**。
@@ -560,15 +562,14 @@
 | 修4 の行 | 中身 | 入った回 |
 |---|---|---|
 | L1-3 | `'use strict'` など | 元のコード |
-| L4-28 | 修正の理由のコメント | 修正2（L4-20）、修正3（L21-22）、修正4（L23-28） |
-| L29-94 | `_has`・許可の表・`_escapeText`・`_decodeEntities`・`_encodeAttr`・`_isSafeUrl` | 修正2 |
-| L96-128 | `_sanitizeTag` | 修正2。L118 の `<` `>` の条件は修正3、L127 は修正4 |
-| L130-151 | `_stripComments` | 修正3 |
-| L153-300 | タグの対応の表と関数（`_findOpen`〜`_closeTag`） | 修正4 |
-| L302-326 | `_sanitize` | 入口（L302）と最後の `};`（L326）は元のコード。本体は修正2、L309 の `_stripComments` は修正3、スタックの部分（L304-305・L311-312・L316-319・L325）は修正4 |
-| L328-346 | `sanitize` ヘルパー | 元のコード。L340 は修正2 |
-| L348-395 | `renderTextParam` | 元のコード。L360・L364・L379 は修正1 |
-| L397-425 | `ifCond`・`escape` | 元のコード（変わっていない） |
+| L4-62 | `_has`・許可の表・`_escapeText`・`_decodeEntities`・`_encodeAttr`・`_isSafeUrl` | 修正2 |
+| L64-85 | `_sanitizeTag` | 修正2。L78 の `<` `>` の条件は修正3、L84 は修正4 |
+| L87-104 | `_stripComments` | 修正3 |
+| L106-232 | タグの対応の表と関数（`_findOpen`〜`_closeTag`） | 修正4 |
+| L234-250 | `_sanitize` | 入口（L234）と最後の `};`（L250）は元のコード。本体は修正2、L237 の `_stripComments` は修正3、スタックの部分（L235-236・L238-239・L241-244・L249）は修正4 |
+| L252-266 | `sanitize` ヘルパー | 元のコード。L260 は修正2 |
+| L268-309 | `renderTextParam` | 元のコード。L279・L282・L293 は修正1 |
+| L311-339 | `ifCond`・`escape` | 元のコード（変わっていない） |
 
 ## 7. 変化の例（元のコードと修正コード4 の出力。node で確かめた）
 
