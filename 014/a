@@ -1,0 +1,510 @@
+'use strict';
+/*jslint eqeq: true*/
+
+var _has = function(obj, key) {
+    return Object.prototype.hasOwnProperty.call(obj, key);
+};
+var _allowedTags = {
+    a: true, b: true, blockquote: true, br: true, code: true, dd: true, del: true, div: true,
+    dl: true, dt: true, em: true, h1: true, h2: true, h3: true, h4: true, h5: true, h6: true,
+    hr: true, i: true, img: true, kbd: true, li: true, ol: true, p: true, pre: true, s: true,
+    small: true, span: true, strike: true, strong: true, sub: true, sup: true, table: true,
+    tbody: true, td: true, tfoot: true, th: true, thead: true, tr: true, u: true, ul: true
+};
+var _voidTags = { br: true, hr: true, img: true };
+var _allowedAttrs = {
+    a: { href: 'url', title: 'text' },
+    img: { src: 'url', alt: 'text', title: 'text' }
+};
+var _textEscapes = { '<': '&lt;', '>': '&gt;', '"': '&quot;', '\'': '&#x27;', '`': '&#x60;', '=': '&#x3D;' };
+var _namedEntities = { amp: '&', lt: '<', gt: '>', quot: '"', apos: '\'' };
+
+var _escapeText = function(text) {
+    return text
+        .replace(/&(?!(?:[a-zA-Z][a-zA-Z0-9]{0,31}|#[0-9]{1,7}|#[xX][0-9a-fA-F]{1,6});)/g, '&amp;')
+        .replace(/[<>"'`=]/g, function(c) {
+            return _textEscapes[c];
+        });
+};
+var _decodeEntities = function(value) {
+    return value.replace(/&(?:#([0-9]{1,7})|#[xX]([0-9a-fA-F]{1,6})|(amp|lt|gt|quot|apos));/g, function(m, dec, hex, named) {
+        var code;
+        if (named) {
+            return _namedEntities[named];
+        }
+        code = dec ? parseInt(dec, 10) : parseInt(hex, 16);
+        if (code === 0 || code > 0x10FFFF || (code >= 0xD800 && code <= 0xDFFF)) {
+            return '\uFFFD';
+        }
+        if (code > 0xFFFF) {
+            code -= 0x10000;
+            return String.fromCharCode(0xD800 + Math.floor(code / 0x400), 0xDC00 + code % 0x400);
+        }
+        return String.fromCharCode(code);
+    });
+};
+
+var _encodeAttr = function(value) {
+    return value.replace(/[^A-Za-z0-9_.\-:\/?#%~+,;@!$()*\[\]\u0080-\uFFFF]/g, function(c) {
+        return '&#x' + c.charCodeAt(0).toString(16) + ';';
+    });
+};
+
+var _isSafeUrl = function(url, tag) {
+    var scheme = url.replace(/[\u0000- ]/g, '').match(/^([a-zA-Z][a-zA-Z0-9+.\-]*):/);
+    if (!scheme) {
+        return true;
+    }
+    scheme = scheme[1].toLowerCase();
+    return scheme === 'http' || scheme === 'https' || (tag === 'a' && scheme === 'mailto');
+};
+
+var _sanitizeTag = function(source, slash, name, attrs) {
+    var tag = name.toLowerCase();
+    var allowedAttrs, out;
+    if (!_has(_allowedTags, tag)) {
+        return _escapeText(source);
+    }
+    if (slash) {
+        return _has(_voidTags, tag) ? '' : '</' + tag + '>';
+    }
+    allowedAttrs = _has(_allowedAttrs, tag) ? _allowedAttrs[tag] : {};
+    out = '<' + tag;
+    attrs.replace(/([^\s"'<>\/=]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'<>`=]+)))?/g, function(m, attrName, v1, v2, v3) {
+        var key = attrName.toLowerCase();
+        var value = _decodeEntities(v1 || v2 || v3 || '');
+        if (_has(allowedAttrs, key) && value !== '' && !/[<>]/.test(value) &&
+            (allowedAttrs[key] !== 'url' || _isSafeUrl(value, tag))) {
+            out += ' ' + key + '=' + _encodeAttr(value);
+        }
+        return m;
+    });
+    return out + (out.charAt(out.length - 1) === '/' ? ' >' : '>');
+};
+
+var _stripComments = function(html) {
+    var out = '';
+    var pos = 0;
+    var start, end;
+    for (;;) {
+        start = html.indexOf('<!--', pos);
+        if (start === -1) {
+            break;
+        }
+        end = html.indexOf('-->', start + 4);
+        if (end === -1) {
+            break;
+        }
+        out += html.substring(pos, start);
+        pos = end + 3;
+    }
+    return out + html.substring(pos);
+};
+
+var _specialTags = {
+    blockquote: true, dd: true, div: true, dl: true, dt: true, h1: true, h2: true, h3: true, h4: true, h5: true, h6: true,
+    li: true, ol: true, p: true, pre: true, table: true, tbody: true, td: true, tfoot: true, th: true, thead: true, tr: true, ul: true
+};
+var _closePTags = {
+    blockquote: true, dd: true, div: true, dl: true, dt: true, h1: true, h2: true, h3: true, h4: true, h5: true, h6: true,
+    hr: true, li: true, ol: true, p: true, pre: true, table: true, ul: true
+};
+var _headingTags = { h1: true, h2: true, h3: true, h4: true, h5: true, h6: true };
+var _scopeTags = { table: true, td: true, th: true };
+var _listScopeTags = { ol: true, table: true, td: true, th: true, ul: true };
+var _tableOnlyTags = { table: true, tbody: true, tfoot: true, thead: true, tr: true };
+var _tableSectionTags = { tbody: true, tfoot: true, thead: true };
+var _tablePartTags = { tbody: true, td: true, tfoot: true, th: true, thead: true, tr: true };
+var _maxDepth = 100;
+
+var _findOpen = function(stack, names, stops) {
+    var i;
+    for (i = stack.length - 1; i >= 0; i--) {
+        if (names[stack[i]] === true) {
+            return i;
+        }
+        if (stops[stack[i]] === true) {
+            return -1;
+        }
+    }
+    return -1;
+};
+
+var _closeFrom = function(stack, index) {
+    var out = '';
+    while (stack.length > index) {
+        out += '</' + stack.pop() + '>';
+    }
+    return out;
+};
+
+var _findListItem = function(stack, names) {
+    var i;
+    for (i = stack.length - 1; i >= 0; i--) {
+        if (_has(names, stack[i])) {
+            return i;
+        }
+        if (_has(_specialTags, stack[i]) && stack[i] !== 'div' && stack[i] !== 'p') {
+            return -1;
+        }
+    }
+    return -2;
+};
+
+var _openTag = function(stack, tag, html) {
+    var out = '';
+    var top = stack.length ? stack[stack.length - 1] : '';
+    var i;
+    if (!_has(_voidTags, tag) && stack.length >= _maxDepth) {
+        return '';
+    }
+    if (_has(_tablePartTags, tag)) {
+        i = _findOpen(stack, { table: true }, {});
+        if (i === -1) {
+            return '';
+        }
+        i += 1;
+        if (!_has(_tableSectionTags, tag)) {
+            if (_has(_tableSectionTags, stack[i])) {
+                i += 1;
+            }
+            if (tag !== 'tr') {
+                if (stack[i] === 'tr') {
+                    i += 1;
+                } else {
+                    out = _closeFrom(stack, i) + '<tr>';
+                    stack.push('tr');
+                    i = stack.length;
+                }
+            }
+        }
+        out += _closeFrom(stack, i);
+    } else if (_has(_tableOnlyTags, top)) {
+        return '';
+    } else {
+        if (tag === 'li' || tag === 'dd' || tag === 'dt') {
+            i = _findListItem(stack, tag === 'li' ? { li: true } : { dd: true, dt: true });
+            if (i === -2) {
+                return '';
+            }
+            if (i !== -1) {
+                out += _closeFrom(stack, i);
+            }
+        }
+        if (_has(_closePTags, tag)) {
+            i = _findOpen(stack, { p: true }, _scopeTags);
+            if (i !== -1) {
+                out += _closeFrom(stack, i);
+            }
+        }
+        if (_has(_headingTags, tag) && _has(_headingTags, stack[stack.length - 1] || '')) {
+            out += _closeFrom(stack, stack.length - 1);
+        }
+        if (tag === 'a') {
+            i = _findOpen(stack, { a: true }, { td: true, th: true });
+            if (i !== -1) {
+                out += _closeFrom(stack, i);
+            }
+        }
+    }
+    if (!_has(_voidTags, tag)) {
+        stack.push(tag);
+    }
+    return out + html;
+};
+
+var _closeTag = function(stack, tag) {
+    var names = {};
+    var i;
+    names[tag] = true;
+    if (_has(_headingTags, tag)) {
+        i = _findOpen(stack, _headingTags, _scopeTags);
+    } else if (tag === 'table' || _has(_tablePartTags, tag)) {
+        i = _findOpen(stack, names, { table: true });
+    } else if (tag === 'li') {
+        i = _findOpen(stack, names, _listScopeTags);
+    } else {
+        i = _findOpen(stack, names, _scopeTags);
+    }
+    return i === -1 ? '' : _closeFrom(stack, i);
+};
+
+var _sanitize = function(html) {
+    var stack = [];
+    var out;
+    html = _stripComments(String(html));
+    out = html.replace(/<(\/?)([a-zA-Z][a-zA-Z0-9]*)((?:[\s\/][^<>]*)?)>|[^<]+|</g, function(m, slash, name, attrs) {
+        var tag;
+        if (name) {
+            tag = name.toLowerCase();
+            if (_has(_allowedTags, tag) && !(slash && _has(_voidTags, tag))) {
+                return slash ? _closeTag(stack, tag) : _openTag(stack, tag, _sanitizeTag(m, slash, name, attrs));
+            }
+            return _sanitizeTag(m, slash, name, attrs);
+        }
+        return _escapeText(m);
+    });
+    return out + _closeFrom(stack, 0);
+};
+
+var sanitize =function (html) {
+    var _html;
+    if( _.isUndefined(html) || _.isNull(html) || _.isNumber(html))  {
+        return new Handlebars.SafeString(html);
+    }
+
+    if (_.isObject(html)){
+        _html = JSON.stringify(html);
+        return new Handlebars.SafeString(_sanitize('' + JSON.parse(_html)));
+    }
+
+    return new Handlebars.SafeString(_sanitize(html));
+};
+
+Handlebars.registerHelper('sanitize', sanitize);
+
+Handlebars.registerHelper('renderTextParam', function(param) {
+    var result, type = 'text', idAtt = '';
+    var paramType = param.type || param.schema && param.schema.type || '';
+    var isArray = paramType.toLowerCase() === 'array' || param.allowMultiple;
+    var defaultValue = isArray && Array.isArray(param.default) ? param.default.join('\n') : param.default;
+    var name = Handlebars.Utils.escapeExpression(param.name);
+    var valueId = Handlebars.Utils.escapeExpression(param.valueId);
+    paramType = Handlebars.Utils.escapeExpression(paramType);
+
+    var dataVendorExtensions = Object.keys(param).filter(function(property) {
+        // filter X-data- properties
+        return property.match(/^X-data-[A-Za-z0-9_-]+$/i) !== null;
+    }).reduce(function(result, property) {
+        // remove X- from property name, so it results in html attributes like data-foo='bar'
+        return result += ' ' + property.substring(2, property.length) + '=\'' + Handlebars.Utils.escapeExpression(param[property]) + '\'';
+    }, '');
+
+    if(param.format && param.format === 'password') {
+        type = 'password';
+    }
+
+    if(valueId) {
+        idAtt = ' id=\'' + valueId + '\'';
+    }
+
+    defaultValue = Handlebars.Utils.escapeExpression(defaultValue);
+
+    if(isArray) {
+        result = '<textarea class=\'body-textarea' + (param.required ? ' required' : '') + '\' name=\'' + name + '\'' + idAtt + dataVendorExtensions;
+        result += ' placeholder=\'Provide multiple values in new lines' + (param.required ? ' (at least one required).' : '.') + '\'>';
+        result += defaultValue + '</textarea>';
+    } else {
+        var parameterClass = 'parameter';
+        if(param.required) {
+          parameterClass += ' required';
+        }
+      
+　　　　 result = '<input class=\'' + parameterClass + '\' minlength=\'' + (param.required ? 1 : 0) + '\'';
+        result += ' name=\'' + name +'\' placeholder=\'' + (param.required ? '(required)' : '') + '\'' + idAtt + dataVendorExtensions;
+        result += ' type=\'' + type + '\' value=\'' + defaultValue + '\'/>';
+    }
+    return new Handlebars.SafeString(result);
+});
+
+Handlebars.registerHelper('ifCond', function (v1, operator, v2, options) {
+
+    switch (operator) {
+        case '==':
+            return (v1 == v2) ? options.fn(this) : options.inverse(this);
+        case '===':
+            return (v1 === v2) ? options.fn(this) : options.inverse(this);
+        case '<':
+            return (v1 < v2) ? options.fn(this) : options.inverse(this);
+        case '<=':
+            return (v1 <= v2) ? options.fn(this) : options.inverse(this);
+        case '>':
+            return (v1 > v2) ? options.fn(this) : options.inverse(this);
+        case '>=':
+            return (v1 >= v2) ? options.fn(this) : options.inverse(this);
+        case '&&':
+            return (v1 && v2) ? options.fn(this) : options.inverse(this);
+        case '||':
+            return (v1 || v2) ? options.fn(this) : options.inverse(this);
+        default:
+            return options.inverse(this);
+    }
+});
+
+Handlebars.registerHelper('escape', function (value) {
+    var text = Handlebars.Utils.escapeExpression(value);
+
+    return new Handlebars.SafeString(text);
+});
+
+
+
+
+
+
+
+
+No.96 lib/fetch-package-metadata.js
+
+'use strict'
+
+const deprCheck = require('./utils/depr-check')
+const path = require('path')
+const log = require('npmlog')
+const readPackageTree = require('read-package-tree')
+const rimraf = require('rimraf')
+const validate = require('aproba')
+const npa = require('npm-package-arg')
+const npm = require('./npm')
+let npmConfig
+const npmlog = require('npmlog')
+const limit = require('call-limit')
+const tempFilename = require('./utils/temp-filename')
+const pacote = require('pacote')
+const isWindows = require('./utils/is-windows.js')
+
+const URL_CREDENTIALS = /:([/\\]+)[^\s/\\?#]*@/g
+const URL_CREDENTIALS_IN_SPEC = /:([/\\]+)[^/\\?#]*@/g
+const SPEC_STARTS_WITH_SCHEME = /^[\x00-\x20\s]*[a-z0-9.+-]+:/i
+const SPEC_URL_CREDENTIALS = /^([\x00-\x20\s]*(?!(?:[a-z]|npm|file):)[a-z0-9.+-]+:[/\\]*)[^/\\?#]*@/i
+const URL_CREDENTIALS_NO_SLASH = /(^|\s)(['"`(<[{]*(?:(?:@[\w.!~*'()-]+\/)?[\w.!~*)-][\w.!~*'()-]*@)?(?!(?:[a-z]|npm|file):)[a-z0-9.+-]+:[/\\]*)[^\s/\\?#]*@/gi
+function redactUrlCredentials (str, inSpec) {
+  if (typeof str !== 'string') return str
+  if (inSpec) return redactSpecCredentials(str).replace(URL_CREDENTIALS_IN_SPEC, ':$1***@')
+  return str.replace(URL_CREDENTIALS, ':$1***@').replace(URL_CREDENTIALS_NO_SLASH, '$1$2***@')
+}
+function redactSpecCredentials (spec) {
+  let start = 0
+  if (!SPEC_STARTS_WITH_SCHEME.test(spec)) {
+    const at = spec.indexOf('@', spec[0] === '@' ? 1 : 0)
+    if (at !== -1) start = at + 1
+  }
+  return spec.slice(0, start) + spec.slice(start).replace(SPEC_URL_CREDENTIALS, '$1***@')
+}
+function redactSpecInMessage (message, spec, specString) {
+  if (typeof message !== 'string') return message
+  const forms = [specString]
+  if (spec && typeof spec === 'object') {
+    const name = typeof spec.name === 'string' ? spec.name : ''
+    for (const key of ['raw', 'rawSpec', 'saveSpec', 'fetchSpec']) {
+      const value = spec[key]
+      if (typeof value !== 'string') continue
+      forms.push(value)
+      if (name) forms.push(name + '@' + value)
+    }
+  }
+  forms.sort((a, b) => b.length - a.length)
+  const seen = new Set()
+  for (const form of forms) {
+    if (!form || seen.has(form)) continue
+    seen.add(form)
+    if (message.indexOf(form) === -1) continue
+    const redacted = redactUrlCredentials(form, true)
+    if (redacted !== form) message = message.split(form).join(redacted)
+  }
+  return message
+}
+
+function andLogAndFinish (spec, tracker, done) {
+  validate('SOF|SZF|OOF|OZF', [spec, tracker, done])
+  return (er, pkg) => {
+    if (er) {
+      const specString = String(spec)
+      log.silly('fetchPackageMetaData', 'error for ' + redactUrlCredentials(specString, true), redactUrlCredentials(redactSpecInMessage(er.message, spec, specString)))
+      if (tracker) tracker.finish()
+    }
+    return done(er, pkg)
+  }
+}
+
+const LRUCache = require('lru-cache')
+const CACHE = new LRUCache({
+  max: 300 * 1024 * 1024,
+  length: (p) => p._contentLength
+})
+
+module.exports = limit(fetchPackageMetadata, npm.limit.fetch)
+function fetchPackageMetadata (spec, where, opts, done) {
+  validate('SSOF|SSFZ|OSOF|OSFZ', [spec, where, opts, done])
+
+  if (!done) {
+    done = opts
+    opts = {}
+  }
+  var tracker = opts.tracker
+  const logAndFinish = andLogAndFinish(spec, tracker, done)
+
+  if (typeof spec === 'object') {
+    var dep = spec
+  } else {
+    dep = npa(spec)
+  }
+  if (!isWindows && dep.type === 'directory' && /^[a-zA-Z]:/.test(dep.fetchSpec)) {
+    var err = new Error(`Can't install from windows path on a non-windows system: ${dep.fetchSpec.replace(/[/]/g, '\\')}`)
+    err.code = 'EWINDOWSPATH'
+    return logAndFinish(err)
+  }
+  if (!npmConfig) {
+    npmConfig = require('./config/figgy-config.js')
+  }
+  pacote.manifest(dep, npmConfig({
+    annotate: true,
+    fullMetadata: opts.fullMetadata,
+    log: tracker || npmlog,
+    memoize: CACHE,
+    where: where
+  })).then(
+    (pkg) => logAndFinish(null, deprCheck(pkg)),
+    (err) => {
+      if (dep.type !== 'directory') return logAndFinish(err)
+      if (err.code === 'ENOTDIR') {
+        var enolocal = new Error(`Could not install "${path.relative(process.cwd(), dep.fetchSpec)}" as it is not a directory and is not a file with a name ending in .tgz, .tar.gz or .tar`)
+        enolocal.code = 'ENOLOCAL'
+        if (err.stack) enolocal.stack = err.stack
+        return logAndFinish(enolocal)
+      } else if (err.code === 'ENOPACKAGEJSON') {
+        var enopackage = new Error(`Could not install from "${path.relative(process.cwd(), dep.fetchSpec)}" as it does not contain a package.json file.`)
+        enopackage.code = 'ENOLOCAL'
+        if (err.stack) enopackage.stack = err.stack
+        return logAndFinish(enopackage)
+      } else {
+        return logAndFinish(err)
+      }
+    }
+  )
+}
+
+module.exports.addBundled = addBundled
+function addBundled (pkg, next) {
+  validate('OF', arguments)
+  if (pkg._bundled !== undefined) return next(null, pkg)
+
+  if (!pkg.bundleDependencies && pkg._requested.type !== 'directory') return next(null, pkg)
+  const requested = pkg._requested || npa(pkg._from)
+  if (requested.type === 'directory') {
+    pkg._bundled = null
+    return readPackageTree(pkg._requested.fetchSpec, function (er, tree) {
+      if (tree) pkg._bundled = tree.children
+      return next(null, pkg)
+    })
+  }
+  pkg._bundled = null
+  const target = tempFilename('unpack')
+  if (!npmConfig) {
+    npmConfig = require('./config/figgy-config.js')
+  }
+  const opts = npmConfig({integrity: pkg._integrity})
+  pacote.extract(pkg._resolved || pkg._requested || npa.resolve(pkg.name, pkg.version), target, opts).then(() => {
+    log.silly('addBundled', 'read tarball')
+    readPackageTree(target, (err, tree) => {
+      if (err) { return next(err) }
+      log.silly('cleanup', 'remove extracted module')
+      rimraf(target, function () {
+        if (tree) {
+          pkg._bundled = tree.children
+        }
+        next(null, pkg)
+      })
+    })
+  }, next)
+}
