@@ -1,0 +1,820 @@
+#### No.96 CVE-2020-15095 npm (npm/cli v6.14.5) の修正コードの説明
+
+対象: npm/cli コミット 479e45c（v6.14.5）の `lib/fetch-package-metadata.js`、`lib/utils/error-handler.js`。あわせて `bin/npm-cli.js` を直し、共通の関数を新しいファイル `lib/utils/redact-url-auth.js` に置いた。
+
+| 修正ファイル | 元のパス | 内容 |
+|---|---|---|
+| `fix01_redact-url-auth.js` | `lib/utils/redact-url-auth.js`（**新規**） | URL 内の認証情報（userinfo）を伏せる関数 `redactUrlAuth` |
+| `fix01_fetch-package-metadata.js` | `lib/fetch-package-metadata.js` | 取得失敗時のログ（spec と er.message）を伏せる |
+| `fix01_error-handler.js` | `lib/utils/error-handler.js` | argv の記録、`_timing.json` の command、debug.log の書き出しを伏せる |
+| `fix01_npm-cli.js` | `bin/npm-cli.js` | 起動直後の argv の記録（`cli`）を伏せる |
+
+#### 1. 修正の方針
+
+##### 防ぐ脆弱性
+判定の記録で「脆弱性あり」とした、**ログへの機密情報（URL 内の認証情報）の平文の記録（CWE-312 / CWE-532）**を防ぐ。
+
+- `npm install https://ユーザー名:パスワード@私設レジストリ/pkg.tgz` や、package.json の `"dep": "git+https://ユーザー名:トークン@github.com/owner/repo.git"` のように、URL に認証情報を入れて依存を指定できる。
+- 取得に失敗すると、`lib/fetch-package-metadata.js` 22 行目の `log.silly(...)` が spec と er.message をそのまま記録する。npmlog は表示レベルに関係なく全メッセージを `log.record` に保存し、npm がエラーで終わると `writeLogFile()` が `log.record` を `~/.npm/_logs/<日時>-debug.log` に平文で書き出す。
+- 補足の指摘として、`lib/utils/error-handler.js` 185 行目の `log.verbose('argv', ...)` も、コマンドライン引数の URL をそのまま記録する。
+
+##### どこで、どのように防ぐか
+- **記録する直前に、記録用の文字列からだけ URL の userinfo（`//` と、ホストの前の `@` に挟まれた部分）を `***` に置き換える。**
+  - spec・`process.argv`・エラーオブジェクトそのものは書き換えない。認証情報は実際の取得に必要なので、元の値は取得処理にそのまま渡す。
+- 置き換えは共通の関数 `redactUrlAuth`（新規 `lib/utils/redact-url-auth.js`）にまとめ、次の箇所で使う。
+  1. `lib/fetch-package-metadata.js` の `log.silly('fetchPackageMetaData', ...)`（判定で根拠とした箇所。spec と er.message の両方）
+  2. `lib/utils/error-handler.js` の `log.verbose('argv', ...)`（判定の補足の箇所）
+  3. 同じ argv を記録しているほかの 2 か所: `bin/npm-cli.js` の `log.verbose('cli', process.argv)` と、`error-handler.js` の `timings.command`（`--timing` 指定時に `<cache>/_timing.json` へ平文で追記される）
+  4. `error-handler.js` の `writeLogFile()`。debug.log に書き出す各行をもう一度伏せる（多重の防御）。
+
+##### この方法を選んだ理由
+- **正規表現で置き換える理由**: 伏せたい URL は、`'error for foo@https://u:p@host/x.tgz'` や `'request to https://u:p@host/x.tgz failed, reason: ...'` のように、文の途中に埋め込まれている。`url.parse` で auth を消す方法は、文字列全体が 1 つの URL のときにしか使えない。そのため、文中の URL も見つけられる正規表現を使った。
+- **パスワードだけでなく userinfo 全体を伏せる理由**: `https://TOKEN@github.com/...` や `https://TOKEN:x-oauth-basic@github.com/...` のように、ユーザー名の位置にアクセストークンを入れる使い方がある。そのため、`ユーザー名:` を残すと秘密が漏れる場合がある。
+- **記録箇所ごとに直す理由**: `--loglevel silly` / `verbose` を付けると、端末（CI のログ）にもそのまま表示される。端末への表示は `writeLogFile()` を通らないので、判定で指摘された記録箇所は、その場で伏せる必要がある。
+- **`writeLogFile()` でも伏せる理由**: 認証情報付きの URL は、ほかの経路でも `log.record` に入る。たとえば errorHandler が記録する `er.stack` / `er.message`（`error-message.js` 経由の `log.error`）や、pacote などの依存モジュールが記録する取得先 URL である。これらを 1 か所ずつ直すと漏れが出やすいので、判定で挙がった被害（debug.log に平文で残り、issue への貼り付けなどで第三者に渡る）を、ファイルを書く出口でもまとめて防ぐ。
+- **新しいファイルにした理由**: 同じ処理を 3 ファイルで使うので、コピーを作らず、正規表現を 1 か所で管理するため。
+
+#### 2. 変更箇所ごとの説明
+
+##### 2-1. `lib/utils/redact-url-auth.js`（新規。`fix01_redact-url-auth.js` 1〜24 行目）
+
+修正後（コメントを除く）:
+```js
+'use strict'
+
+const URL_USERINFO = /\/\/[^/?#\s]+@/g
+
+module.exports = redactUrlAuth
+function redactUrlAuth (str) {
+  if (typeof str !== 'string') return str
+  return str.replace(URL_USERINFO, '//***@')
+}
+```
+
+- `URL_USERINFO = /\/\/[^/?#\s]+@/g`
+  - `\/\/`: URL の `scheme://` の `//`。ここが authority（userinfo とホスト）の始まり。
+  - `[^/?#\s]+`: `//` の後ろで、パス（`/`）、クエリ（`?`）、フラグメント（`#`）、空白文字のどれかが出るまでの 1 文字以上。URL の authority 部分に当たる。
+  - `@`: userinfo とホストの区切り。`+` は最長一致なので、区間の中に `@` が複数あると**最後の `@`** までが一致する。パスワードに `@` がそのまま入っていても（`https://u:p@ss@host/`）、`ss` などの一部が残らない。
+  - `g`: 文字列の中にある URL を全部置き換える（er.message に URL が 2 回出る場合や、argv をつないだ文字列など）。
+  - 一致する区間には `/` が含まれないので、区間どうしは重ならない。後戻り（バックトラック）は 1 つの区間の中だけで起きるので、処理時間は入力の長さに比例する。長い入力でも極端に遅くはならない（ReDoS にならない）。
+- `if (typeof str !== 'string') return str`: `er.message` が `undefined` の場合などは、そのまま返す。元のコードと同じ表示（`undefined`）になり、例外も起きない。
+- `str.replace(URL_USERINFO, '//***@')`: userinfo を `***` に置き換える。scheme（`https:` / `git+https:`）とホスト名以降は残るので、どの取得先で失敗したかはログから分かる。
+
+脆弱性が防げる理由: URL の認証情報は、構文上 `//` と、ホストの前の最後の `@` の間にしか置けない。そこを丸ごと `***` に置き換えた文字列だけをログに渡すので、ユーザー名・パスワード・トークンの文字がログに入らない。
+
+##### 2-2. `lib/fetch-package-metadata.js`（`fix01_fetch-package-metadata.js`）
+
+**17〜18 行目（追加）**
+```js
+// 【修正】URL 内の認証情報（userinfo）を伏せる関数を読み込む（新規ファイル lib/utils/redact-url-auth.js）
+const redactUrlAuth = require('./utils/redact-url-auth.js')
+```
+- 2-1 の関数を読み込む。
+
+**元の 22 行目 → 修正後 24〜28 行目（`andLogAndFinish()` の中）**
+
+修正前:
+```js
+      log.silly('fetchPackageMetaData', 'error for ' + String(spec), er.message)
+```
+修正後:
+```js
+      // 【修正】spec（…）や er.message（…）をそのまま記録すると、…認証情報が平文で残る。
+      // 記録する前に、どちらも URL の userinfo を「***」に伏せる。
+      log.silly('fetchPackageMetaData', 'error for ' + redactUrlAuth(String(spec)), redactUrlAuth(er.message))
+```
+- `redactUrlAuth(String(spec))`:
+  - spec が npm-package-arg の Result オブジェクトのとき、`String(spec)` は `toString()` により `名前@saveSpec` になる。URL 指定では `saveSpec` は入力そのままなので、認証情報が入っている。
+  - spec が文字列のときは、入力そのままが入る。
+  - どちらの場合も、文字列にした後で userinfo を伏せる。
+- `redactUrlAuth(er.message)`: 取得失敗のエラーメッセージ（例: `request to https://u:p@host/x.tgz failed, reason: ...`）に入る取得先 URL の userinfo を伏せる。
+- 伏せるのはログに渡す文字列だけで、`er` オブジェクトと `spec` は変えない。`done(er, pkg)` に渡すエラーは元のままなので、呼び出し元のエラー処理（`er.code` による分類や終了コード）は変わらない。
+- これで、`log.record` に入る文字列（その後 debug.log に書かれるもの）と、`--loglevel silly` で端末に出る文字列の両方から、認証情報がなくなる。
+
+##### 2-3. `lib/utils/error-handler.js`（`fix01_error-handler.js`）
+
+**18〜19 行目（追加）**
+```js
+// 【修正】URL 内の認証情報（userinfo）を伏せる関数を読み込む（新規ファイル lib/utils/redact-url-auth.js）
+const redactUrlAuth = require('./redact-url-auth.js')
+```
+- 直後の `timings`（29 行目〜）で使うので、その前で読み込む。
+
+**元の 29 行目 → 修正後 31〜33 行目（`timings.command`）**
+
+修正前:
+```js
+  command: process.argv.slice(2),
+```
+修正後:
+```js
+  // 【修正】--timing 指定時は、この command が <cache>/_timing.json に平文で追記される。
+  // コマンドライン引数の URL の userinfo を伏せたコピーを記録する（process.argv 自体は変えない）。
+  command: process.argv.slice(2).map(redactUrlAuth),
+```
+- `timings` は `process.on('exit')` の中で `cacheFile.append('_timing.json', JSON.stringify(timings))` によりファイルに追記される。argv をそのまま残す点は、判定の補足（185 行目）と同じ問題なので、あわせて直した。
+- `.map(redactUrlAuth)` は新しい配列を作るだけで、`process.argv` は変えない。
+
+**元の 185 行目 → 修正後 189〜192 行目（argv の記録。判定の補足の箇所）**
+
+修正前:
+```js
+  log.verbose('argv', process.argv.map(JSON.stringify).join(' '))
+```
+修正後:
+```js
+  // 【修正】コマンドライン引数（例: npm install https://ユーザー名:パスワード@ホスト/pkg.tgz）を
+  // そのまま記録すると、debug.log や --loglevel verbose 以上の端末表示に認証情報が平文で残る。
+  // 各引数の URL の userinfo を伏せてから JSON 文字列にして記録する（process.argv 自体は変えない）。
+  log.verbose('argv', process.argv.map(redactUrlAuth).map(JSON.stringify).join(' '))
+```
+- `process.argv.map(redactUrlAuth)`: 各引数のコピーから userinfo を伏せる。
+- `.map(JSON.stringify).join(' ')`: 元のコードと同じ形（`"引数1" "引数2" …`）にする。JSON にする前の元の文字列に対して伏せるので、エスケープの影響を受けない。
+- これで、エラー終了時に記録される argv の行（debug.log と verbose 以上の端末表示）に、認証情報が入らない。
+
+**元の 237〜239 行目 → 修正後 244〜250 行目（`writeLogFile()` の中）**
+
+修正前:
+```js
+      m.message.trim().split(/\r?\n/).map(function (line) {
+        return (pref + ' ' + line).trim()
+      }).forEach(function (line) {
+```
+修正後:
+```js
+      m.message.trim().split(/\r?\n/).map(function (line) {
+        // 【修正】ファイルに書き出す直前に、行全体から URL の userinfo を伏せる（多重の防御）。
+        // （…コメント略…）
+        return redactUrlAuth((pref + ' ' + line).trim())
+      }).forEach(function (line) {
+```
+- debug.log に書く 1 行（`id レベル prefix メッセージ`）の全体を伏せる。prefix に URL が入る場合も対象になる。
+- 個々の記録箇所で伏せていない文字列もここで伏せる。たとえば errorHandler の `log.verbose('stack', er.stack)`、`error-message.js` 経由の `log.error('network', er.message)`、依存モジュールの HTTP ログなどである。そのため、判定で挙げた被害（debug.log に平文で残る）を出口でまとめて防げる。
+- 2-2 などで伏せ済みの `//***@` に、もう一度かけても `//***@` のままなので（冪等）、二重にかけても問題ない。
+
+##### 2-4. `bin/npm-cli.js`（`fix01_npm-cli.js`）
+
+**31〜32 行目（追加）**
+```js
+  // 【修正】URL 内の認証情報（userinfo）を伏せる関数を読み込む（新規ファイル lib/utils/redact-url-auth.js）
+  var redactUrlAuth = require('../lib/utils/redact-url-auth.js')
+```
+
+**元の 43 行目 → 修正後 45〜50 行目**
+
+修正前:
+```js
+  log.verbose('cli', process.argv)
+```
+修正後:
+```js
+  // 【修正】コマンドライン引数（例: …）をそのまま記録すると、log.record を経て debug.log や
+  // --loglevel verbose 以上の端末表示に認証情報が平文で残る（error-handler.js の argv の記録と同じ問題）。
+  // 各引数の URL の userinfo を伏せたコピーを記録する。process.argv 自体は変えないので、
+  // この後の nopt による引数の解析や、実際の取得には元の値がそのまま使われる。
+  log.verbose('cli', process.argv.map(redactUrlAuth))
+```
+- npm は起動直後に、argv 全体を `cli` として記録している。判定の補足の 185 行目だけを直しても、同じ argv がここから `log.record` に入る。そのため、debug.log や verbose 表示に認証情報が残る。185 行目の修正を意味のあるものにするため、ここも直した。
+- `.map()` は新しい配列を返すので、`process.argv` は変わらない。直後の `nopt(types, shorthands)`（`process.argv` を解析する）と、その後の install の処理には元の URL がそのまま渡り、取得の動作は変わらない。
+- npmlog は配列を `util.format` で `[ '…', '…' ]` の形にして記録する。修正後も配列を渡しているので、ログの形は変わらない。
+
+#### 3. 修正の結果
+
+##### 判定の記録にある攻撃（入力例）の扱い
+例として、`npm install https://alice:s3cret@registry.example.com/foo/-/foo-1.0.0.tgz` を実行し、名前解決の失敗・404・401 などで取得に失敗した場合を考える。
+
+| 記録先 | 修正前 | 修正後 |
+|---|---|---|
+| debug.log の `fetchPackageMetaData` 行 | `silly fetchPackageMetaData error for https://alice:s3cret@registry.example.com/foo/-/foo-1.0.0.tgz request to https://alice:s3cret@registry.example.com/… failed, …` | `silly fetchPackageMetaData error for https://***@registry.example.com/foo/-/foo-1.0.0.tgz request to https://***@registry.example.com/… failed, …` |
+| debug.log の `argv` 行 | `verbose argv "/usr/bin/node" "/usr/bin/npm" "install" "https://alice:s3cret@registry.example.com/…"` | `verbose argv "/usr/bin/node" "/usr/bin/npm" "install" "https://***@registry.example.com/…"` |
+| debug.log の `cli` 行 | `verbose cli [ …, 'https://alice:s3cret@registry.example.com/…' ]` | `verbose cli [ …, 'https://***@registry.example.com/…' ]` |
+| debug.log の `stack` / `network` などの行（er.message・er.stack） | URL がそのまま | `writeLogFile()` で `https://***@…` に置き換わる |
+| `--loglevel silly` / `verbose` の端末表示（上の 3 行） | 平文 | `***` に伏せて表示 |
+| `--timing` 時の `_timing.json` の `command` | `["install","https://alice:s3cret@…"]` | `["install","https://***@…"]` |
+
+ほかの入力例:
+- package.json の `"bar": "git+https://bob:ghp_xxxx@github.com/owner/repo.git"` → `bar@git+https://***@github.com/owner/repo.git`
+- トークンをユーザー名の位置に置く `https://ghp_xxxx@github.com/owner/repo.git` → `https://***@github.com/owner/repo.git`
+- パスワードに `@` がそのまま入る `https://u:p@ss@host/x.tgz` → `https://***@host/x.tgz`（最後の `@` まで伏せる）
+
+その結果、debug.log が issue に貼られたり、CI の成果物として公開されたり、共有マシンやバックアップから読まれたりしても、私設レジストリのパスワードやアクセストークンは、ここからは得られない。
+
+##### 正常な入力での動作への影響
+- **変わらない点**
+  - 実際の取得の動作。伏せるのはログに渡すコピーだけで、spec・`process.argv`・`er` は変えないので、認証付き URL からの取得はこれまでどおり成功する。
+  - エラーの分類、エラーコード、終了コード。
+  - userinfo を含まない URL や指定子のログ。例: `https://registry.npmjs.org/@scope/pkg/-/pkg-1.0.0.tgz`、`https://registry.npmjs.org/@scope%2fpkg`（`@` が `/` の後にあるので一致しない）、`foo@^1.2.3`、`git@github.com:owner/repo.git`（scp 形式は `//` がないので一致しない）、`github:owner/repo`、ローカルのパス。
+  - ログの行の形（id、レベル、prefix、JSON 化した argv、配列の表示）。
+- **変わる点**
+  - ログ・debug.log・`_timing.json` の中で、URL の userinfo が `***` になる。`git+ssh://git@github.com/...` のように秘密ではないユーザー名も `git+ssh://***@github.com/...` と表示される。
+  - URL ではない文字列でも、`//文字列@` の形（空白・`/`・`?`・`#` を挟まない）があれば、debug.log ではその部分が伏せられる。いずれも情報を隠す側に倒れるだけで、npm の動作には影響しない。
+  - 処理時間: 各ログの文字列に、長さに比例する時間の置き換えを 1〜2 回行うだけなので、影響はほとんどない。
+
+#### 4. 注意点
+
+- **XSS について**: この項目は XSS（CWE-79）ではないと判定されており、XSS の指摘はない。この作業では XSS に関する変更はしていない。
+- **端末への通常のエラー表示は直していない**:
+  - 取得の失敗は最後に `errorHandler` に渡り、`error-message.js` が `er.message` を `log.error`（`npm ERR! network request to https://u:p@host/… failed` など）で、既定のログレベルのまま端末に表示する。`--json` 指定時は `summary` / `detail` として標準出力にも出す。
+  - 今回の修正では debug.log（`writeLogFile()`）からは消えるが、**端末（CI のログ）への表示には URL の認証情報が残り得る**。
+  - 判定で指摘された記録箇所ではないこと、エラーオブジェクトを書き換えると影響範囲が広がることから、修正を最小限にするため直さなかった。
+  - 直す場合は、`errorHandler` の最初で `er.message` / `er.stack` / `er.pkgid` に `redactUrlAuth` をかける方法がある。npmlog の全メッセージを、記録・表示の前に一括で伏せる方法もある。
+- **依存モジュールのログの端末表示**: pacote や npm-registry-fetch などが `log.http` / `log.silly` で記録する取得先 URL は、debug.log では伏せられる。一方、`--loglevel http` 以上を指定したときの端末表示では伏せられない（これらのモジュールは対象のコミットの外部パッケージで、判定の対象外）。
+- **伏せられない形の認証情報**:
+  - URL の userinfo 以外の形には対応していない。例: クエリ文字列のトークン（`?access_token=…`）、`.npmrc` の `_authToken` / `_auth`、Authorization ヘッダの値。
+  - userinfo に `/` `?` `#` や空白を、パーセントエンコードせずにそのまま入れた不正な形の URL では、その文字の後ろの部分が伏せられずに残る。
+- **すでに書き出されたログ**: 修正前に作られた `~/.npm/_logs/*-debug.log` や `_timing.json` はそのまま残る。認証付き URL で取得に失敗したことがある環境では、これらのファイルを消し、漏れた可能性のあるパスワードやトークンを無効にして作り直す必要がある。
+- **メモリ上の記録**: `log.record` の中身（メモリ上）は、2-2〜2-4 以外の箇所では平文のまま残る。ファイルに書くときは `writeLogFile()` で伏せるので、ディスクには残らない。
+- **新規ファイルの配置**: `fix01_redact-url-auth.js` は `lib/utils/redact-url-auth.js` として置く必要がある。3 つのファイルの `require` は、このパスを前提にしている。
+
+### 修正したコード: error-handler.js
+
+```javascript
+
+module.exports = errorHandler
+module.exports.exit = exit
+
+var cbCalled = false
+var log = require('npmlog')
+var npm = require('../npm.js')
+var itWorked = false
+var path = require('path')
+var wroteLogFile = false
+var exitCode = 0
+var rollbacks = npm.rollbacks
+var chain = require('slide').chain
+var errorMessage = require('./error-message.js')
+var stopMetrics = require('./metrics.js').stop
+
+const cacheFile = require('./cache-file.js')
+// 【修正】URL 内の認証情報（userinfo）を伏せる関数を読み込む（新規ファイル lib/utils/redact-url-auth.js）
+const redactUrlAuth = require('./redact-url-auth.js')
+
+var logFileName
+function getLogFile () {
+  if (!logFileName) {
+    logFileName = path.resolve(npm.config.get('cache'), '_logs', (new Date()).toISOString().replace(/[.:]/g, '_') + '-debug.log')
+  }
+  return logFileName
+}
+
+var timings = {
+  version: npm.version,
+  // 【修正】--timing 指定時は、この command が <cache>/_timing.json に平文で追記される。
+  // コマンドライン引数の URL の userinfo を伏せたコピーを記録する（process.argv 自体は変えない）。
+  command: process.argv.slice(2).map(redactUrlAuth),
+  logfile: null
+}
+process.on('timing', function (name, value) {
+  if (timings[name]) { timings[name] += value } else { timings[name] = value }
+})
+
+process.on('exit', function (code) {
+  process.emit('timeEnd', 'npm')
+  log.disableProgress()
+  if (npm.config && npm.config.loaded && npm.config.get('timing')) {
+    try {
+      timings.logfile = getLogFile()
+      cacheFile.append('_timing.json', JSON.stringify(timings) + '\n')
+    } catch (_) {
+      // ignore
+    }
+  }
+
+  // kill any outstanding stats reporter if it hasn't finished yet
+  stopMetrics()
+
+  if (code) itWorked = false
+  if (itWorked) {
+    log.info('ok')
+  } else {
+    if (!cbCalled) {
+      log.error('', 'cb() never called!')
+      console.error('')
+      log.error('', 'This is an error with npm itself. Please report this error at:')
+      log.error('', '    <https://npm.community>')
+      writeLogFile()
+    }
+
+    if (code) {
+      log.verbose('code', code)
+    }
+  }
+  if (npm.config && npm.config.loaded && npm.config.get('timing') && !wroteLogFile) writeLogFile()
+  if (wroteLogFile) {
+    // just a line break
+    if (log.levels[log.level] <= log.levels.error) console.error('')
+
+    log.error(
+      '',
+      [
+        'A complete log of this run can be found in:',
+        '    ' + getLogFile()
+      ].join('\n')
+    )
+    wroteLogFile = false
+  }
+
+  var doExit = npm.config && npm.config.loaded && npm.config.get('_exit')
+  if (doExit) {
+    // actually exit.
+    if (exitCode === 0 && !itWorked) {
+      exitCode = 1
+    }
+    if (exitCode !== 0) process.exit(exitCode)
+  } else {
+    itWorked = false // ready for next exit
+  }
+})
+
+function exit (code, noLog) {
+  exitCode = exitCode || process.exitCode || code
+
+  var doExit = npm.config && npm.config.loaded ? npm.config.get('_exit') : true
+  log.verbose('exit', [code, doExit])
+  if (log.level === 'silent') noLog = true
+
+  if (rollbacks.length) {
+    chain(rollbacks.map(function (f) {
+      return function (cb) {
+        npm.commands.unbuild([f], true, cb)
+      }
+    }), function (er) {
+      if (er) {
+        log.error('error rolling back', er)
+        if (!code) {
+          errorHandler(er)
+        } else {
+          if (!noLog) writeLogFile()
+          reallyExit(er)
+        }
+      } else {
+        if (!noLog && code) writeLogFile()
+        reallyExit()
+      }
+    })
+    rollbacks.length = 0
+  } else if (code && !noLog) {
+    writeLogFile()
+  } else {
+    reallyExit()
+  }
+
+  function reallyExit (er) {
+    if (er && !code) code = typeof er.errno === 'number' ? er.errno : 1
+
+    itWorked = !code
+
+    // Exit directly -- nothing in the CLI should still be running in the
+    // background at this point, and this makes sure anything left dangling
+    // for whatever reason gets thrown away, instead of leaving the CLI open
+    //
+    // Commands that expect long-running actions should just delay `cb()`
+    process.stdout.write('', () => {
+      process.exit(code)
+    })
+  }
+}
+
+function errorHandler (er) {
+  log.disableProgress()
+  if (!npm.config || !npm.config.loaded) {
+    // logging won't work unless we pretend that it's ready
+    er = er || new Error('Exit prior to config file resolving.')
+    console.error(er.stack || er.message)
+  }
+
+  if (cbCalled) {
+    er = er || new Error('Callback called more than once.')
+  }
+
+  cbCalled = true
+  if (!er) return exit(0)
+  if (typeof er === 'string') {
+    log.error('', er)
+    return exit(1, true)
+  } else if (!(er instanceof Error)) {
+    log.error('weird error', er)
+    return exit(1, true)
+  }
+
+  var m = er.code || er.message.match(/^(?:Error: )?(E[A-Z]+)/)
+  if (m && !er.code) {
+    er.code = m
+  }
+
+  ;[
+    'type',
+    'stack',
+    'statusCode',
+    'pkgid'
+  ].forEach(function (k) {
+    var v = er[k]
+    if (!v) return
+    log.verbose(k, v)
+  })
+
+  log.verbose('cwd', process.cwd())
+
+  var os = require('os')
+  log.verbose('', os.type() + ' ' + os.release())
+  // 【修正】コマンドライン引数（例: npm install https://ユーザー名:パスワード@ホスト/pkg.tgz）を
+  // そのまま記録すると、debug.log や --loglevel verbose 以上の端末表示に認証情報が平文で残る。
+  // 各引数の URL の userinfo を伏せてから JSON 文字列にして記録する（process.argv 自体は変えない）。
+  log.verbose('argv', process.argv.map(redactUrlAuth).map(JSON.stringify).join(' '))
+  log.verbose('node', process.version)
+  log.verbose('npm ', 'v' + npm.version)
+
+  ;[
+    'code',
+    'syscall',
+    'file',
+    'path',
+    'dest',
+    'errno'
+  ].forEach(function (k) {
+    var v = er[k]
+    if (v) log.error(k, v)
+  })
+
+  var msg = errorMessage(er)
+  msg.summary.concat(msg.detail).forEach(function (errline) {
+    log.error.apply(log, errline)
+  })
+  if (npm.config && npm.config.get('json')) {
+    var error = {
+      error: {
+        code: er.code,
+        summary: messageText(msg.summary),
+        detail: messageText(msg.detail)
+      }
+    }
+    console.log(JSON.stringify(error, null, 2))
+  }
+
+  exit(typeof er.errno === 'number' ? er.errno : 1)
+}
+
+function messageText (msg) {
+  return msg.map(function (line) {
+    return line.slice(1).join(' ')
+  }).join('\n')
+}
+
+function writeLogFile () {
+  if (wroteLogFile) return
+
+  var os = require('os')
+
+  try {
+    var logOutput = ''
+    log.record.forEach(function (m) {
+      var pref = [m.id, m.level]
+      if (m.prefix) pref.push(m.prefix)
+      pref = pref.join(' ')
+
+      m.message.trim().split(/\r?\n/).map(function (line) {
+        // 【修正】ファイルに書き出す直前に、行全体から URL の userinfo を伏せる（多重の防御）。
+        // 個々の記録箇所で伏せていないもの（errorHandler が記録する er.message・er.stack や、
+        // pacote などの依存モジュールが記録した取得先 URL）に認証情報が入っていても、
+        // debug.log には平文で残さない。
+        return redactUrlAuth((pref + ' ' + line).trim())
+      }).forEach(function (line) {
+        logOutput += line + os.EOL
+      })
+    })
+    cacheFile.write(getLogFile(), logOutput)
+
+    // truncate once it's been written.
+    log.record.length = 0
+    wroteLogFile = true
+  } catch (ex) {
+
+  }
+}
+```
+
+### 修正したコード: fetch-package-metadata.js
+
+```javascript
+'use strict'
+
+const deprCheck = require('./utils/depr-check')
+const path = require('path')
+const log = require('npmlog')
+const readPackageTree = require('read-package-tree')
+const rimraf = require('rimraf')
+const validate = require('aproba')
+const npa = require('npm-package-arg')
+const npm = require('./npm')
+let npmConfig
+const npmlog = require('npmlog')
+const limit = require('call-limit')
+const tempFilename = require('./utils/temp-filename')
+const pacote = require('pacote')
+const isWindows = require('./utils/is-windows.js')
+// 【修正】URL 内の認証情報（userinfo）を伏せる関数を読み込む（新規ファイル lib/utils/redact-url-auth.js）
+const redactUrlAuth = require('./utils/redact-url-auth.js')
+
+function andLogAndFinish (spec, tracker, done) {
+  validate('SOF|SZF|OOF|OZF', [spec, tracker, done])
+  return (er, pkg) => {
+    if (er) {
+      // 【修正】spec（例: https://ユーザー名:パスワード@私設レジストリ/pkg.tgz）や
+      // er.message（取得先の URL を含み得る）をそのまま記録すると、log.record を経て
+      // debug.log（既定 ~/.npm/_logs/）や --loglevel silly の端末表示に認証情報が平文で残る。
+      // 記録する前に、どちらも URL の userinfo を「***」に伏せる。
+      log.silly('fetchPackageMetaData', 'error for ' + redactUrlAuth(String(spec)), redactUrlAuth(er.message))
+      if (tracker) tracker.finish()
+    }
+    return done(er, pkg)
+  }
+}
+
+const LRUCache = require('lru-cache')
+const CACHE = new LRUCache({
+  max: 300 * 1024 * 1024,
+  length: (p) => p._contentLength
+})
+
+module.exports = limit(fetchPackageMetadata, npm.limit.fetch)
+function fetchPackageMetadata (spec, where, opts, done) {
+  validate('SSOF|SSFZ|OSOF|OSFZ', [spec, where, opts, done])
+
+  if (!done) {
+    done = opts
+    opts = {}
+  }
+  var tracker = opts.tracker
+  const logAndFinish = andLogAndFinish(spec, tracker, done)
+
+  if (typeof spec === 'object') {
+    var dep = spec
+  } else {
+    dep = npa(spec)
+  }
+  if (!isWindows && dep.type === 'directory' && /^[a-zA-Z]:/.test(dep.fetchSpec)) {
+    var err = new Error(`Can't install from windows path on a non-windows system: ${dep.fetchSpec.replace(/[/]/g, '\\')}`)
+    err.code = 'EWINDOWSPATH'
+    return logAndFinish(err)
+  }
+  if (!npmConfig) {
+    npmConfig = require('./config/figgy-config.js')
+  }
+  pacote.manifest(dep, npmConfig({
+    annotate: true,
+    fullMetadata: opts.fullMetadata,
+    log: tracker || npmlog,
+    memoize: CACHE,
+    where: where
+  })).then(
+    (pkg) => logAndFinish(null, deprCheck(pkg)),
+    (err) => {
+      if (dep.type !== 'directory') return logAndFinish(err)
+      if (err.code === 'ENOTDIR') {
+        var enolocal = new Error(`Could not install "${path.relative(process.cwd(), dep.fetchSpec)}" as it is not a directory and is not a file with a name ending in .tgz, .tar.gz or .tar`)
+        enolocal.code = 'ENOLOCAL'
+        if (err.stack) enolocal.stack = err.stack
+        return logAndFinish(enolocal)
+      } else if (err.code === 'ENOPACKAGEJSON') {
+        var enopackage = new Error(`Could not install from "${path.relative(process.cwd(), dep.fetchSpec)}" as it does not contain a package.json file.`)
+        enopackage.code = 'ENOLOCAL'
+        if (err.stack) enopackage.stack = err.stack
+        return logAndFinish(enopackage)
+      } else {
+        return logAndFinish(err)
+      }
+    }
+  )
+}
+
+module.exports.addBundled = addBundled
+function addBundled (pkg, next) {
+  validate('OF', arguments)
+  if (pkg._bundled !== undefined) return next(null, pkg)
+
+  if (!pkg.bundleDependencies && pkg._requested.type !== 'directory') return next(null, pkg)
+  const requested = pkg._requested || npa(pkg._from)
+  if (requested.type === 'directory') {
+    pkg._bundled = null
+    return readPackageTree(pkg._requested.fetchSpec, function (er, tree) {
+      if (tree) pkg._bundled = tree.children
+      return next(null, pkg)
+    })
+  }
+  pkg._bundled = null
+  const target = tempFilename('unpack')
+  if (!npmConfig) {
+    npmConfig = require('./config/figgy-config.js')
+  }
+  const opts = npmConfig({integrity: pkg._integrity})
+  pacote.extract(pkg._resolved || pkg._requested || npa.resolve(pkg.name, pkg.version), target, opts).then(() => {
+    log.silly('addBundled', 'read tarball')
+    readPackageTree(target, (err, tree) => {
+      if (err) { return next(err) }
+      log.silly('cleanup', 'remove extracted module')
+      rimraf(target, function () {
+        if (tree) {
+          pkg._bundled = tree.children
+        }
+        next(null, pkg)
+      })
+    })
+  }, next)
+}
+```
+
+### 修正したコード: npm-cli.js
+
+```javascript
+#!/usr/bin/env node
+;(function () { // wrapper in case we're in module_context mode
+  // windows: running "npm blah" in this folder will invoke WSH, not node.
+  /* global WScript */
+  if (typeof WScript !== 'undefined') {
+    WScript.echo(
+      'npm does not work when run\n' +
+        'with the Windows Scripting Host\n\n' +
+        "'cd' to a different directory,\n" +
+        "or type 'npm.cmd <args>',\n" +
+        "or type 'node npm <args>'."
+    )
+    WScript.quit(1)
+    return
+  }
+
+  process.title = 'npm'
+
+  var unsupported = require('../lib/utils/unsupported.js')
+  unsupported.checkForBrokenNode()
+
+  var log = require('npmlog')
+  log.pause() // will be unpaused when config is loaded.
+  log.info('it worked if it ends with', 'ok')
+
+  unsupported.checkForUnsupportedNode()
+
+  var npm = require('../lib/npm.js')
+  var npmconf = require('../lib/config/core.js')
+  var errorHandler = require('../lib/utils/error-handler.js')
+  // 【修正】URL 内の認証情報（userinfo）を伏せる関数を読み込む（新規ファイル lib/utils/redact-url-auth.js）
+  var redactUrlAuth = require('../lib/utils/redact-url-auth.js')
+
+  var configDefs = npmconf.defs
+  var shorthands = configDefs.shorthands
+  var types = configDefs.types
+  var nopt = require('nopt')
+
+  // if npm is called as "npmg" or "npm_g", then
+  // run in global mode.
+  if (process.argv[1][process.argv[1].length - 1] === 'g') {
+    process.argv.splice(1, 1, 'npm', '-g')
+  }
+
+  // 【修正】コマンドライン引数（例: npm install https://ユーザー名:パスワード@ホスト/pkg.tgz）を
+  // そのまま記録すると、log.record を経て debug.log や --loglevel verbose 以上の端末表示に
+  // 認証情報が平文で残る（error-handler.js の argv の記録と同じ問題）。
+  // 各引数の URL の userinfo を伏せたコピーを記録する。process.argv 自体は変えないので、
+  // この後の nopt による引数の解析や、実際の取得には元の値がそのまま使われる。
+  log.verbose('cli', process.argv.map(redactUrlAuth))
+
+  var conf = nopt(types, shorthands)
+  npm.argv = conf.argv.remain
+  if (npm.deref(npm.argv[0])) npm.command = npm.argv.shift()
+  else conf.usage = true
+
+  if (conf.version) {
+    console.log(npm.version)
+    return errorHandler.exit(0)
+  }
+
+  if (conf.versions) {
+    npm.command = 'version'
+    conf.usage = false
+    npm.argv = []
+  }
+
+  log.info('using', 'npm@%s', npm.version)
+  log.info('using', 'node@%s', process.version)
+
+  process.on('uncaughtException', errorHandler)
+  process.on('unhandledRejection', errorHandler)
+
+  if (conf.usage && npm.command !== 'help') {
+    npm.argv.unshift(npm.command)
+    npm.command = 'help'
+  }
+
+  var isGlobalNpmUpdate = conf.global && ['install', 'update'].includes(npm.command) && npm.argv.includes('npm')
+
+  // now actually fire up npm and run the command.
+  // this is how to use npm programmatically:
+  conf._exit = true
+  npm.load(conf, function (er) {
+    if (er) return errorHandler(er)
+    if (
+      !isGlobalNpmUpdate &&
+      npm.config.get('update-notifier') &&
+      !unsupported.checkVersion(process.version).unsupported
+    ) {
+      const pkg = require('../package.json')
+      let notifier = require('update-notifier')({pkg})
+      const isCI = require('ci-info').isCI
+      if (
+        notifier.update &&
+        notifier.update.latest !== pkg.version &&
+        !isCI
+      ) {
+        const color = require('ansicolors')
+        const useColor = npm.config.get('color')
+        const useUnicode = npm.config.get('unicode')
+        const old = notifier.update.current
+        const latest = notifier.update.latest
+        let type = notifier.update.type
+        if (useColor) {
+          switch (type) {
+            case 'major':
+              type = color.red(type)
+              break
+            case 'minor':
+              type = color.yellow(type)
+              break
+            case 'patch':
+              type = color.green(type)
+              break
+          }
+        }
+        const changelog = `https://github.com/npm/cli/releases/tag/v${latest}`
+        notifier.notify({
+          message: `New ${type} version of ${pkg.name} available! ${
+            useColor ? color.red(old) : old
+          } ${useUnicode ? '→' : '->'} ${
+            useColor ? color.green(latest) : latest
+          }\n` +
+          `${
+            useColor ? color.yellow('Changelog:') : 'Changelog:'
+          } ${
+            useColor ? color.cyan(changelog) : changelog
+          }\n` +
+          `Run ${
+            useColor
+              ? color.green(`npm install -g ${pkg.name}`)
+              : `npm i -g ${pkg.name}`
+          } to update!`
+        })
+      }
+    }
+    npm.commands[npm.command](npm.argv, function (err) {
+      // https://genius.com/Lin-manuel-miranda-your-obedient-servant-lyrics
+      if (
+        !err &&
+        npm.config.get('ham-it-up') &&
+        !npm.config.get('json') &&
+        !npm.config.get('parseable') &&
+        npm.command !== 'completion'
+      ) {
+        console.error(
+          `\n ${
+            npm.config.get('unicode') ? '🎵 ' : ''
+          } I Have the Honour to Be Your Obedient Servant,${
+            npm.config.get('unicode') ? '🎵 ' : ''
+          } ~ npm ${
+            npm.config.get('unicode') ? '📜🖋 ' : ''
+          }\n`
+        )
+      }
+      errorHandler.apply(this, arguments)
+    })
+  })
+})()
+```
+
+### 修正したコード: redact-url-auth.js
+
+```javascript
+'use strict'
+
+// 【修正】新規に追加したファイル（置き場所: lib/utils/redact-url-auth.js）。
+// ログやログファイルに書き出す文字列から、URL に含まれる認証情報（userinfo）を伏せる。
+//   例: 'https://user:pass@example.com/pkg.tgz'
+//    →  'https://***@example.com/pkg.tgz'
+//   例: 'foo@git+https://user:token@github.com/owner/repo.git'
+//    →  'foo@git+https://***@github.com/owner/repo.git'
+// - エラーメッセージのように、文の途中に埋め込まれた URL も対象にするため、
+//   url.parse で URL 全体を解析するのではなく、正規表現で置き換える。
+// - `//` の直後から、次の `/` `?` `#` 空白文字の手前までの区間（URL の authority 部分）に
+//   `@` があれば、その区間の最後の `@` までを userinfo とみなして `***` に置き換える。
+//   パスワードに `@` がそのまま入っていても、最後の `@` まで伏せるので一部が残らない。
+// - ユーザー名だけの形（https://TOKEN@github.com/... のようにトークンをユーザー名の位置に
+//   入れる使い方がある）も伏せる。
+// - 照合する区間は `/` を含まないため、照合は入力の長さに対して線形の時間で終わる。
+// - 文字列以外（undefined など）は、そのまま返す（呼び出し元の表示を変えないため）。
+const URL_USERINFO = /\/\/[^/?#\s]+@/g
+
+module.exports = redactUrlAuth
+function redactUrlAuth (str) {
+  if (typeof str !== 'string') return str
+  return str.replace(URL_USERINFO, '//***@')
+}
+```
+
+---
